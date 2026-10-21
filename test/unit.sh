@@ -1633,4 +1633,277 @@ else
     "export_client_artifacts 用例前提：mktemp -d 必须能创建唯一临时目录"
 fi
 rm -rf "$exp_dir"
+
+# ── 本段用到的辅助断言 ─────────────────────────────────────────
+# assert_contains 只能表达「包含」，而本任务有多条断言要表达「【不】含」
+# （例如「参数校验失败时不得走到 root 检查」）。
+# 用 grep -c 数命中行数（0 = 不存在）；grep 无匹配时退出码是 1，
+# 必须用 `|| true` 吞掉，否则会把非零码带出命令替换。
+assert_not_contains() {
+  local haystack="$1" needle="$2" msg="${3:-不含子串}"
+  local n
+  n=$(printf '%s' "$haystack" | grep -c -F -- "$needle" || true)
+  assert_eq "0" "$n" "$msg"
+}
+
+# 本段有 4 条断言依赖「当前不是 root」。
+# ⚠️ EUID 是 bash 的【只读特殊变量】→ 没法注入 → 只能靠实际运行身份判断。
+#    以 root 运行时必须走 else 分支（条数不变 + 说明已跳过），
+#    否则在 Debian 上以 root 跑测试会有 3 条断言假红。
+T8_IS_ROOT=0
+if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+  T8_IS_ROOT=1
+fi
+
+test_case "install.sh 参数解析"
+
+# ⚠️ 每一次调用 install.sh 都要用 `timeout 10` 包一层。
+#    原因：参数解析的守卫（`[[ -n "$OPT_X" ]] || { ...; exit 1; }`）一旦被删，
+#    `shift 2` 在「参数缺失」时会失败 → while 循环消费不掉当前参数 → 进程死循环。
+#    控制器实测（C5 变异）：`bash install.sh --uuid` 永不退出 → 整个测试套件挂死。
+#    包上 timeout 之后，这类失败变成 rc=124（断言照样变红），套件不会挂死。
+run_help=$(timeout 10 bash "$ROOT/install.sh" --help 2>&1)
+assert_contains "$run_help" "--port" "帮助信息含 --port"
+assert_contains "$run_help" "--sni" "帮助信息含 --sni"
+assert_contains "$run_help" "--menu" "帮助信息含 --menu"
+assert_contains "$run_help" "--addr" "帮助信息含 --addr"
+
+# --addr 的字符集校验：会原样进分享链接与客户端 JSON → 必须拒绝引号/空格/$
+out=$(timeout 10 bash "$ROOT/install.sh" --addr 'bad"addr' 2>&1); rc=$?
+assert_status 1 "$rc" "--addr 含引号时以非零码退出"
+assert_contains "$out" "--addr" "--addr 非法时给出明确提示"
+assert_not_contains "$out" "需要 root 权限" "--addr 非法时不得走到 root 检查（校验必须在参数解析口）"
+out=$(timeout 10 bash "$ROOT/install.sh" --addr 'a b' 2>&1); rc=$?
+assert_status 1 "$rc" "--addr 含空格时以非零码退出"
+out=$(timeout 10 bash "$ROOT/install.sh" --addr 2>&1); rc=$?
+assert_status 1 "$rc" "--addr 缺少参数时以非零码退出"
+assert_contains "$out" "缺少参数" "--addr 缺少参数时给出明确提示"
+
+# 未知参数必须报错退出
+out=$(timeout 10 bash "$ROOT/install.sh" --definitely-not-a-real-flag 2>&1); rc=$?
+assert_status 1 "$rc" "未知参数以非零码退出"
+assert_contains "$out" "未知" "未知参数给出提示"
+
+# --status 在未部署时应优雅退出而非崩溃（只读操作，不要求 root）
+out=$(timeout 10 bash "$ROOT/install.sh" --status 2>&1); rc=$?
+assert_status 0 "$rc" "未部署时 --status 退出码为 0"
+
+# ── 其余参数的【缺参数】与【取值非法】必须各自报错 ──────────────
+# 这一组是「参数解析口」的守卫：漏掉任何一个，用户就会得到
+# 「参数被静默吞掉」或「非法值一路写进 config.json」的结果。
+out=$(timeout 10 bash "$ROOT/install.sh" --port 2>&1); rc=$?
+assert_status 1 "$rc" "--port 缺少参数时以非零码退出"
+assert_contains "$out" "缺少参数" "--port 缺少参数时给出明确提示"
+out=$(timeout 10 bash "$ROOT/install.sh" --port 99999 2>&1); rc=$?
+assert_status 1 "$rc" "--port 超出范围时以非零码退出"
+assert_contains "$out" "--port" "--port 超出范围时给出明确提示"
+assert_not_contains "$out" "需要 root 权限" "--port 越界时不得走到 root 检查（范围校验必须在参数解析口）"
+out=$(timeout 10 bash "$ROOT/install.sh" --port 0 2>&1); rc=$?
+assert_status 1 "$rc" "--port 为 0 时以非零码退出"
+out=$(timeout 10 bash "$ROOT/install.sh" --sni 2>&1); rc=$?
+assert_status 1 "$rc" "--sni 缺少参数时以非零码退出"
+assert_contains "$out" "缺少参数" "--sni 缺少参数时给出明确提示"
+out=$(timeout 10 bash "$ROOT/install.sh" --name 2>&1); rc=$?
+assert_status 1 "$rc" "--name 缺少参数时以非零码退出"
+assert_contains "$out" "缺少参数" "--name 缺少参数时给出明确提示"
+out=$(timeout 10 bash "$ROOT/install.sh" --uuid 2>&1); rc=$?
+assert_status 1 "$rc" "--uuid 缺少参数时以非零码退出"
+assert_contains "$out" "缺少参数" "--uuid 缺少参数时给出明确提示"
+
+# --sni 的值会原样进 config.json 与分享链接 → 非法主机名必须被拒
+out=$(timeout 10 bash "$ROOT/install.sh" --sni 'bad host' 2>&1); rc=$?
+assert_status 1 "$rc" "--sni 非法主机名以非零码退出"
+assert_contains "$out" "--sni" "--sni 非法主机名时给出明确提示"
+assert_not_contains "$out" "需要 root 权限" "--sni 非法时不得走到 root 检查（主机名校验必须在参数解析口）"
+
+# ── require_root：非 root 时必须报错并以非零码退出 ──────────────
+if [[ "$T8_IS_ROOT" -eq 0 ]]; then
+  out=$( ( INSTALL_SH_NO_MAIN=1; source "$ROOT/install.sh"; require_root ) 2>&1 ); rc=$?
+  assert_status 1 "$rc" "非 root 时 require_root 返回非零"
+  assert_contains "$out" "root" "非 root 时 require_root 给出明确提示"
+else
+  assert_eq "以 root 运行" "以 root 运行" "非 root 时 require_root 返回非零（以 root 运行，前提不成立，已跳过）"
+  assert_eq "以 root 运行" "以 root 运行" "非 root 时 require_root 给出明确提示（以 root 运行，前提不成立，已跳过）"
+fi
+
+# ── require_root 的【root 分支】只能用源码静态断言 ──────────────
+# ⚠️ EUID 是 bash 的【只读特殊变量】→ `EUID=0` 改不了它 →
+# 本机（Windows + MSYS，EUID=197615）永远进不了 root 分支。
+# 而 root 分支恰恰是「误报『需要 root』」的唯一来源 → 必须钉住。
+# 办法：把函数体取出来做【源码静态断言】（与 Task 4 的 F4-1、Task 6 的 T6-9 同款）。
+rr_body=$( ( INSTALL_SH_NO_MAIN=1; source "$ROOT/install.sh"; declare -f require_root ) )
+assert_contains "$rr_body" "return 1" "require_root 在非 root 时返回非零（不得直接 exit 掉调用方）"
+assert_contains "$rr_body" "return 0" "require_root 在 root 时返回 0"
+
+test_case "install.sh 的函数级分支（source 但不执行 main）"
+
+# install.sh 末尾的 main 调用有守卫：被 source 时不执行 main
+# （否则本机非 root → 立刻 exit 1 → 什么都测不到）。
+# 所以这里统一用 `INSTALL_SH_NO_MAIN=1; source "$ROOT/install.sh"` 拿到函数。
+#
+# ⚠️ 每次 source 都要重新加载 —— install.sh 顶层会把 OPT_* 全部重置成空串，
+#    所以【必须在 source 之后】再设置这些变量，否则会被覆盖。
+
+# ── preflight：全部依赖都满足时必须返回 0 ──────────────
+# ⚠️ 绝对不能让它真的 apt-get / 真的联网 → 全部 mock。
+out=$( ( INSTALL_SH_NO_MAIN=1; source "$ROOT/install.sh"
+         assert_debian() { return 0; }
+         have_cmd() { return 0; }
+         ensure_packages() { return 0; }
+         detect_public_ip() { printf '203.0.113.9'; }
+         preflight ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "preflight 在依赖齐备时返回 0"
+assert_contains "$out" "环境预检" "preflight 打印环境预检标题"
+assert_contains "$out" "systemd 可用" "preflight 确认 systemd 可用"
+assert_contains "$out" "curl 可用" "preflight 确认 curl 可用"
+assert_contains "$out" "203.0.113.9" "preflight 显示探测到的公网 IP"
+
+# ── preflight：缺 systemd 时必须失败并指出原因 ──────────────
+out=$( ( INSTALL_SH_NO_MAIN=1; source "$ROOT/install.sh"
+         assert_debian() { return 0; }
+         have_cmd() { case "$1" in systemctl) return 1 ;; *) return 0 ;; esac; }
+         ensure_packages() { return 0; }
+         detect_public_ip() { printf '203.0.113.9'; }
+         preflight ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "preflight 缺 systemd 时返回非零"
+assert_contains "$out" "systemd 不可用" "preflight 缺 systemd 时给出明确提示"
+
+# ── preflight：缺 curl 时必须失败并指出原因 ──────────────
+out=$( ( INSTALL_SH_NO_MAIN=1; source "$ROOT/install.sh"
+         assert_debian() { return 0; }
+         have_cmd() { case "$1" in curl) return 1 ;; *) return 0 ;; esac; }
+         ensure_packages() { return 0; }
+         detect_public_ip() { printf '203.0.113.9'; }
+         preflight ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "preflight 缺 curl 时返回非零"
+assert_contains "$out" "无法下载安装脚本" "preflight 缺 curl 时给出明确提示"
+
+# ── preflight：不是 Debian 时必须失败 ──────────────
+out=$( ( INSTALL_SH_NO_MAIN=1; source "$ROOT/install.sh"
+         assert_debian() { return 1; }
+         have_cmd() { return 0; }
+         ensure_packages() { return 0; }
+         detect_public_ip() { printf '203.0.113.9'; }
+         preflight ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "preflight 在非 Debian 系统上返回非零"
+
+# ── preflight：依赖安装失败必须计入失败 ──────────────
+out=$( ( INSTALL_SH_NO_MAIN=1; source "$ROOT/install.sh"
+         assert_debian() { return 0; }
+         have_cmd() { return 0; }
+         ensure_packages() { return 1; }
+         detect_public_ip() { printf '203.0.113.9'; }
+         preflight ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "preflight 在依赖安装失败时返回非零"
+
+# ── preflight：缺 qrencode 不得阻断部署 ──────────────
+# qrencode 只是「锦上添花」（二维码可以之后手动生成）→ 装不上只能提示，不能中止。
+# ⚠️ mock 必须精确：ensure_packages 只对 qrencode 失败，openssl 仍然成功 ——
+#    否则这条用例测的其实是「依赖安装失败」那条路径。
+out=$( ( INSTALL_SH_NO_MAIN=1; source "$ROOT/install.sh"
+         assert_debian() { return 0; }
+         have_cmd() { case "$1" in qrencode) return 1 ;; *) return 0 ;; esac; }
+         ensure_packages() { [[ "$1" == "qrencode" ]] && return 1; return 0; }
+         detect_public_ip() { printf '203.0.113.9'; }
+         preflight ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "preflight 缺 qrencode 时不阻断部署"
+assert_contains "$out" "qrencode" "preflight 缺 qrencode 时给出提示"
+
+# ── preflight：探测不到公网 IP 时必须回退并提示 ──────────────
+out=$( ( INSTALL_SH_NO_MAIN=1; source "$ROOT/install.sh"
+         assert_debian() { return 0; }
+         have_cmd() { return 0; }
+         ensure_packages() { return 0; }
+         detect_public_ip() { return 1; }
+         detect_local_ip() { printf '10.0.0.5'; }
+         preflight ) 2>&1 ); rc=$?
+assert_contains "$out" "未能探测到公网 IP" "preflight 探测不到公网 IP 时给出提示"
+assert_contains "$out" "10.0.0.5" "preflight 探测不到公网 IP 时回退到本机地址"
+
+# ── preflight：--addr 指定时必须用它而不是去探测 ──────────────
+# ⚠️ OPT_ADDR 必须在 source 【之后】设置 —— install.sh 顶层会把它重置为空串。
+out=$( ( INSTALL_SH_NO_MAIN=1; source "$ROOT/install.sh"
+         OPT_ADDR='203.0.113.7'
+         assert_debian() { return 0; }
+         have_cmd() { return 0; }
+         ensure_packages() { return 0; }
+         detect_public_ip() { printf '198.51.100.1'; }
+         preflight
+         printf 'SERVER_IP=[%s]\n' "$SERVER_IP" ) 2>&1 ); rc=$?
+assert_contains "$out" "203.0.113.7" "preflight 优先使用 --addr 指定的地址"
+assert_contains "$out" "SERVER_IP=[203.0.113.7]" "preflight 把 --addr 写进 SERVER_IP"
+
+# ── parse_args：合法参数必须被正确解析 ──────────────
+out=$( ( INSTALL_SH_NO_MAIN=1; source "$ROOT/install.sh"
+         parse_args --port 8443 --sni www.microsoft.com --name 我的节点 --uuid 11111111-2222-3333-4444-555555555555 --addr 203.0.113.7 -y
+         printf 'PORT=%s\nSNI=%s\nNAME=%s\nUUID=%s\nADDR=%s\nYES=%s\n' \
+                "$OPT_PORT" "$OPT_SNI" "$OPT_NAME" "$OPT_UUID" "$OPT_ADDR" "$OPT_YES" ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "parse_args 解析合法参数时返回 0"
+assert_contains "$out" "PORT=8443" "parse_args 解析 --port"
+assert_contains "$out" "SNI=www.microsoft.com" "parse_args 解析 --sni"
+assert_contains "$out" "NAME=我的节点" "parse_args 解析 --name"
+assert_contains "$out" "UUID=11111111-2222-3333-4444-555555555555" "parse_args 解析 --uuid"
+assert_contains "$out" "ADDR=203.0.113.7" "parse_args 解析 --addr"
+assert_contains "$out" "YES=1" "parse_args 解析 -y"
+
+# ── parse_args：--menu / --status / --uninstall 的开关必须置位 ──────────────
+out=$( ( INSTALL_SH_NO_MAIN=1; source "$ROOT/install.sh"
+         parse_args --menu
+         printf 'MENU=%s\n' "$OPT_MENU" ) 2>&1)
+assert_contains "$out" "MENU=1" "parse_args 解析 --menu"
+out=$( ( INSTALL_SH_NO_MAIN=1; source "$ROOT/install.sh"
+         parse_args --status
+         printf 'STATUS=%s\n' "$OPT_STATUS" ) 2>&1)
+assert_contains "$out" "STATUS=1" "parse_args 解析 --status"
+out=$( ( INSTALL_SH_NO_MAIN=1; source "$ROOT/install.sh"
+         parse_args --uninstall
+         printf 'UNINSTALL=%s\n' "$OPT_UNINSTALL" ) 2>&1)
+assert_contains "$out" "UNINSTALL=1" "parse_args 解析 --uninstall"
+
+# ── main：--uninstall 时找不到卸载脚本必须报错退出 ──────────────
+out=$( ( INSTALL_SH_NO_MAIN=1; source "$ROOT/install.sh"
+         ROOT_DIR=/nonexistent-dir-for-test
+         main --uninstall ) 2>&1); rc=$?
+assert_status 1 "$rc" "--uninstall 找不到卸载脚本时以非零码退出"
+assert_contains "$out" "uninstall.sh" "--uninstall 找不到卸载脚本时给出明确提示"
+
+# ── main 的 root 相关分支：源码静态断言 ──────────────
+# ⚠️ EUID 只读 → 本机无法把 EUID 设成 0 → 「root 下 --menu / --status /
+#    部署主路径」这三条在本机【不可达】。但它们是「部署到底能不能跑」的
+#    关键路径 → 不能就这么放过。用源码静态断言钉住结构。
+main_body=$( ( INSTALL_SH_NO_MAIN=1; source "$ROOT/install.sh"; declare -f main ) )
+# ⚠️ 不能只断言 main_body 里出现过 "require_root || exit 1"：
+#    --menu 分支里也有一句 → 删掉【部署路径】那句，断言照样绿（恒真）。
+#    判据必须唯一：「部署路径」= 打印部署 banner 的那段 → 它前面必须有 require_root。
+deploy_guard=$(printf '%s\n' "$main_body" | grep -A1 'require_root || exit 1' | grep -c 'tui_banner')
+assert_eq "1" "$deploy_guard" "main 在进入部署路径前必须要求 root"
+assert_contains "$main_body" 'OPT_STATUS -eq 1' "main 必须处理 --status 分支"
+assert_contains "$main_body" 'OPT_MENU -eq 1' "main 必须处理 --menu 分支"
+assert_contains "$main_body" 'OPT_UNINSTALL -eq 1' "main 必须处理 --uninstall 分支"
+# ⚠️ 不能只断言 main_body 里出现过 "deploy_wizard"：
+#    `if ! declare -F deploy_wizard >/dev/null 2>&1; then` 那行也含这个词
+#    → 删掉【调用】那一行，断言照样绿（恒真）。
+#    判据必须唯一：只数【这一行就是 deploy_wizard 调用】的行。
+#    （declare -f 会重排版：补分号、改缩进 → 用词边界而不是整行相等。）
+wizard_call=$(printf '%s\n' "$main_body" | grep -c '^[[:space:]]*deploy_wizard\b')
+assert_eq "1" "$wizard_call" "main 必须调用 deploy_wizard"
+# --status 必须在 require_root 之前（只读操作不应要求 root）→
+# 顺序本身就是一条可断言的性质：--status 的判定行号必须小于 require_root 的行号。
+status_line=$(printf '%s\n' "$main_body" | grep -n 'OPT_STATUS -eq 1' | head -1 | cut -d: -f1)
+root_line=$(printf '%s\n' "$main_body" | grep -n 'require_root || exit 1' | tail -1 | cut -d: -f1)
+order_ok=0
+if [[ -n "$status_line" && -n "$root_line" && "$status_line" -lt "$root_line" ]]; then
+  order_ok=1
+fi
+assert_eq "1" "$order_ok" "--status 的判定在 require_root 之前（只读操作不要求 root）"
+
+# ── 非 root 下 --menu 必须以非零码退出（这条【可达】）──────────────
+if [[ "$T8_IS_ROOT" -eq 0 ]]; then
+  out=$( ( INSTALL_SH_NO_MAIN=1; source "$ROOT/install.sh"; main --menu ) 2>&1); rc=$?
+  assert_status 1 "$rc" "非 root 下 --menu 以非零码退出"
+  assert_contains "$out" "root" "非 root 下 --menu 提示需要 root 权限"
+else
+  assert_eq "以 root 运行" "以 root 运行" "非 root 下 --menu 以非零码退出（以 root 运行，前提不成立，已跳过）"
+  assert_eq "以 root 运行" "以 root 运行" "非 root 下 --menu 提示需要 root 权限（以 root 运行，前提不成立，已跳过）"
+fi
 test_summary
