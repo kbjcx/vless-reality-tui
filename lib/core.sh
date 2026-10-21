@@ -245,3 +245,164 @@ load_state() {
 }
 
 state_exists() { [[ -f "$STATE_FILE" ]]; }
+
+# 判定一个字符串是不是可用的对外地址。
+# 存在的理由：旧的判定 `^[0-9a-fA-F:]+$` 太宽 —— HTTP 状态码响应体
+# （代理/网关常返回 "404" / "403" / "200" 当正文）和 "cafebabe" / "12345"
+# 这类纯十六进制串都会被当成 IP → 写进分享链接与配置后客户端必然连不上，
+# 而用户完全看不出是「探测错了」而不是「服务没起来」。
+is_valid_ip() {
+  local ip="$1" o
+  # IPv4：4 段十进制，每段 0-255
+  if [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+    for o in "${BASH_REMATCH[@]:1:4}"; do
+      # 必须用 10# 前缀：裸算术会把 "08" 当八进制，直接报「value too great for base」。
+      if (( 10#$o > 255 )); then return 1; fi
+    done
+    return 0
+  fi
+  # IPv6：必须含 ':'（否则 "404" 这类纯数字/纯十六进制串会被误收），
+  # 且只允许十六进制字符与冒号。
+  if [[ "$ip" == *:* ]] && [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]]; then
+    return 0
+  fi
+  return 1
+}
+
+detect_public_ip() {
+  local ip u
+  local urls=(
+    'https://api.ipify.org'
+    'https://ifconfig.me/ip'
+    'https://icanhazip.com'
+    'https://ipinfo.io/ip'
+    'https://myip.ipip.net'
+  )
+  for u in "${urls[@]}"; do
+    ip=$(curl -fsS --max-time 8 "$u" 2>/dev/null | tr -d '[:space:]')
+    if is_valid_ip "$ip"; then
+      printf '%s' "$ip"; return 0
+    fi
+  done
+  return 1
+}
+
+detect_local_ip() {
+  local ip
+  ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+  [[ -z "$ip" ]] && ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+  printf '%s' "$ip"
+}
+
+port_in_use() {
+  local port="$1" rows
+  if have_cmd ss; then
+    # 先把整段输出【收进变量】再匹配，不能写成 `ss | awk | grep -q`：
+    # 管道里 grep -q 命中即退出 → 上游 awk 收到 SIGPIPE（141）→
+    # 在 set -o pipefail 下整条管道的退出码变成 141 → `&& return 0` 不成立 →
+    # 一个【已占用】的端口被误判成【空闲】→ 向导选了这个端口 →
+    # 部署到一半才报 "address in use"，且错误信息与真实原因无关。
+    # 改成「先收进变量、再对变量 grep」后，grep 读的是 here-string（临时文件），
+    # 整条链路上没有任何会早退的管道 → 不可能有 SIGPIPE。
+    #
+    # 仍必须按【字段】精确匹配，不能对整行 grep ":$port"：
+    # ":8080" 这个字符串里就含 ":80" → 全行 grep 会把 8080 误判成 80 已被占用，
+    # 于是向导会以为端口 80 被占而改选别的端口。NR>1 跳过 ss 的表头行。
+    rows=$(ss -ltn "sport = :$port" 2>/dev/null | awk 'NR>1{print $4}')
+    [[ -n "$rows" ]] || return 1
+    grep -qE "[:.]$port\$" <<<"$rows" && return 0
+    return 1
+  fi
+  if have_cmd netstat; then
+    # netstat 的输出【不受端口过滤】，行数可能很大 → 同样不能把 grep -q 接在管道上。
+    rows=$(netstat -ltn 2>/dev/null | awk '{print $4}')
+    [[ -n "$rows" ]] || return 1
+    grep -qE "[:.]$port\$" <<<"$rows" && return 0
+    return 1
+  fi
+  return 1
+}
+
+port_occupant() {
+  local port="$1" rows
+  if have_cmd ss; then
+    # 用纯 bash 取首行，不用 `| head -1`：head 命中即退出会让上游 awk 收到
+    # SIGPIPE（141）。原写法其实【输出是对的】（head 先读走第一行才退出，
+    # 且函数末尾显式 return 0 覆盖了管道状态），改成纯 bash 后不再有任何管道，
+    # 行为不变但不再依赖那个时序。
+    rows=$(ss -ltnp "sport = :$port" 2>/dev/null | awk 'NR>1{print $NF}')
+    rows="${rows%%$'\n'*}"
+    printf '%s' "$rows"
+    return 0
+  fi
+  printf ''
+}
+
+random_free_port() {
+  local p
+  for _ in $(seq 1 40); do
+    p=$(( (RANDOM % 20000) + 20000 ))
+    if ! port_in_use "$p"; then printf '%s' "$p"; return 0; fi
+  done
+  printf '%s' 44321
+}
+
+target_supports_tls13() {
+  local host="$1"
+  have_cmd openssl || return 1
+  local out
+  out=$(timeout 12 openssl s_client -connect "${host}:443" -servername "$host" -tls1_3 </dev/null 2>&1)
+  grep -qE 'TLSv1\.3|Cipher is (TLS_AES|TLS_CHACHA)' <<<"$out"
+}
+
+target_latency_ms() {
+  local host="$1"
+  have_cmd curl || { printf '?'; return 0; }
+  local t
+  t=$(curl -o /dev/null -sS --max-time 10 -w '%{time_connect}' "https://${host}/" 2>/dev/null)
+  if [[ -z "$t" || "$t" == '0' || "$t" == '0.000000' ]]; then
+    printf '?'
+  else
+    awk -v t="$t" 'BEGIN{printf "%d", t*1000}'
+  fi
+}
+
+apt_update_once() {
+  [[ -f /var/lib/vless-reality/apt-updated ]] && return 0
+  tui_run "更新软件源索引 (apt update)" apt-get update -y -o Acquire::Retries=3
+  local rc=$?
+  # 必须显式判失败并返回非零：若写成
+  #   if [[ $? -eq 0 ]]; then ...; fi
+  # 则 apt update 失败时走假分支，而【无 else 的 if 在条件为假时返回 0】——
+  # apt_update_once 于是「成功」返回，ensure_packages 继续装依赖，
+  # 依赖装不上却没人知道。
+  if (( rc != 0 )); then
+    tui_err "apt update 失败（退出码 $rc），无法继续安装依赖"
+    return 1
+  fi
+  mkdir -p /var/lib/vless-reality
+  # 用 `: >` 而不是 touch：touch 不在运行时白名单里，而 `: >` 是 shell 重定向，
+  # 不调用任何外部命令（效果等同「创建或清空该文件」）。
+  : > /var/lib/vless-reality/apt-updated
+  return 0
+}
+
+ensure_packages() {
+  local missing=() p
+  for p in "$@"; do
+    have_cmd "$p" || missing+=("$p")
+  done
+  ((${#missing[@]} == 0)) && return 0
+  # apt update 失败必须中止，否则依赖静默装不上而部署继续往下走。
+  apt_update_once || return 1
+  # tui_run 是最后一条语句 → 其退出码就是本函数的退出码（透传给调用方）。
+  tui_run "安装依赖：${missing[*]}" env DEBIAN_FRONTEND=noninteractive \
+    apt-get install -y --no-install-recommends "${missing[@]}"
+}
+
+service_run_user() {
+  local u
+  u=$(systemctl show xray -p User --value 2>/dev/null || printf '')
+  [[ -z "$u" || "$u" == '0' ]] && u='root'
+  printf '%s' "$u"
+}

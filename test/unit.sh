@@ -455,11 +455,6 @@ core_src="$(cat "$ROOT/lib/core.sh")"
 assert_contains "$core_src" "chmod 600" "core.sh 对状态文件设置 600 权限"
 assert_contains "$core_src" "chmod 700" "core.sh 对状态目录设置 700 权限"
 
-# 简报 Step 3 的「一律不保留」清单：这些函数不属于 core.sh
-# （require_root 属于 install.sh；其余网络探测类属于 Task 4）
-offenders="$(grep -nE '^[[:space:]]*(function[[:space:]]+)?(require_root|is_modern_debian|detect_public_ip|detect_local_ip|port_in_use|port_occupant|random_free_port|target_supports_tls13|target_latency_ms|apt_update_once|ensure_packages|service_run_user)[[:space:]]*(\(\))?[[:space:]]*[{]' "$ROOT/lib/core.sh" | tr '\n' ' ')"
-assert_eq "" "$offenders" "core.sh 不含属于 install.sh / Task 4 的越权函数"
-
 test_case "core 修复轮 1 回归（评审发现项）"
 
 # ── I-1：全局状态变量必须显式声明 ─────────────────────────
@@ -633,5 +628,123 @@ if [[ -n "$perm_dir" ]]; then
   fi
 fi
 rm -rf "$perm_dir"
+
+test_case "core 网络探测（用可控输入验证解析逻辑）"
+
+# 端口判定：结果在【退出码】上，不能写成 assert_false "$(port_in_use 59999)" ——
+# $( ) 捕获的是 stdout（空串），退出码被丢掉，断言会恒真通过（测不出任何东西）。
+# 也不能依赖「59999 恰好是空闲的」这种环境假设：用 mock 的 ss 构造确定场景。
+SS_HDR='State Recv-Q Send-Q Local Address:Port Peer Address:Port\n'
+mock_port_in_use() {
+  local ssout="$1" port="$2"
+  (
+    have_cmd() { case "$1" in ss) return 0 ;; netstat) return 1 ;; *) return 1 ;; esac; }
+    ss() { printf '%b' "$ssout"; }
+    port_in_use "$port" >/dev/null 2>&1
+  )
+}
+mock_port_in_use "${SS_HDR}LISTEN 0 128 0.0.0.0:59999 0.0.0.0:*\n" 59999; rc=$?
+assert_true "$rc" "port_in_use 识别出被占用的端口（mock ss）"
+mock_port_in_use "$SS_HDR" 59999; rc=$?
+assert_false "$rc" "port_in_use 识别出空闲的端口（mock ss 只有表头）"
+# 子串陷阱：":8080" 里就含 ":80" —— 对整行 grep 会把 :8080 误判成 :80 已被占用
+mock_port_in_use "${SS_HDR}LISTEN 0 128 0.0.0.0:8080 0.0.0.0:*\n" 80; rc=$?
+assert_false "$rc" "port_in_use 不得把 :8080 误判成 :80 已占用（按字段精确匹配）"
+
+# ── F4-1：port_in_use 不得把 grep -q 直接接在管道上 ──────────
+# 缺陷本体：管道里 `grep -q` 命中即退出 → 上游 awk 收到 SIGPIPE（141）→
+# 在 set -o pipefail 下整条管道的退出码变成 141 → `&& return 0` 不成立 →
+# 一个【已占用】的端口被误判成【空闲】→ 向导选了这个端口 →
+# 部署到一半才报 "address in use"，且错误信息与真实原因无关。
+# 这个缺陷在运行期复现需要 awk 的输出超过其管道缓冲（约 8KB，即 >1000 行），
+# 且是否触发取决于时序 → 【不能】写成一条依赖时序的运行期断言。
+# 因此用【源码静态断言】锁住实现形状（确定性，权威判据）。
+port_in_use_body="$(awk '/^port_in_use\(\) *\{/,/^\}/' "$ROOT/lib/core.sh")"
+[[ -n "$port_in_use_body" ]]; assert_true "$?" \
+  "core.sh 里必须存在 port_in_use 函数（下面那条静态断言的前提）"
+# 检查前必须先去掉整行注释：函数的说明性注释里会写「不能写成 `ss | awk | grep -q`」
+# 这类字样 —— 那是【说明】不是【代码】，不去掉会把自己判成违规（实测踩过）。
+port_in_use_code="$(printf '%s\n' "$port_in_use_body" | grep -v '^[[:space:]]*#')"
+assert_eq "" "$(printf '%s\n' "$port_in_use_code" | grep -n '|[ \t]*grep[ \t]*-q' | tr '\n' ' ')" \
+  "port_in_use 不得把 grep -q 直接接在管道上（SIGPIPE 会把 141 带进退出码）"
+# 辅助（行为）断言：输出量大到超过 awk 的管道缓冲时，判定仍必须是「已占用」。
+# 修好后这条【必然】通过；若有人改回「管道 + grep -q」，它【可能】变红（时序相关），
+# 所以它只是辅助，权威判据是上面那条静态断言。
+big_ss='State Recv-Q Send-Q Local Address:Port Peer Address:Port\nLISTEN 0 128 0.0.0.0:59999 0.0.0.0:*\n'
+for _ in $(seq 1 2000); do
+  big_ss+="LISTEN 0 128 0.0.0.0:$((3000 + _)) 0.0.0.0:*\n"
+done
+mock_port_in_use "$big_ss" 59999; rc=$?
+assert_true "$rc" "port_in_use 在输出量很大时仍能正确判定端口已占用（不得因 SIGPIPE 误判为空闲）"
+# port_occupant 的解析同样用 mock 构造确定场景
+out=$( ( have_cmd() { case "$1" in ss) return 0 ;; *) return 1 ;; esac; }
+            ss() { printf '%b' "${SS_HDR}LISTEN 0 128 0.0.0.0:59999 0.0.0.0:* users:((nginx,pid=1,fd=2))\n"; }
+            port_occupant 59999 ) 2>&1 )
+assert_contains "$out" "pid=1" "port_occupant 解析出占用进程的描述"
+out=$( ( have_cmd() { case "$1" in ss) return 0 ;; *) return 1 ;; esac; }
+            ss() { printf '%b' "$SS_HDR"; }
+            port_occupant 59999 ) 2>&1 )
+assert_eq "" "$out" "port_occupant 在端口空闲时输出为空"
+
+# ── is_valid_ip：挡住「响应体根本不是 IP」的情况 ──────────────
+# 旧判定 `^[0-9a-fA-F:]+$` 太宽：HTTP 状态码响应体（"404" / "403" / "200"，
+# 代理与网关常这么返回）和 "cafebabe" / "12345" 这类纯十六进制串都会被当成 IP
+# → 写进分享链接与配置后客户端必然连不上，而用户完全看不出是「探测错了」。
+assert_succeeds "is_valid_ip 接受合法 IPv4" is_valid_ip 1.2.3.4
+assert_succeeds "is_valid_ip 接受 0 号段（0.0.0.0 是合法写法）" is_valid_ip 0.0.0.0
+assert_succeeds "is_valid_ip 接受 255 号段" is_valid_ip 255.255.255.255
+assert_succeeds "is_valid_ip 接受 IPv6 形态" is_valid_ip "2001:db8::1"
+assert_fails "is_valid_ip 拒绝纯数字串（404 这类 HTTP 状态码）" is_valid_ip 404
+assert_fails "is_valid_ip 拒绝纯十六进制串（cafebabe）" is_valid_ip cafebabe
+assert_fails "is_valid_ip 拒绝五段 IPv4" is_valid_ip 1.2.3.4.5
+assert_fails "is_valid_ip 拒绝每段都大于 255 的伪 IPv4" is_valid_ip 999.999.999.999
+assert_fails "is_valid_ip 拒绝空串" is_valid_ip ""
+
+# detect_public_ip：必须 mock 掉 curl 才能得到确定性结果（真实网络不可依赖）。
+out=$( ( curl() { printf '404'; }; detect_public_ip ) 2>/dev/null ); rc=$?
+assert_status 1 "$rc" "detect_public_ip 面对非 IP 响应体（HTTP 状态码 404）必须返回非零"
+assert_eq "" "$out" "detect_public_ip 面对非 IP 响应体时不得输出任何内容"
+out=$( ( curl() { printf '1.2.3.4'; }; detect_public_ip ) 2>/dev/null ); rc=$?
+assert_status 0 "$rc" "detect_public_ip 遇到合法 IPv4 时返回 0"
+assert_eq "1.2.3.4" "$out" "detect_public_ip 输出正确的公网 IPv4"
+out=$( ( curl() { printf '2001:db8::1'; }; detect_public_ip ) 2>/dev/null ); rc=$?
+assert_status 0 "$rc" "detect_public_ip 遇到 IPv6 时返回 0"
+assert_eq "2001:db8::1" "$out" "detect_public_ip 输出正确的 IPv6"
+
+# 延迟解析：必须用 mock 的 curl，不能依赖「某个域名一定不可达」——
+# 实测本机环境里 invalid.invalid.nonexistent 会被解析并连上，curl 报出 4ms
+# → 断言「返回 ?」会随机变红。mock 掉 curl 才能得到确定性结果。
+out=$( ( curl() { return 7; }; target_latency_ms 'x.example' ) 2>/dev/null )
+assert_eq "?" "$out" "curl 失败时 target_latency_ms 返回 ?"
+out=$( ( curl() { printf '0.000000'; }; target_latency_ms 'x.example' ) 2>/dev/null )
+assert_eq "?" "$out" "curl 报告 0 连接时间时 target_latency_ms 返回 ?"
+out=$( ( curl() { printf '0.250000'; }; target_latency_ms 'x.example' ) 2>/dev/null )
+assert_eq "250" "$out" "curl 报告 0.25 秒时 target_latency_ms 换算成 250 毫秒"
+
+# （原「不可达目标返回 ?」这条断言已移除：它依赖「某个域名一定不可达」的环境假设 ——
+#   实测本机环境里 invalid.invalid.nonexistent 会被解析并连上，curl 报出 4ms →
+#   断言随机变红。确定性版本见上面的 mock curl 三条断言。）
+
+# 真实目标：至少一个候选站点应支持 TLS1.3（网络不可用时跳过断言，不算失败）
+if have_cmd openssl && curl -fsS --max-time 5 -o /dev/null https://www.microsoft.com 2>/dev/null; then
+  target_supports_tls13 www.microsoft.com; rc=$?
+  assert_true "$rc" "www.microsoft.com 支持 TLS 1.3"
+fi
+
+# 【替换】下面这两行是 Task 3 加进 test/unit.sh 的断言（原样照抄，用来定位），
+# 必须被下面那条收窄后的断言【替换掉】，不是并存：
+#   offenders="$(grep -nE '^[[:space:]]*(function[[:space:]]+)?(require_root|is_modern_debian|detect_public_ip|detect_local_ip|port_in_use|port_occupant|random_free_port|target_supports_tls13|target_latency_ms|apt_update_once|ensure_packages|service_run_user)[[:space:]]*(\(\))?[[:space:]]*[{]' "$ROOT/lib/core.sh" | tr '\n' ' ')"
+#   assert_eq "" "$offenders" "core.sh 不含属于 install.sh / Task 4 的越权函数"
+# 收窄后只剩 install.sh 拥有的 require_root / is_modern_debian。
+offenders="$(grep -nE '^[[:space:]]*(function[[:space:]]+)?(require_root|is_modern_debian)[[:space:]]*(\(\))?[[:space:]]*[{]' "$ROOT/lib/core.sh" | tr '\n' ' ')"
+assert_eq "" "$offenders" "core.sh 不含属于 install.sh 的越权函数（require_root / is_modern_debian）"
+
+# apt update 失败必须中止：否则依赖装不上，调用方却以为装好了。
+# 用 mock 覆盖 tui_run 让它失败（子 shell 内覆盖，不污染测试进程）。
+# 若本机已存在标记文件则跳过（此时函数会提前返回 0，用例前提不成立）。
+if [[ ! -f /var/lib/vless-reality/apt-updated ]]; then
+  ( tui_run() { return 1; }; apt_update_once >/dev/null 2>&1 ); rc=$?
+  assert_false "$rc" "apt update 失败时 apt_update_once 必须返回非零"
+fi
 
 test_summary
