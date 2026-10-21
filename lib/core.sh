@@ -261,9 +261,14 @@ is_valid_ip() {
     done
     return 0
   fi
-  # IPv6：必须含 ':'（否则 "404" 这类纯数字/纯十六进制串会被误收），
-  # 且只允许十六进制字符与冒号。
-  if [[ "$ip" == *:* ]] && [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]]; then
+  # IPv6：必须含 ':'（否则 "404" 这类纯数字/纯十六进制串会被误收）。
+  # 还必须是像样的 IPv6 形态：含 "::" 压缩写法，或至少 3 段十六进制组 ——
+  # 否则 "dead:beef" / "cafe:babe" 这类只有两段的串会被误收成 IP。
+  if [[ "$ip" == *"::"* ]]; then
+    [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]] && return 0
+    return 1
+  fi
+  if [[ "$ip" =~ ^([0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4}$ ]]; then
     return 0
   fi
   return 1
@@ -271,15 +276,22 @@ is_valid_ip() {
 
 detect_public_ip() {
   local ip u
+  # 候选源说明：
+  #   · 故意【不】用 https://myip.ipip.net —— 它返回中文正文
+  #     （「当前 IP：1.2.3.4 来自于：中国」），is_valid_ip 永远不可能接受 →
+  #     该源【永远失败】，而且排在最后，只在前面全失败时才白等一次超时。
+  #   · --max-time 取 5 秒：4 个源最坏合计 20 秒（旧的 5 源 × 8 秒 = 40 秒，
+  #     在无网环境下预检会静默卡住近一分钟）。
   local urls=(
     'https://api.ipify.org'
     'https://ifconfig.me/ip'
     'https://icanhazip.com'
     'https://ipinfo.io/ip'
-    'https://myip.ipip.net'
   )
   for u in "${urls[@]}"; do
-    ip=$(curl -fsS --max-time 8 "$u" 2>/dev/null | tr -d '[:space:]')
+    # tr -d '[:space:]' 是【承重逻辑】：真实 IP 服务返回的正文都带尾随 "\n"，
+    # 而 bash 的 =~ 锚点不匹配尾随换行 → 不剥掉就一定判不出 IP。
+    ip=$(curl -fsS --max-time 5 "$u" 2>/dev/null | tr -d '[:space:]')
     if is_valid_ip "$ip"; then
       printf '%s' "$ip"; return 0
     fi
@@ -291,6 +303,12 @@ detect_local_ip() {
   local ip
   ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
   [[ -z "$ip" ]] && ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+  # 两个来源都没给出地址 → 必须返回非零：rc=0 却输出空串会让调用方
+  # 分不清「探测到了空地址」和「探测成功」。
+  if [[ -z "$ip" ]]; then
+    tui_err "无法探测本机地址（ip 与 hostname 都不可用）"
+    return 1
+  fi
   printf '%s' "$ip"
 }
 

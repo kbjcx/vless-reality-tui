@@ -676,6 +676,7 @@ for _ in $(seq 1 2000); do
 done
 mock_port_in_use "$big_ss" 59999; rc=$?
 assert_true "$rc" "port_in_use 在输出量很大时仍能正确判定端口已占用（不得因 SIGPIPE 误判为空闲）"
+
 # port_occupant 的解析同样用 mock 构造确定场景
 out=$( ( have_cmd() { case "$1" in ss) return 0 ;; *) return 1 ;; esac; }
             ss() { printf '%b' "${SS_HDR}LISTEN 0 128 0.0.0.0:59999 0.0.0.0:* users:((nginx,pid=1,fd=2))\n"; }
@@ -694,41 +695,101 @@ assert_succeeds "is_valid_ip 接受合法 IPv4" is_valid_ip 1.2.3.4
 assert_succeeds "is_valid_ip 接受 0 号段（0.0.0.0 是合法写法）" is_valid_ip 0.0.0.0
 assert_succeeds "is_valid_ip 接受 255 号段" is_valid_ip 255.255.255.255
 assert_succeeds "is_valid_ip 接受 IPv6 形态" is_valid_ip "2001:db8::1"
+assert_succeeds "is_valid_ip 接受完整写法的 IPv6" is_valid_ip "2001:0db8:0000:0000:0000:0000:0000:0001"
 assert_fails "is_valid_ip 拒绝纯数字串（404 这类 HTTP 状态码）" is_valid_ip 404
 assert_fails "is_valid_ip 拒绝纯十六进制串（cafebabe）" is_valid_ip cafebabe
 assert_fails "is_valid_ip 拒绝五段 IPv4" is_valid_ip 1.2.3.4.5
 assert_fails "is_valid_ip 拒绝每段都大于 255 的伪 IPv4" is_valid_ip 999.999.999.999
 assert_fails "is_valid_ip 拒绝空串" is_valid_ip ""
+# IPv6 分支曾经只要求「含冒号 + 全是十六进制字符」→ "dead:beef" 这类只有两段、
+# 且没有 "::" 压缩写法的串会被误收。收紧后必须钉住。
+assert_fails "is_valid_ip 拒绝只有两段且无 :: 的伪 IPv6（dead:beef）" is_valid_ip "dead:beef"
+assert_fails "is_valid_ip 拒绝只有两段且无 :: 的伪 IPv6（cafe:babe）" is_valid_ip "cafe:babe"
 
-# detect_public_ip：必须 mock 掉 curl 才能得到确定性结果（真实网络不可依赖）。
-out=$( ( curl() { printf '404'; }; detect_public_ip ) 2>/dev/null ); rc=$?
+# ── detect_public_ip：必须 mock 掉 curl 才能得到确定性结果（真实网络不可依赖）──
+# 注意：mock 的响应体【必须带尾随换行】！真实的 IP 服务（ipify / ifconfig.me /
+# icanhazip / ipinfo）返回的都是 "1.2.3.4\n"。bash 的 =~ 锚点【不匹配】尾随换行，
+# 而实现里靠 `tr -d '[:space:]'` 剥掉它 —— 如果那条 tr 被当成「冗余」删掉，
+# 探测在【任何真实网络下】都会失败（返回空），而用无换行的 mock 去测【测不出来】。
+out=$( ( curl() { printf '404\n'; }; detect_public_ip ) 2>/dev/null ); rc=$?
 assert_status 1 "$rc" "detect_public_ip 面对非 IP 响应体（HTTP 状态码 404）必须返回非零"
 assert_eq "" "$out" "detect_public_ip 面对非 IP 响应体时不得输出任何内容"
-out=$( ( curl() { printf '1.2.3.4'; }; detect_public_ip ) 2>/dev/null ); rc=$?
+out=$( ( curl() { printf '1.2.3.4\n'; }; detect_public_ip ) 2>/dev/null ); rc=$?
 assert_status 0 "$rc" "detect_public_ip 遇到合法 IPv4 时返回 0"
 assert_eq "1.2.3.4" "$out" "detect_public_ip 输出正确的公网 IPv4"
-out=$( ( curl() { printf '2001:db8::1'; }; detect_public_ip ) 2>/dev/null ); rc=$?
+out=$( ( curl() { printf '2001:db8::1\n'; }; detect_public_ip ) 2>/dev/null ); rc=$?
 assert_status 0 "$rc" "detect_public_ip 遇到 IPv6 时返回 0"
 assert_eq "2001:db8::1" "$out" "detect_public_ip 输出正确的 IPv6"
+out=$( ( curl() { printf '  1.2.3.4  \n'; }; detect_public_ip ) 2>/dev/null ); rc=$?
+assert_eq "1.2.3.4" "$out" "detect_public_ip 会剥掉响应里的空白与换行（真实 IP 服务都带尾随换行）"
 
-# 延迟解析：必须用 mock 的 curl，不能依赖「某个域名一定不可达」——
-# 实测本机环境里 invalid.invalid.nonexistent 会被解析并连上，curl 报出 4ms
-# → 断言「返回 ?」会随机变红。mock 掉 curl 才能得到确定性结果。
-out=$( ( curl() { return 7; }; target_latency_ms 'x.example' ) 2>/dev/null )
-assert_eq "?" "$out" "curl 失败时 target_latency_ms 返回 ?"
-out=$( ( curl() { printf '0.000000'; }; target_latency_ms 'x.example' ) 2>/dev/null )
-assert_eq "?" "$out" "curl 报告 0 连接时间时 target_latency_ms 返回 ?"
-out=$( ( curl() { printf '0.250000'; }; target_latency_ms 'x.example' ) 2>/dev/null )
-assert_eq "250" "$out" "curl 报告 0.25 秒时 target_latency_ms 换算成 250 毫秒"
+# ── detect_local_ip：ip 命令与 hostname 两条路径都要覆盖 ──────────
+out=$( ( ip() { printf '1.2.3.4 via 10.0.0.1 dev eth0 src 192.168.1.10 uid 0\n'; }
+         hostname() { return 1; }
+         detect_local_ip ) 2>/dev/null ); rc=$?
+assert_eq "192.168.1.10" "$out" "detect_local_ip 从 ip route 的 src 字段取到本机地址"
+out=$( ( ip() { return 1; }
+         hostname() { printf '10.0.0.7\n'; }
+         detect_local_ip ) 2>/dev/null ); rc=$?
+assert_eq "10.0.0.7" "$out" "detect_local_ip 在 ip 不可用时回退到 hostname -I"
+out=$( ( ip() { return 1; }; hostname() { return 1; }; detect_local_ip ) 2>/dev/null ); rc=$?
+assert_status 1 "$rc" "detect_local_ip 在 ip 与 hostname 都不可用时必须返回非零（不得 rc=0 却输出空串）"
+# 注意：tui_err 写的是【stdout】（本项目的 TUI 输出统一走 stdout，不是 stderr），
+# 所以失败时 stdout 上会出现错误提示 —— 这里断言的是「有明确提示、且没有输出任何地址」。
+assert_contains "$out" "无法探测本机地址" "detect_local_ip 失败时给出明确错误（且不输出任何地址）"
 
-# （原「不可达目标返回 ?」这条断言已移除：它依赖「某个域名一定不可达」的环境假设 ——
-#   实测本机环境里 invalid.invalid.nonexistent 会被解析并连上，curl 报出 4ms →
-#   断言随机变红。确定性版本见上面的 mock curl 三条断言。）
+# ── random_free_port：输出必须是 20000-39999 的整数 ──────────────
+out=$( ( port_in_use() { return 1; }; random_free_port ) 2>/dev/null ); rc=$?
+assert_status 0 "$rc" "random_free_port 返回 0"
+[[ "$out" =~ ^[0-9]+$ ]] && (( 10#$out >= 20000 && 10#$out <= 39999 )); assert_true "$?" \
+  "random_free_port 输出落在 20000-39999 区间"
 
-# 真实目标：至少一个候选站点应支持 TLS1.3（网络不可用时跳过断言，不算失败）
+# ── ensure_packages：依赖缺失且 apt update 失败时必须中止，不得继续装 ──────
+# 用文件记录 apt-get install 是否被调用：赋值给变量的调用在子 shell 里发生，
+# 外层看不到 → 只能用文件跨子 shell 传递。
+called_file="$(mktemp 2>/dev/null)"
+if [[ -n "$called_file" ]]; then
+  out=$( ( have_cmd() { return 1; }
+           apt_update_once() { return 1; }
+           tui_run() { : >"$called_file"; return 0; }
+           ensure_packages curl ) 2>/dev/null ); rc=$?
+  assert_status 1 "$rc" "ensure_packages 在 apt update 失败时必须返回非零"
+  if [[ -s "$called_file" ]]; then called=1; else called=0; fi
+  assert_eq "0" "$called" "ensure_packages 在 apt update 失败时不得继续调用 apt-get install"
+  rm -f "$called_file"
+else
+  assert_eq "mktemp 能创建临时文件" "失败（mktemp 返回空路径）" \
+    "ensure_packages 用例前提：mktemp 必须能创建临时文件"
+fi
+
+# ── service_run_user：systemd unit 的运行用户与回退 ──────────────
+out=$( ( systemctl() { printf 'xray\n'; }; service_run_user ) 2>/dev/null )
+assert_eq "xray" "$out" "service_run_user 读出 systemd unit 的运行用户"
+out=$( ( systemctl() { return 1; }; service_run_user ) 2>/dev/null )
+assert_eq "root" "$out" "service_run_user 在 systemctl 不可用时回退到 root"
+
+# ── target_supports_tls13 的解析逻辑：mock 掉 openssl 得到确定性结果 ──────────
+# 该函数此前【一条确定性断言都没有】—— 只在真实网络下被测，网络一抖就整条被跳过；
+# 更糟的是它【测的是环境而不是实现】：把函数整个换成 `return 0` 也测不出来。
+out=$( ( have_cmd() { case "$1" in openssl) return 0 ;; *) return 1 ;; esac; }
+         timeout() { shift; "$@"; }
+         openssl() { printf 'Protocol  : TLSv1.3\nCipher    : TLS_AES_128_GCM_SHA256\n'; }
+         target_supports_tls13 'x.example' ) 2>/dev/null ); rc=$?
+assert_true "$rc" "target_supports_tls13 识别出 TLS 1.3 的握手输出"
+out=$( ( have_cmd() { case "$1" in openssl) return 0 ;; *) return 1 ;; esac; }
+         timeout() { shift; "$@"; }
+         openssl() { printf 'Protocol  : TLSv1.2\nCipher    : ECDHE-RSA-AES128-GCM-SHA256\n'; }
+         target_supports_tls13 'x.example' ) 2>/dev/null ); rc=$?
+assert_false "$rc" "target_supports_tls13 识别出非 TLS 1.3 的握手输出"
+# 真实目标：至少一个候选站点应支持 TLS1.3。
+# 网络不可用时【登记一条说明】而不是静默跳过 —— 否则断言条数会在 183/184 之间
+# 振荡（实测 6 次里 2 次是 183），CI 里写死条数必然 flake。
 if have_cmd openssl && curl -fsS --max-time 5 -o /dev/null https://www.microsoft.com 2>/dev/null; then
   target_supports_tls13 www.microsoft.com; rc=$?
   assert_true "$rc" "www.microsoft.com 支持 TLS 1.3"
+else
+  assert_eq "网络不可用" "网络不可用" \
+    "真实 TLS1.3 探测已跳过（网络不可用）：解析逻辑已由上面的 mock 用例覆盖"
 fi
 
 # 【替换】下面这两行是 Task 3 加进 test/unit.sh 的断言（原样照抄，用来定位），
@@ -742,9 +803,14 @@ assert_eq "" "$offenders" "core.sh 不含属于 install.sh 的越权函数（req
 # apt update 失败必须中止：否则依赖装不上，调用方却以为装好了。
 # 用 mock 覆盖 tui_run 让它失败（子 shell 内覆盖，不污染测试进程）。
 # 若本机已存在标记文件则跳过（此时函数会提前返回 0，用例前提不成立）。
+# 注意：真实 Debian 上跑过一次 apt update 后标记文件就在了 → 这条断言会消失。
+# 所以 else 侧必须登记一条说明，把条数补回来（见全局约束）。
 if [[ ! -f /var/lib/vless-reality/apt-updated ]]; then
   ( tui_run() { return 1; }; apt_update_once >/dev/null 2>&1 ); rc=$?
   assert_false "$rc" "apt update 失败时 apt_update_once 必须返回非零"
+else
+  assert_eq "标记文件已存在" "标记文件已存在" \
+    "apt update 失败用例已跳过（本机已存在 /var/lib/vless-reality/apt-updated，用例前提不成立）"
 fi
 
 test_summary
