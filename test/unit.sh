@@ -751,7 +751,12 @@ called_file="$(mktemp 2>/dev/null)"
 if [[ -n "$called_file" ]]; then
   out=$( ( have_cmd() { return 1; }
            apt_update_once() { return 1; }
-           tui_run() { : >"$called_file"; return 0; }
+           # 标记文件必须【写入内容】：`: >"$called_file"` 只创建空文件（size 0），
+           # 而下面的判定是 `[[ -s "$called_file" ]]`（size > 0）→ 空文件恒为假 →
+           # 这条断言【永远绿、永远不可能变红】（假绿）。
+           # 控制器与实施者各自独立实证：把本行改成写 1 字节后，
+           # 把 ensure_packages 变异成 `apt_update_once || true` 才会红 2 条。
+           tui_run() { printf called >"$called_file"; return 0; }
            ensure_packages curl ) 2>/dev/null ); rc=$?
   assert_status 1 "$rc" "ensure_packages 在 apt update 失败时必须返回非零"
   if [[ -s "$called_file" ]]; then called=1; else called=0; fi
