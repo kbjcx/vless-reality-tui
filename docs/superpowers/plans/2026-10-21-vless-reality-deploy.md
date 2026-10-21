@@ -25,7 +25,7 @@
   - 包管理：`apt-get`
   - 可选：`qrencode`（二维码）`python3`（仅 urlencode 回退）`netstat`（仅 `ss` 不可用时的端口探测回退）
   - 被部署的负载程序：`xray`（由官方 `install-release.sh` 安装，非系统自带，但显然是允许调用的）
-  - **CI / 开发期脚本**（不随分发物发布，可用范围更宽）：`git` `find` `xargs` `diff` `docker` `stat` `wc`
+  - **CI / 开发期脚本**（不随分发物发布，可用范围更宽）：`git` `find` `xargs` `diff` `docker` `stat` `wc` `bash`
 - `lib/tui.sh` **不得**包含任何业务判断、文件写入或系统调用（例外仅两处：`mktemp`/`sed`/`rm` 用于 `tui_run` 捕获输出，`sleep` 用于 spinner 帧间隔）
 - 状态文件 `/etc/vless-reality/deploy.env` 权限 `600`，状态目录 `700`；客户端导出目录 `/root/vless-reality/` 权限 `700`
 - 服务端配置写入流程恒为：**写临时文件 → `xray run -test` 校验 → 通过才 `mv` 原子替换**；不通过则保留旧配置并原样输出 xray 报错
@@ -1430,6 +1430,14 @@ assert_eq "1234" "$out" "core.sh 的声明块保留调用方预设的全局变�
 out=$( ( have_cmd() { return 1; }; od() { return 1; }; random_hex 4 ) 2>&1 ); rc=$?
 assert_status 1 "$rc" "random_hex 在 openssl 与 od 都不可用时返回非零"
 assert_eq "" "$out" "random_hex 失败时不输出任何内容"
+# openssl 分支的静默失败必须单独覆盖：旧写法 `openssl ... | tr ...; return 0`
+# 的末尾是【显式】return 0，管道退出码取的是 tr 的 → openssl 失败时返回 0
+# 但输出为空。测试入口的 pipefail 也救不了它（显式 return 0 直接覆盖管道状态）。
+# 只 mock「openssl 不存在」是抓不到这个缺陷的 —— 必须让 have_cmd 说 openssl 存在、
+# 而 openssl 本身失败。
+out=$( ( have_cmd() { return 0; }; openssl() { return 1; }; od() { return 1; }; random_hex 4 ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "random_hex 在 openssl 失败时返回非零（不得静默返回空串）"
+assert_eq "" "$out" "random_hex 在 openssl 失败时不输出任何内容"
 out=$( ( openssl() { printf 'NOTHEX'; }; random_hex 4 ) 2>&1 ); rc=$?
 assert_status 0 "$rc" "openssl 输出非十六进制时退回 /dev/urandom 而不是把垃圾返回"
 assert_eq "8" "$(printf '%s' "$out" | wc -c | tr -d ' ')" "回退后输出恰好 8 个十六进制字符"
@@ -1560,22 +1568,62 @@ rm -rf "$perm_dir"
 ```bash
 test_case "core 网络探测（用可控输入验证解析逻辑）"
 
-# 端口判定：用一个必然空闲的高位端口。
-# 注意：port_in_use / target_supports_tls13 的结果在【退出码】上，
-# 不能写成 assert_false "$(port_in_use 59999)" —— $( ) 捕获的是 stdout（空串），
-# 退出码被丢掉，断言会恒真通过（测不出任何东西）。
-port_in_use 59999; rc=$?
-assert_false "$rc" "高位端口 59999 判定为空闲"
-assert_eq "" "$(port_occupant 59999)" "空闲端口无占用进程"
+# 端口判定：结果在【退出码】上，不能写成 assert_false "$(port_in_use 59999)" ——
+# $( ) 捕获的是 stdout（空串），退出码被丢掉，断言会恒真通过（测不出任何东西）。
+# 也不能依赖「59999 恰好是空闲的」这种环境假设：用 mock 的 ss 构造确定场景。
+SS_HDR='State Recv-Q Send-Q Local Address:Port Peer Address:Port\n'
+mock_port_in_use() {
+  local ssout="$1" port="$2"
+  (
+    have_cmd() { case "$1" in ss) return 0 ;; netstat) return 1 ;; *) return 1 ;; esac; }
+    ss() { printf '%b' "$ssout"; }
+    port_in_use "$port" >/dev/null 2>&1
+  )
+}
+mock_port_in_use "${SS_HDR}LISTEN 0 128 0.0.0.0:59999 0.0.0.0:*\n" 59999; rc=$?
+assert_true "$rc" "port_in_use 识别出被占用的端口（mock ss）"
+mock_port_in_use "$SS_HDR" 59999; rc=$?
+assert_false "$rc" "port_in_use 识别出空闲的端口（mock ss 只有表头）"
+# 子串陷阱：":8080" 里就含 ":80" —— 对整行 grep 会把 :8080 误判成 :80 已被占用
+mock_port_in_use "${SS_HDR}LISTEN 0 128 0.0.0.0:8080 0.0.0.0:*\n" 80; rc=$?
+assert_false "$rc" "port_in_use 不得把 :8080 误判成 :80 已占用（按字段精确匹配）"
+# port_occupant 的解析同样用 mock 构造确定场景
+out=$( ( have_cmd() { case "$1" in ss) return 0 ;; *) return 1 ;; esac; }
+            ss() { printf '%b' "${SS_HDR}LISTEN 0 128 0.0.0.0:59999 0.0.0.0:* users:((nginx,pid=1,fd=2))\n"; }
+            port_occupant 59999 ) 2>&1 )
+assert_contains "$out" "pid=1" "port_occupant 解析出占用进程的描述"
+out=$( ( have_cmd() { case "$1" in ss) return 0 ;; *) return 1 ;; esac; }
+            ss() { printf '%b' "$SS_HDR"; }
+            port_occupant 59999 ) 2>&1 )
+assert_eq "" "$out" "port_occupant 在端口空闲时输出为空"
 
-# 延迟解析：传入一个必然超时的域名，应返回 '?'
-assert_eq "?" "$(target_latency_ms 'invalid.invalid.nonexistent' 2>/dev/null)" "不可达目标返回 ?"
+# 延迟解析：必须用 mock 的 curl，不能依赖「某个域名一定不可达」——
+# 实测本机环境里 invalid.invalid.nonexistent 会被解析并连上，curl 报出 4ms
+# → 断言「返回 ?」会随机变红。mock 掉 curl 才能得到确定性结果。
+out=$( ( curl() { return 7; }; target_latency_ms 'x.example' ) 2>/dev/null )
+assert_eq "?" "$out" "curl 失败时 target_latency_ms 返回 ?"
+out=$( ( curl() { printf '0.000000'; }; target_latency_ms 'x.example' ) 2>/dev/null )
+assert_eq "?" "$out" "curl 报告 0 连接时间时 target_latency_ms 返回 ?"
+out=$( ( curl() { printf '0.250000'; }; target_latency_ms 'x.example' ) 2>/dev/null )
+assert_eq "250" "$out" "curl 报告 0.25 秒时 target_latency_ms 换算成 250 毫秒"
+
+# （原「不可达目标返回 ?」这条断言已移除：它依赖「某个域名一定不可达」的环境假设 ——
+#   实测本机环境里 invalid.invalid.nonexistent 会被解析并连上，curl 报出 4ms →
+#   断言随机变红。确定性版本见上面的 mock curl 三条断言。）
 
 # 真实目标：至少一个候选站点应支持 TLS1.3（网络不可用时跳过断言，不算失败）
 if have_cmd openssl && curl -fsS --max-time 5 -o /dev/null https://www.microsoft.com 2>/dev/null; then
   target_supports_tls13 www.microsoft.com; rc=$?
   assert_true "$rc" "www.microsoft.com 支持 TLS 1.3"
 fi
+
+# 【替换】下面这两行是 Task 3 加进 test/unit.sh 的断言（原样照抄，用来定位），
+# 必须被下面那条收窄后的断言【替换掉】，不是并存：
+#   offenders="$(grep -nE '^[[:space:]]*(function[[:space:]]+)?(require_root|is_modern_debian|detect_public_ip|detect_local_ip|port_in_use|port_occupant|random_free_port|target_supports_tls13|target_latency_ms|apt_update_once|ensure_packages|service_run_user)[[:space:]]*(\(\))?[[:space:]]*[{]' "$ROOT/lib/core.sh" | tr '\n' ' ')"
+#   assert_eq "" "$offenders" "core.sh 不含属于 install.sh / Task 4 的越权函数"
+# 收窄后只剩 install.sh 拥有的 require_root / is_modern_debian。
+offenders="$(grep -nE '^[[:space:]]*(function[[:space:]]+)?(require_root|is_modern_debian)[[:space:]]*(\(\))?[[:space:]]*[{]' "$ROOT/lib/core.sh" | tr '\n' ' ')"
+assert_eq "" "$offenders" "core.sh 不含属于 install.sh 的越权函数（require_root / is_modern_debian）"
 
 # apt update 失败必须中止：否则依赖装不上，调用方却以为装好了。
 # 用 mock 覆盖 tui_run 让它失败（子 shell 内覆盖，不污染测试进程）。
@@ -1629,7 +1677,10 @@ detect_local_ip() {
 port_in_use() {
   local port="$1"
   if have_cmd ss; then
-    ss -ltn "sport = :$port" 2>/dev/null | grep -q ":$port" && return 0
+    # 必须按【字段】精确匹配，不能对整行 grep ":$port"：
+    # ":8080" 这个字符串里就含 ":80" → 全行 grep 会把 8080 误判成 80 已被占用，
+    # 于是向导会以为端口 80 被占而改选别的端口。NR>1 跳过 ss 的表头行。
+    ss -ltn "sport = :$port" 2>/dev/null | awk 'NR>1{print $4}' | grep -qE "[:.]$port\$" && return 0
     return 1
   fi
   if have_cmd netstat; then
@@ -1691,7 +1742,9 @@ apt_update_once() {
     return 1
   fi
   mkdir -p /var/lib/vless-reality
-  touch /var/lib/vless-reality/apt-updated
+  # 用 `: >` 而不是 touch：touch 不在运行时白名单里，而 `: >` 是 shell 重定向，
+  # 不调用任何外部命令（效果等同「创建或清空该文件」）。
+  : > /var/lib/vless-reality/apt-updated
   return 0
 }
 
@@ -1715,6 +1768,10 @@ service_run_user() {
   printf '%s' "$u"
 }
 ```
+
+> **注**：Task 3 的 Step 3 代码块是 `lib/core.sh` 的 **Task 3 部分**。
+> 本任务在其**末尾追加**网络探测函数；追加之后，整份 `lib/core.sh` 不再与
+> Task 3 的代码块逐字节相同（Task 3 修复轮的「diff 为空」验收只在 Task 3 期间有效）。
 
 **Step 4: 运行测试确认通过**
 
