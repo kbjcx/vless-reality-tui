@@ -665,7 +665,14 @@ deploy_wizard() {
             # ⚠️ 必须是 10#$PORT（带 $）：bash 不会在 10# 后解析【变量名】，
             #    10#PORT 会被当成「以 10 为基的数字 PORT」→ 直接报
             #    "value too great for base" → 用户手动指定的端口【必然】被判非法。
-            [[ "$PORT" =~ ^[0-9]+$ ]] && (( 10#$PORT > 0 && 10#$PORT < 65536 )) || { tui_err "端口非法"; return 1; } ;;
+            [[ "$PORT" =~ ^[0-9]+$ ]] && (( 10#$PORT > 0 && 10#$PORT < 65536 )) || { tui_err "端口非法"; return 1; }
+            # 手动指定的端口同样必须复查占用：只校验范围不校验占用 →
+            # 用户会一路走到 systemd 才炸，首句报错是「systemd 配置失败」，
+            # 与真实原因（端口被占）完全无关 —— 正是本轮修掉的 T9-7 抱怨过的那类错。
+            if port_in_use "$PORT"; then
+              tui_err "端口 $PORT 已被占用，请另选一个。"
+              return 1
+            fi ;;
         *) tui_info "已取消部署"; return 1 ;;
       esac
     fi
@@ -761,9 +768,182 @@ deploy_wizard() {
     cat "$OUT_DIR/qrcode.txt"
   fi
 
-  if [[ ${OPT_YES:-0} -eq 0 ]]; then
+  # ⚠️ 已经在管理菜单里就【不要】再开一层：
+  #    管理菜单的第 0 项「重新部署」会调 deploy_wizard，
+  #    而这里又会调 management_menu → 用户在菜单里选一次「重新部署」，
+  #    部署完就掉进第二层菜单，再选一次「重新部署」就是第三层。
+  #    用 IN_MENU 标志位把这条回路掐断。
+  #    用 ${IN_MENU:-0} 读：deploy.sh 被单独 source（单元测试 / helper）时
+  #    它可能根本没定义，在 set -u 下直接引用会报 unbound variable。
+  if [[ ${OPT_YES:-0} -eq 0 && "${IN_MENU:-0}" -eq 0 ]]; then
     tui_pause
     management_menu
   fi
   return 0
+}
+menu_show_client() {
+  if ! state_exists; then
+    tui_warn "尚未部署，无客户端信息可显示。"
+    return 1
+  fi
+  load_state || return 1
+  local link
+  link=$(build_share_link "$UUID" "$SERVER_IP" "$PORT" "$SNI" "$PUBLIC_KEY" "$SHORT_ID" "$REMARK")
+  # 生成为空说明参数有问题（缺 UUID/公钥/地址）→ 必须报错，不能展示一片空白。
+  [[ -n "$link" ]] || { tui_err "分享链接生成为空，状态文件可能不完整。"; return 1; }
+  tui_panel "当前节点" \
+    "地址|$SERVER_IP:$PORT" \
+    "UUID|$UUID" \
+    "SNI|$SNI" \
+    "公钥 pbk|$PUBLIC_KEY" \
+    "ShortID sid|$SHORT_ID" \
+    "备注|$REMARK"
+  tui_box "分享链接"
+  tui_box_line "$link"
+  tui_box_end
+  if [[ -f "$OUT_DIR/qrcode.txt" ]]; then
+    tui_section "终端二维码"
+    cat "$OUT_DIR/qrcode.txt"
+  fi
+  return 0
+}
+
+menu_restart() {
+  restart_service
+}
+
+menu_logs() {
+  tui_info "实时日志输出，Ctrl+C 退出"
+  # -f 是跟随模式，会一直挂着直到用户 Ctrl+C。
+  # 非 TTY（CI / 单元测试）下必须由调用方 mock 掉，否则会永久阻塞。
+  journalctl -u xray -f --no-pager
+}
+
+menu_update_xray() {
+  # 依赖装不上就必须停在这里：继续往下走会下载安装脚本、失败，
+  # 报出来的却是「下载失败」——错误信息与真实原因无关。
+  ensure_packages curl ca-certificates || { tui_err "依赖安装失败，无法更新 Xray。"; return 1; }
+  local installer
+  # mktemp 可能失败（磁盘满 / 目录不可写）→ 拿到空路径后 curl -o "" 会失败，
+  # 而且 rm -f "" 会报 "cannot remove ''"。必须先守卫。
+  installer=$(mktemp 2>/dev/null)
+  if [[ -z "$installer" ]]; then
+    tui_err "无法创建临时文件，更新中止。"
+    return 1
+  fi
+  curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o "$installer" || {
+    tui_err "下载安装脚本失败"; rm -f "$installer"; return 1; }
+  chmod +x "$installer" || { tui_err "无法设置安装脚本权限"; rm -f "$installer"; return 1; }
+  tui_run "更新 Xray 内核" bash "$installer" install
+  local rc=$?
+  rm -f "$installer"
+  [[ $rc -eq 0 ]] && restart_service
+  return $rc
+}
+
+menu_tune() {
+  # 必须先确认「已部署」：未部署时 $PORT 是【空串】（core.sh 给的全局默认值），
+  # 此时 open_firewall "" 会去执行 `ufw allow "/tcp"` / `iptables --dport ""` /
+  # `nft ... tcp dport ""` —— 三条全部报错，而且报出来的错与真实原因
+  # （压根没部署、根本没有端口）完全无关。
+  # menu_show_client 与 menu_rotate_keys 都有这道守卫，menu_tune 原来漏了。
+  state_exists || { tui_warn "尚未部署，无端口可放行，无法调优。"; return 1; }
+  load_state || { tui_err "状态文件读取失败，无法调优。"; return 1; }
+  # 不能用 `|| true` 吞掉失败：防火墙没放行、BBR 没开，
+  # 用户却只看到 service_status 的输出 → 以为调优成功了。
+  # 两个动作互相独立，所以各自报错、最后统一返回。
+  local rc=0
+  open_firewall "$PORT" || { tui_err "防火墙放行失败，请检查 ufw/iptables/nft。"; rc=1; }
+  enable_bbr || { tui_warn "BBR 未启用（内核不支持或权限不足），不影响部署可用性。"; }
+  service_status
+  return $rc
+}
+
+menu_rotate_keys() {
+  state_exists || { tui_warn "尚未部署，无密钥可轮换"; return 1; }
+  # load_state 自 Task 3 修复轮 1 起会对损坏的状态文件返回非零 → 必须检查，
+  # 否则会用空值渲染出一份非法配置，再被 xray 校验拒绝，报错与真实原因无关。
+  load_state || { tui_err "状态文件读取失败，无法轮换密钥。"; return 1; }
+  tui_confirm "轮换密钥与 UUID 会使所有旧客户端失效，继续？" "n" || { tui_info "已取消"; return 0; }
+  gen_keys || return 1
+  local cfg
+  cfg=$(mktemp 2>/dev/null)
+  if [[ -z "$cfg" ]]; then
+    tui_err "无法创建临时文件，密钥轮换中止。"
+    return 1
+  fi
+  render_server_config "$cfg" "$UUID" "$PRIVATE_KEY" "$SNI" "$PORT" "$SHORT_ID" || { rm -f "$cfg"; return 1; }
+  # 与 do_deploy 走同一个入口：write_config_atomic（校验 → 原子替换 → 600）
+  write_config_atomic "$XRAY_CONFIG" "$cfg" || { rm -f "$cfg"; return 1; }
+  rm -f "$cfg"
+  # ⚠️ 这一步失败时，服务端配置【已经】换成新密钥了，而状态文件还是旧的
+  #    （旧 UUID / 旧公钥）→ 分享链接里的公钥与服务端实际公钥对不上 →
+  #    客户端导入后连不上，而用户只看到一句「状态保存失败」。
+  #    所以提示里必须如实说明「配置已换、状态没落盘」，并给出补救动作。
+  save_state || { tui_err "状态保存失败：服务端配置已更新为新密钥，但状态文件未落盘。"; tui_tip "请用 install.sh --status 核对，或重新执行一次部署。"; return 1; }
+  restart_service || return 1
+  # 物料导出失败必须报错：否则「密钥已轮换」这条提示会让人以为
+  # client.json / link.txt 已经是新的，实际还是旧的（甚至根本没生成）。
+  export_client_artifacts "$OUT_DIR" "$UUID" "$SERVER_IP" "$PORT" "$SNI" "$PUBLIC_KEY" "$SHORT_ID" "$REMARK" \
+    || { tui_err "客户端物料导出失败，密钥已轮换但客户端文件未更新。"; return 1; }
+  tui_ok "密钥已轮换，请使用新的分享链接更新客户端"
+}
+
+menu_uninstall() {
+  # 单文件分发版（dist/install.sh）里没有 uninstall.sh → exec 会失败并让菜单崩掉。
+  if [[ ! -x "$ROOT_DIR/uninstall.sh" ]]; then
+    tui_warn "当前目录没有 uninstall.sh（单文件分发版不含卸载脚本）。"
+    tui_tip "请手动执行：systemctl disable --now xray && rm -f $XRAY_CONFIG"
+    return 1
+  fi
+  exec "$ROOT_DIR/uninstall.sh"
+}
+
+management_menu() {
+  # ⚠️ 防止「管理菜单 ↔ deploy_wizard」互相递归：
+  #    菜单第 0 项「重新部署」会调 deploy_wizard，而 deploy_wizard 末尾又会调
+  #    management_menu → 用户在菜单里选一次「重新部署」，部署完就掉进第二层菜单，
+  #    再选一次「重新部署」就是第三层。
+  #    用全局标志位告诉 deploy_wizard「现在已经在菜单里了，别再开一层」。
+  #    用 ${IN_MENU:-0} 读：deploy.sh 被单独 source（单元测试 / helper）时它可能没定义，
+  #    在 set -u 下直接引用会报 unbound variable。
+  IN_MENU=1
+  while true; do
+    tui_banner "$APP_NAME" "管理菜单"
+    if ! state_exists; then
+      tui_warn "尚未部署。选「重新部署」开始，或直接退出。"
+    fi
+    local choice=0 crc=0
+    # 菜单必须渲染到 stderr：tui_menu 把整张菜单打到 stdout，而 deploy_wizard
+    # 末尾会调 management_menu —— 一旦有人用 $(...) 捕获它，菜单文本就会被
+    # 当成返回值吞进去。与 choose_target 是同一个坑。
+    tui_menu "请选择操作" \
+      "重新部署（重跑向导）" \
+      "查看配置 / 分享链接 / 二维码" \
+      "重启服务" \
+      "实时日志（tail -f）" \
+      "更新 Xray 内核" \
+      "网络调优（BBR / 防火墙）" \
+      "轮换密钥与 UUID" \
+      "卸载" \
+      "退出" >&2 || crc=$?
+    if (( crc == 255 )); then
+      tui_info "已退出"
+      return 0
+    fi
+    choice=$crc
+    case "$choice" in
+      0) deploy_wizard ;;
+      1) menu_show_client ;;
+      2) menu_restart ;;
+      3) menu_logs ;;
+      4) menu_update_xray ;;
+      5) menu_tune ;;
+      6) menu_rotate_keys ;;
+      7) menu_uninstall ;;
+      8) tui_info "已退出"; return 0 ;;
+      *) return 0 ;;
+    esac
+    tui_pause
+  done
 }
