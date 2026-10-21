@@ -476,6 +476,14 @@ assert_eq "1234" "$out" "core.sh 的声明块保留调用方预设的全局变�
 out=$( ( have_cmd() { return 1; }; od() { return 1; }; random_hex 4 ) 2>&1 ); rc=$?
 assert_status 1 "$rc" "random_hex 在 openssl 与 od 都不可用时返回非零"
 assert_eq "" "$out" "random_hex 失败时不输出任何内容"
+# openssl 分支的静默失败必须单独覆盖：旧写法 `openssl ... | tr ...; return 0`
+# 的末尾是【显式】return 0，管道退出码取的是 tr 的 → openssl 失败时返回 0
+# 但输出为空。测试入口的 pipefail 也救不了它（显式 return 0 直接覆盖管道状态）。
+# 只 mock「openssl 不存在」是抓不到这个缺陷的 —— 必须让 have_cmd 说 openssl 存在、
+# 而 openssl 本身失败。
+out=$( ( have_cmd() { return 0; }; openssl() { return 1; }; od() { return 1; }; random_hex 4 ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "random_hex 在 openssl 失败时返回非零（不得静默返回空串）"
+assert_eq "" "$out" "random_hex 在 openssl 失败时不输出任何内容"
 out=$( ( openssl() { printf 'NOTHEX'; }; random_hex 4 ) 2>&1 ); rc=$?
 assert_status 0 "$rc" "openssl 输出非十六进制时退回 /dev/urandom 而不是把垃圾返回"
 assert_eq "8" "$(printf '%s' "$out" | wc -c | tr -d ' ')" "回退后输出恰好 8 个十六进制字符"
@@ -507,6 +515,20 @@ if [[ -n "$bad_dir" ]]; then
   printf 'PORT=443\nfalse\n' > "$bad_dir/lastfalse.env"
   out=$( ( STATE_FILE="$bad_dir/lastfalse.env"; load_state ) 2>&1 ); rc=$?
   assert_status 0 "$rc" "load_state 对末条命令返回非零的合法状态文件仍视为可读"
+  # 「读不到」与「格式错」必须分开报：不可读是权限问题，提示去改格式会把人带偏。
+  out=$( ( STATE_FILE="$bad_dir/absent.env"; load_state ) 2>&1 ); rc=$?
+  assert_status 1 "$rc" "load_state 对不存在的状态文件返回非零（读不到 ≠ 格式错）"
+  assert_contains "$out" "状态文件不存在" \
+    "load_state 对读不到的状态文件报『不存在』而不是笼统失败"
+  # F-3：load_state 绝不能把状态文件【执行两次】。
+  # 旧写法先在子 shell 里 source 一遍做「静默探测」，再正式 source 一遍
+  # → 文件里的副作用发生两次（且第一次发生在子 shell 里，调用方看不见）。
+  # 计数方式：状态文件里放一条会追加一行的命令，source 一次就多一行。
+  printf 'PORT=443\nprintf "x\\n" >> "%s/sidefx"\n' "$bad_dir" > "$bad_dir/sidefx.env"
+  out=$( ( STATE_FILE="$bad_dir/sidefx.env"; load_state ) 2>&1 ); rc=$?
+  assert_status 0 "$rc" "load_state 对带副作用的合法状态文件仍视为可读"
+  assert_eq "1" "$(wc -l < "$bad_dir/sidefx" 2>/dev/null | tr -d ' ')" \
+    "load_state 只把状态文件执行一次（不得用子 shell 探测导致双执行）"
 else
   assert_eq "mktemp -d 能创建唯一临时目录" "失败（mktemp -d 返回空路径）" \
     "load_state 失败路径用例前提：mktemp -d 必须能创建唯一临时目录"
@@ -514,13 +536,48 @@ fi
 rm -rf "$bad_dir"
 
 # ── M-7：urlencode 两个分支的 stdout 必须逐字节一致 ──────────
+# 断言盲区（复评 M-7 / F-5）：原先直接对比「真实 python 分支输出」与「回退分支输出」。
+# 在 python3 缺失、或 python3 存在但【功能异常】（本机是 MS Store 坏存根：
+# command -v 成功、运行退出码 49）的机器上，两侧其实【都是回退分支】——
+# 这条断言恒真，等于什么都没测。
+# 修法：把对比基准换成【确定性的 mock python3】——
+# 它用与 lib/core.sh 回退实现【不同的算法】（按字节取十六进制码）算百分号编码，
+# 因此这条断言在任何机器上都能真正验证回退实现的字节级正确性；
+# 真实 python3 功能可用时，再额外做一次真实两分支对比。
 enc_all="a b'c\\d中文"
-enc_py="$(urlencode "$enc_all")"
+# mock python3：等价实现 RFC 3986 的 quote(s, safe="")。
+# 真实调用形如 python3 -c '<代码>' '<输入>' → 被编码的串是【最后一个】参数。
+mock_python3() {
+  local s="${!#}" i len out='' ch hex
+  local LC_ALL=C
+  len=${#s}
+  for ((i = 0; i < len; i++)); do
+    ch="${s:i:1}"
+    if [[ "$ch" == [a-zA-Z0-9.~_-] ]]; then
+      out+="$ch"
+    else
+      hex=$(printf '%s' "$ch" | od -An -tx1 | tr -d ' \n')
+      out+="%${hex^^}"
+    fi
+  done
+  printf '%s' "$out"
+}
+enc_mock="$( ( python3() { mock_python3 "$@"; }; urlencode "$enc_all" ) )"
 enc_fb="$( ( have_cmd() { return 1; }; urlencode "$enc_all" ) )"
-assert_eq "$enc_py" "$enc_fb" "urlencode 的 python 分支与回退分支输出逐字节一致"
-assert_eq "a%20b%27c%5Cd%E4%B8%AD%E6%96%87" "$enc_py" "urlencode 编码结果正确"
+assert_eq "$enc_mock" "$enc_fb" "urlencode 的 python 分支与回退分支输出逐字节一致（mock python3 基准）"
+assert_eq "a%20b%27c%5Cd%E4%B8%AD%E6%96%87" "$enc_fb" "urlencode 回退分支编码结果正确"
 raw_enc="$(urlencode 'abc' | od -An -c | tr -d ' ')"
 assert_eq "abc" "$raw_enc" "urlencode 输出不含多余的尾换行（od 逐字节可见）"
+# 真实 python3 【功能可用】时（不只是 command -v 找得到），再对比一次真实分支。
+if python3 -c 'import sys,urllib.parse' >/dev/null 2>&1; then
+  enc_real="$(urlencode "$enc_all")"
+  assert_eq "$enc_real" "$enc_fb" "urlencode 的真实 python3 分支与回退分支输出逐字节一致"
+else
+  # python3 不可用不是缺陷（回退分支正是为此存在），此处【不断言失败】，
+  # 只登记一条说明以保持断言条数稳定；python 分支已由上面的 mock 用例覆盖。
+  assert_eq "python3 功能不可用" "python3 功能不可用" \
+    "python3 功能探测未通过：真实 python3 分支对比跳过（已由 mock python3 用例覆盖）"
+fi
 
 # ── O-1：detect_os 必须能处理 CRLF 行尾的 os-release ─────────
 crlf_os=$(mktemp 2>/dev/null)

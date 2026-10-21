@@ -210,22 +210,36 @@ save_state() {
 }
 
 load_state() {
-  [[ -f "$STATE_FILE" ]] || return 1
-  # 状态文件是纯变量赋值，正常 source 必定【静默】。
-  # 先在子 shell 里做一次静默探测：语法错误一定有 stderr 输出，而
-  # 「文件最后一条命令返回非零」不会 —— 这样只抓真正的语法错误，
-  # 不会把合法状态文件误判成损坏。命令替换跑在子 shell，变量不会落到当前
-  # 作用域，所以探测之后还要再 source 一次。
-  local probe_err=''
-  probe_err=$( . "$STATE_FILE" 2>&1 >/dev/null ) || true
-  if [[ -n "$probe_err" ]]; then
+  # 「读不到」与「格式错」必须分开报（复评 F-4）：
+  # 早期写法是 [[ -f "$STATE_FILE" ]] || return 1 —— 静默返回，调用方无从判断
+  # 是「还没部署过」还是「状态文件坏了」；而对「文件存在但不可读」的情况，
+  # 子 shell 探测会把权限错误当成「格式错误」报出来，把人带偏。
+  if [[ ! -f "$STATE_FILE" ]]; then
+    tui_err "状态文件不存在：$STATE_FILE"
+    return 1
+  fi
+  if [[ ! -r "$STATE_FILE" ]]; then
+    tui_err "状态文件不可读：$STATE_FILE"
+    return 1
+  fi
+  # 只【解析】不【执行】：用 bash -n 做语法检查。
+  # 早期写法是在子 shell 里 source 一遍做「静默探测」，
+  # 那会把状态文件【执行两次】（探测一次、正式读一次）——
+  # 文件里一旦有副作用就会发生两次，且第一次的副作用对调用方不可见。
+  # bash -n 只做语法分析、不执行任何语句，因此没有副作用
+  # （实测：含 $(touch x) 的状态文件经 bash -n 之后副作用未发生）。
+  # 实测：语法错误 → rc=2 且 stderr 有 "syntax error"；
+  #       合法文件（含末条 false）→ rc=0 且 stderr 为空。
+  local syntax_err=''
+  syntax_err=$( "${BASH:-bash}" -n -- "$STATE_FILE" 2>&1 ) || true
+  if [[ -n "$syntax_err" ]]; then
     tui_err "状态文件格式错误：$STATE_FILE"
-    tui_tip "${probe_err%%$'\n'*}"
+    tui_tip "${syntax_err%%$'\n'*}"
     return 1
   fi
   # shellcheck disable=SC1090
   # 这里的返回码【不作为失败判据】：状态文件最后一条命令返回非零是合法的
-  # （例如末尾是一条返回 1 的语句），真正坏掉的文件已在上面的探测里被拦下。
+  # （例如末尾是一条返回 1 的语句），真正坏掉的文件已在上面的语法检查里被拦下。
   . "$STATE_FILE" || true
   return 0
 }
