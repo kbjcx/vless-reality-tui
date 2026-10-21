@@ -3264,7 +3264,12 @@ assert_contains "$dep" 'tui_box_text "分享链接" "$link"' \
 test_case "Task 13：README 的验证状态声明"
 
 rmd=$(cat "$ROOT/README.md" 2>/dev/null)
-assert_contains "$rmd" "验证状态声明" "README 里有「验证状态声明」小节"
+# ⚠️ 判据必须是【标题级】：README **开头的引导语**里也写着
+#    「请先读 [验证状态声明](#验证状态声明)」→ 只查「出现过这个词」的话，
+#    把小节**标题**改名了这条断言照样绿（控制器实测：rc=0、0 条红）。
+#    → 剔掉 ``` 围栏后只认 markdown 的标题行（与下面 9 个小节同款判据）。
+rmd_heads=$(awk 'BEGIN{inb=0} /^```/{inb=!inb; next} !inb && /^#+ /{print}' "$ROOT/README.md" 2>/dev/null || true)
+assert_true "$(grep -qE '^#+ .*验证状态声明' <<<"$rmd_heads" && echo 0 || echo 1)" "README 有「验证状态声明」小节"
 # 下面逐条点名：未验证项必须【逐条】列出，不能含糊成一句「仅供参考」。
 assert_contains "$rmd" "权限位" "声明里点名：权限位 600/700 未在 Debian 真机验证"
 assert_contains "$rmd" "Debian 真机" "声明里点名：Debian 真机端到端未验证"
