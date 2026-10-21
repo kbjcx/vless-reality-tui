@@ -212,7 +212,12 @@ bash test/unit.sh
 # 硬约束：本文件不得包含任何业务逻辑、文件写入或系统调用。
 # （Task 2 的 tui_run 需要 mktemp 捕获命令输出，是这条约束的唯一例外。）
 
-TUI_TTY=0; TUI_COLOR=0; TUI_WIDTH=80; TUI_UNICODE=1
+TUI_TTY=0; TUI_COLOR=0; TUI_WIDTH=80
+# TUI_UNICODE 留空表示「自动探测」（由 tui_init 按 locale 判定）；
+# 显式设为 1/0 可强制 Unicode / ASCII。
+# 必须留空而不能写死 1：否则下面 tui_init 里的「显式覆盖」分支恒真，
+# locale 探测分支将永远不可达，LANG=C → ASCII 的降级规则形同虚设。
+TUI_UNICODE="${TUI_UNICODE:-}"
 
 C_RESET=''; C_BOLD=''; C_DIM=''
 C_RED=''; C_GREEN=''; C_YELLOW=''; C_BLUE=''; C_CYAN=''; C_MAGENTA=''; C_WHITE=''; C_GRAY=''
@@ -232,6 +237,8 @@ tui_init() {
   #   - 其它情况（如 LANG=C）→ 降级 ASCII
   local loc="${LC_ALL:-${LC_CTYPE:-${LANG:-}}}"
   if [[ -n "${TUI_ASCII:-}" ]]; then
+    TUI_UNICODE=0
+  elif [[ "${TUI_UNICODE:-}" == "0" ]]; then
     TUI_UNICODE=0
   elif [[ -n "${TUI_UNICODE:-}" ]]; then
     TUI_UNICODE=1
@@ -443,6 +450,9 @@ tui_panel() {
     "$C_ACCENT" "$(tui_repeat "$B_H" $n)" "$B_TR$C_RESET"
   for entry in "$@"; do
     k="${entry%%|*}"; v="${entry#*|}"
+    # 格式串占位符必须与实参个数严格相等（11 个 %s ↔ 11 个实参）：
+    # 多一个 %s 会让 bash printf 把空串补上去，从而把一个分隔空格挤到
+    # 右边框【之后】——行宽仍是 80，但右边框会停在第 79 列、与角标错开 1 列。
     printf '  %s%s%s %s%s%s%s %s%s%s %s%s%s\n' "$C_ACCENT" "$B_V" "$C_RESET" "$C_GRAY" \
       "$(tui_pad "$k" 18)" "$C_RESET" "$C_WHITE" "$(tui_pad "$v" $vw)" "$C_RESET" \
       "$C_ACCENT$B_V" "$C_RESET"
@@ -482,6 +492,18 @@ git commit -m "feat(tui): 基础层——颜色、宽度计算、边框与消息
 ---
 
 ## Task 2: TUI 交互层（菜单/输入/确认/spinner）
+
+> **给实施者的两条交接提醒（来自 Task 1 复评，务必遵守）：**
+> 1. **只追加，不重写**：`lib/tui.sh` 的基础层已通过评审并修好了若干坑——
+>    locale 无关的 `tui_dwidth`（按字节解码 UTF-8、校验续字节、跳过 ANSI 序列）、
+>    用真实 ESC 字节的 `tui_strip`、统一的框线几何（内容行 = `2空格+│+空格+(W-6)+空格+│`）、
+>    Unicode→ASCII 降级。**这些都不要再动**，你只负责追加交互组件。
+> 2. **不要依赖 `tui_strip` 处理非 SGR 序列**：它只剥 `ESC[...m` 形式，
+>    不处理光标移动（`ESC[nA`、`ESC[J`）与 OSC。菜单重绘若要测宽，
+>    请用 `tui_dwidth`（它会自行跳过 ANSI 序列），不要用 `tui_strip`。
+> 3. `tui_run` 的签名必须为 `tui_run <消息> <命令> [参数...]`——
+>    `lib/core.sh` 的 `apt_update_once` 与 `ensure_packages` 已按此形状调用它，
+>    签名不符会导致依赖静默不装而部署继续。
 
 **Files:**
 - Modify: `lib/tui.sh`（追加交互组件）
