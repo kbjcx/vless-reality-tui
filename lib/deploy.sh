@@ -91,6 +91,10 @@ render_server_config() {
     || { tui_err "ShortID 格式非法（只允许十六进制，长度 2-16）：$sid"; return 1; }
   validate_hostname "$sni" || { tui_err "SNI 主机名非法：$sni"; return 1; }
 
+  # 目标路径如果是【已存在的目录】：后面的 `mv -f "$tmp" "$outfile"` 会把文件
+  # 【移进目录里】而不是替换目标 → mv 返回 0（看起来成功）但配置根本没落到
+  # outfile → 调用方以为渲染成功，实际拿到的不是配置。必须先挡住。
+  [[ -d "$outfile" ]] && { tui_err "目标路径是目录，不能作为配置文件：$outfile"; return 1; }
   local tmp="$outfile.render"
   # cat 的退出码必须检查：目标目录不存在时，重定向失败会漏出原始 bash 报错，
   # 用户看到的是「No such file or directory」而不是我们自己的提示。
@@ -192,13 +196,32 @@ EOF
   mv -f "$tmp" "$outfile" || { tui_err "无法写入配置：$outfile"; rm -f "$tmp"; return 1; }
 }
 
+# 判断一段 xray 报错是不是「这个写法不被支持」而不是「配置本身有问题」。
+# 只认 -c 的旧版本上，`xray run -test -config f` 报 "unknown flag: -test"；
+# 现代版本上 `xray -test -config f` 报同类错 —— 它们只说明【我们试的写法不对】，
+# 对用户毫无价值。用户要看的永远是「配置本身有问题」的那条。
+xray_err_is_unsupported() {
+  case "$1" in
+    *"unknown flag"*|*"flag provided but not defined"*|*"unknown shorthand flag"*|\
+    *"unknown command"*|*"invalid command"*|*"unknown syntax"*|*"unrecognized"*)
+      return 0 ;;
+  esac
+  return 1
+}
+
 # 校验配置可用。兼容不同 xray 版本的子命令写法。
-# 失败时把【最后一次尝试】的 stderr 留在 XRAY_TEST_ERR 里 ——
-# 写配置失败时要把 xray 的原始报错给用户看，而不同版本认的子命令不同，
-# 只打印其中一种写法会给出误导性的报错（比如只认 -c 的版本上会显示 unknown flag）。
+# 失败时把【最有信息量】的 stderr 留在 XRAY_TEST_ERR 里 ——
+# 写配置失败时要把 xray 的原始报错给用户看，而不同版本认的子命令不同。
+# 关键：三种写法依次尝试时必须区分两种失败 ——
+#   ①「这个写法不被支持」（unknown flag / unknown command 等）
+#   ②「配置本身有问题」（failed to parse config: ...）
+# 用户要看的永远是 ②。① 只说明我们试的写法不对。
+# 旧实现只保留【最后一次】尝试的报错 → 现代 xray 上最后一次用的是旧语法
+# → 必然报 "unknown flag: -test" / "unknown command" → 用户看到的是
+# 完全无关的误导性报错（控制器独立复评 D1 实证）。
 XRAY_TEST_ERR=''
 xray_test_config() {
-  local cfg="$1" e=''
+  local cfg="$1" e='' first=''
   XRAY_TEST_ERR=''
   # 注意：stderr 必须用【命令替换】捕获，不能写成 2>"$XRAY_TEST_ERR" ——
   # 变量为空时那是一次「重定向到空文件名」，bash 报的是
@@ -206,11 +229,21 @@ xray_test_config() {
   # 而且命令根本没被执行。控制器实测踩过。
   e=$( { "$XRAY_BIN" run -test -config "$cfg" >/dev/null; } 2>&1 )
   if [[ $? -eq 0 ]]; then XRAY_TEST_ERR="$e"; return 0; fi
+  first="$e"
+  # 判定条件是【有内容】且【不是「写法不被支持」】才停在这里：
+  #   · stderr 为空 → 这一种写法没给出任何信息 → 必须继续试下一种，
+  #     否则「只认 -c 的版本」上第 1 种写法失败就直接返回 1 → 后面两种根本没试。
+  #   · stderr 是「写法不被支持」→ 同理，继续试下一种。
+  # 只有「确实有内容、且说的是配置本身有问题」才停 —— 那才是用户要看的。
+  if [[ -n "$e" ]] && ! xray_err_is_unsupported "$e"; then XRAY_TEST_ERR="$e"; return 1; fi
   e=$( { "$XRAY_BIN" run -test -c "$cfg" >/dev/null; } 2>&1 )
   if [[ $? -eq 0 ]]; then XRAY_TEST_ERR="$e"; return 0; fi
+  if [[ -n "$e" ]] && ! xray_err_is_unsupported "$e"; then XRAY_TEST_ERR="$e"; return 1; fi
   e=$( { "$XRAY_BIN" -test -config "$cfg" >/dev/null; } 2>&1 )
   if [[ $? -eq 0 ]]; then XRAY_TEST_ERR="$e"; return 0; fi
-  XRAY_TEST_ERR="$e"
+  if [[ -n "$e" ]] && ! xray_err_is_unsupported "$e"; then XRAY_TEST_ERR="$e"; return 1; fi
+  # 三种写法都不被支持 → 只能给出第一次的报错（至少证明我们试过）
+  XRAY_TEST_ERR="$first"
   return 1
 }
 
@@ -224,16 +257,25 @@ write_config_atomic() {
   local outfile="$1" src="$2"
   local tmp="$outfile.new"
   [[ -f "$src" ]] || { tui_err "源配置不存在：$src"; return 1; }
-  cp "$src" "$tmp" || { tui_err "无法写入临时文件：$tmp"; return 1; }
+  # 同 render_server_config：目标路径是【已存在的目录】时，
+  # `mv -f "$tmp" "$outfile"` 会把文件移进目录里 → mv 返回 0（看起来成功）
+  # 但配置根本没落位。必须先挡住。
+  [[ -d "$outfile" ]] && { tui_err "目标路径是目录，不能作为配置文件：$outfile"; return 1; }
+  # cp 失败时必须清理【半截的】临时文件：cp 可能已经写出了一部分内容，
+  # 留着它会让下一次写配置的校验去校验一份残缺文件。
+  cp "$src" "$tmp" || { tui_err "无法写入临时文件：$tmp"; rm -f "$tmp"; return 1; }
   # 服务端配置含 REALITY 私钥 → 权限必须 600（计划里其余含密文件一律 600）。
   # systemd unit 没有 User= → xray 以 root 运行 → 600 不会挡住它读配置。
   chmod 600 "$tmp" || { tui_err "无法设置临时文件权限：$tmp"; rm -f "$tmp"; return 1; }
   if ! xray_test_config "$tmp"; then
     tui_err "配置校验未通过，已保留原有配置不变。"
+    # 全局约束要求【原样输出】xray 的报错 → 这里不加任何缩进/改写。
+    # 早先的实现在这里加了 6 个空格的缩进（sed 's/^/      /'），
+    # 与约束的字面要求不一致（控制器独立复评 D4）。
     if [[ -n "$XRAY_TEST_ERR" ]]; then
-      printf '%s\n' "$XRAY_TEST_ERR" | sed -e 's/^/      /'
+      printf '%s\n' "$XRAY_TEST_ERR"
     else
-      "$XRAY_BIN" run -test -config "$tmp" 2>&1 | sed -e 's/^/      /' || true
+      "$XRAY_BIN" run -test -config "$tmp" 2>&1 || true
     fi
     rm -f "$tmp"
     return 1
