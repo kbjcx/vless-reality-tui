@@ -2512,55 +2512,16 @@ git commit -m "feat(core): 网络探测——公网 IP、端口占用、TLS1.3 �
 > 不是读代码读出来的 —— 读代码时「`[[ -f "$src" ]]` 会挡住字面量」这层很容易看漏。
 > **断言有没有判别力，只能靠变异证明。**
 
-#### 修订轮 1 的验收标准
-
-1. `lib/deploy.sh` 的内容与上面 **Step 3 代码块逐字节一致**。
-2. `test/unit.sh` 里 Task 5 的插入段与上面 **Step 1 代码块逐字节一致**
-   （追加在 `test_summary` **之前**；`source "$ROOT/lib/deploy.sh"` 放在顶部 source 区域）。
-3. `bash test/unit.sh` 全部通过、退出码 0。
-4. 断言总数必须恒定，且**连跑 4 次条数相同**。
-   平台差异：本机（Windows + MSYS）与 Debian/CI 的条数差 **4 条** ——
-   4 条权限相关行为断言在 MSYS 上被自动跳过（`chmod` 是模拟的）。
-   报告里必须写明是哪个平台的数字。
-5. 红灯证据（至少这六条，每条都要贴出**变红的断言原文**）：
-   - 把 `write_config_atomic` 的「校验失败」分支改成**直接破坏目标文件**
-     → 「write_config_atomic 校验失败时保留原有配置不变」必须变红
-     （这条在修订前是 0 条红 —— 证明它恒真）；
-   - 把 `gen_keys` 整个换成 `return 0` → 「gen_keys 设置 PRIVATE_KEY」等必须变红；
-   - 把 `xray_test_config` 整个换成 `return 0` → 「xray_test_config 识别 run -test -config 写法」必须变红；
-   - 把 `render_server_config` 的入参白名单校验删掉 → 「render_server_config 拒绝含命令替换的 ShortID」必须变红；
-   - 把 `xray_test_config` 里 `run -test -c` 那一行删掉 → 「xray_test_config 识别 run -test -c 写法」必须变红；
-   - 把 `gen_keys` 里的 UUID 格式校验删掉 → 「gen_keys 在 xray uuid 输出的不是合法 UUID 时返回非零」必须变红；
-   - 把 `render_server_config` 里的**私钥**白名单校验删掉 → 「render_server_config 拒绝含命令替换的私钥」必须变红；
-   - 把 `render_server_config` 里 `cat` 的退出码检查去掉（恢复成不检查）→ 「render_server_config 在目标目录不存在时给出自己的错误提示（而不是裸的 bash 报错）」必须变红。
-     注意**不能**用「返回非零」那条来判断：`cat` 检查去掉后，函数仍会因为后面的
-     `chmod 600 "$tmp"` 失败而返回 1 → 退出码一样是 1 → 那条断言**恒绿**、
-     没有判别力。真正被 `cat` 检查守住的是**错误提示的文本**。
-6. `lib/tui.sh`、`test/lib.sh`、`lib/core.sh` **一字未动**。
-7. 计划文件实施者一个字都不许改。
-
-#### 修订轮 1 的逐项发现与处置
-
-> 本节由**控制器**在 Task 5 派发前预扫（沙箱实证）之后写入。
-> 本节列的全是**计划缺陷**，责任方是控制器；Task 5 的代码块本身还没被实施过。
+#### 修订轮 1 实施后由实施者独立发现的两条（控制器已核实并落地）
 
 | # | 级别 | 发现 | 处置 |
 |---|---|---|---|
-| T5-1 | **Important** | `write_config_atomic` 的「**xray 校验失败**」路径**完全没被测到**：Step 1 传给它的源文件是**字面量** `'{"broken":'`，而函数第一步就是 `[[ -f "$src" ]] || return 1` → 直接把它挡在门外 → 后面那三条断言全是**恒真**。控制器 P1 实证：把「校验失败」分支改成【直接破坏目标文件】，**202 项断言仍然全绿、0 条红** | Step 1 改成先 `printf '{"broken":\n' > "$atomic_dir/broken.json"` 再传**路径**；并补一条「源文件不存在时**不得覆盖目标文件**」（原来只有「返回非零」，实现若写成「先覆盖再校验」仍会漏） |
-| T5-2 | **Important** | `gen_keys` **一条断言都没有**。控制器 P3 实证：把 `gen_keys` 整个换成 `return 0`，**202 项全绿、0 条红**。而它恰好是「把 xray 的输出变成配置」的关键环节 | Step 1 补假 xray（用 **shell 函数**实现而不是「造脚本 + chmod +x」—— MSYS 的 chmod 位不可靠）+ 4 组断言：成功路径一次设置 4 个全局变量、x25519 失败、输出无法解析、`random_hex` 失败 |
-| T5-3 | **Important** | `xray_test_config` **一条断言都没有**。控制器 P4 实证：整个换成 `return 0`，**202 项全绿、0 条红** | Step 1 补 3 条：`run -test -config` 写法、`run -test -c` 写法、两种都不支持 |
-| T5-4 | **Minor** | `render_server_config` 用**未加引号的 heredoc**（`<<EOF`）渲染 → 5 个入参里任何 `$(...)` / 反引号都会被**真实执行**。控制器 P7/P8 实证：把 `'$(echo PWNED)'` 传进 ShortID 或 SNI，**该命令被执行并把结果写进了 config.json**。当前所有调用方恰好都校验过输入（Task 8 校验 `--sni`/`--port`，向导校验端口），所以**当前不可达**；但「安全性靠调用方自觉」不是函数契约 | Step 3 在 `render_server_config` 里加**入参白名单校验**（UUID / 私钥 base64url 40-64 / 端口 1-65535 / ShortID 十六进制 2-16 / SNI 走 `validate_hostname`），任一不合法 → `tui_err` + 返回 1 + **不落盘**；Step 1 补 4 条注入拒绝断言 |
-| T5-5 | **Minor** | `cat >"$tmp" <<EOF` 的**退出码没检查** → 目标目录不存在时，原始 bash 报错（`No such file or directory`）直接漏到 stderr，用户看到的是裸报错而不是我们的提示（控制器 P9 实证） | Step 3 把 heredoc 包进 `if ! cat >"$tmp" <<EOF ... EOF then ... fi` |
-| T5-6 | **Minor** | `chmod 600` 写在 `mv` **之后** → 权限设置失败时文件**已经落位**，函数却返回非零 → 调用方以为失败而重试 | Step 3 改成先 `chmod 600 "$tmp"` 再 `mv`（与 `write_config_atomic` 一致） |
-| T5-7 | **Minor** | `write_config_atomic` 失败时打印的 xray 报错只用了 `run -test -config` 一种写法，而 `xray_test_config` 会依次试 3 种 → 在只认 `-c` 的版本上，给用户看的是「unknown flag」这种误导性报错 | Step 3 让 `xray_test_config` 把**最后一次尝试**的 stderr 留在 `XRAY_TEST_ERR` 里，失败时打印它 |
-| T5-8 | **Minor** | `xray_parse_keys` 的那条断言描述写着「返回空串**且退出码非零**」，实际**只断言了空串**，退出码那一半从来没被测过 | Step 1 拆成两条：空串一条、退出码一条 |
-| T5-9 | **Minor** | `gen_keys` 的 `UUID=$("$XRAY_BIN" uuid ...)` **不检查格式** → xray 失败时若把错误信息写进 stdout，那串文字会被原样写进 config.json，失败点被推迟到 xray 校验，报错与真实原因无关 | Step 3 加 UUID 正则校验 |
-| T5-10 | **Minor** | `render_server_config` 的内部暂存名是 `$outfile.new`，与 `write_config_atomic` 的 `$outfile.new` **同名**。Task 9/10 目前的调用姿势（`render` 到 mktemp 路径、`write` 到正式路径）不会撞名，但一旦有人把正式路径直接传给 `render`，就会**绕过 xray 校验** | Step 3 把 `render` 的暂存名改成 `$outfile.render`，与 `.new` 区分开；Step 3 的函数注释写明**调用约定**（必须传暂存路径） |
-| T5-11 | **Minor** | Task 5 **没有独立的验收标准段**（Task 3 / Task 4 都有） | 补一个 |
+| T5-12 | **Important** | 修订轮 1 的验收标准第 5 条写的是「把 `xray_test_config` 整个换成 `return 0` → 「xray_test_config **识别 run -test -config 写法**」必须变红」。**这条字面上不可满足**：那条是**正向断言**（期望码 0），把函数换成 `return 0` 恰好让它**保持绿**。真正被捕获的是它的**反向断言**「xray_test_config 在所有写法都不被支持时返回非零」。实施者独立发现并如实报告（未擅自改代码） | 验收标准第 5 条改成点名那条**反向断言**，并写明「正向断言在把函数换成 `return 0` 时不会变红」。**这与 Task 4 的 F4-16 是同一类错误（点名错了断言），控制器在同一项目里犯了第二次** —— 教训：写验收标准时，**点名的断言必须与预演结果里【实际变红的那一条】逐字对上**，不能只看「红了几条」 |
+| T5-13 | **观察 → 不成立** | 实施者报告：Step 1 块的 `rm -rf "$atomic_dir"` 写在 `if [[ -n "$atomic_dir" ]]` 守卫**之外** → `mktemp -d` 失败时会往 stderr 漏一行 `rm: cannot remove ''` | 控制器**实测**（GNU coreutils 8.32）：`rm -rf ""` → **rc=0、输出为空、完全静默**；`rm -rf <不存在的路径>` 同样静默。**该噪音复现不了** → 观察不成立，**不改代码**。记录此条是为了说明「实施者报的现象必须独立复现」——这条经复现后被否掉了 |
 
-> **控制器的自我记账（与 Task 4 的 F4-15 同源）**：T5-1 的发现方法是**变异**，
-> 不是读代码读出来的 —— 读代码时「`[[ -f "$src" ]]` 会挡住字面量」这层很容易看漏。
-> **断言有没有判别力，只能靠变异证明。**
+> **控制器的自我记账（第 2 条）**：T5-13 是实施者报的「观察」，控制器复现后发现**不成立**
+> （`rm -rf ""` 静默）。**实施者如实报告 ≠ 报告的事实成立** —— 两条都要走一遍
+> 「独立复现」才能落进计划。
 
 #### 修订轮 1 的验收标准
 
@@ -2577,7 +2538,11 @@ git commit -m "feat(core): 网络探测——公网 IP、端口占用、TLS1.3 �
      → 「write_config_atomic 校验失败时保留原有配置不变」必须变红
      （这条在修订前是 0 条红 —— 证明它恒真）；
    - 把 `gen_keys` 整个换成 `return 0` → 「gen_keys 设置 PRIVATE_KEY」等必须变红；
-   - 把 `xray_test_config` 整个换成 `return 0` → 「xray_test_config 识别 run -test -config 写法」必须变红；
+   - 把 `xray_test_config` 整个换成 `return 0`
+     → 「xray_test_config **在所有写法都不被支持时返回非零**」必须变红。
+     ⚠️ **不是**「xray_test_config 识别 run -test -config 写法」—— 那条是**正向断言**
+     （期望码 0），把函数换成 `return 0` 恰好让它**保持绿**。
+     真正被捕获的是它的**反向断言**（实施者独立发现并如实报告）。
    - 把 `render_server_config` 的入参白名单校验删掉 → 「render_server_config 拒绝含命令替换的 ShortID」必须变红；
    - 把 `xray_test_config` 里 `run -test -c` 那一行删掉 → 「xray_test_config 识别 run -test -c 写法」必须变红；
    - 把 `gen_keys` 里的 UUID 格式校验删掉 → 「gen_keys 在 xray uuid 输出的不是合法 UUID 时返回非零」必须变红；
