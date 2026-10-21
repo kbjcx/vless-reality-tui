@@ -1057,6 +1057,7 @@ assert_fails    "含空格"                        validate_hostname "a b.com"
 assert_fails    "含反斜杠命令替换"              validate_hostname 'a$(id).com'
 assert_fails    "标签以连字符开头"               validate_hostname "-a.com"
 assert_fails    "标签以连字符结尾"               validate_hostname "a-.com"
+assert_fails    "尾点形式（SNI 不带尾点）"        validate_hostname "com."
 
 # state_quote：状态文件会被 load_state 用 `.` 引入执行，
 # 写入的值必须是可被 shell 安全求值的单引号字面量。
@@ -1207,6 +1208,9 @@ validate_hostname() {
   [[ "$host" != *'"'* ]] || return 1
   [[ "$host" != *'\'* ]] || return 1
   [[ "$host" == *.* ]] || return 1
+  # 尾点形式（"com."）在 DNS 里合法，但 SNI 永远不带尾点，
+  # 且会被原样写进 config.json 的 "target" → 必须拒绝。
+  if [[ "$host" == *. ]]; then return 1; fi
   local -a labels
   IFS='.' read -r -a labels <<<"$host"
   ((${#labels[@]} > 0)) || return 1
