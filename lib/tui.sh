@@ -285,24 +285,39 @@ tui_run() {
   local tmp rc=0
 
   tmp=$(mktemp 2>/dev/null || printf '/tmp/.tui.%s' "$$")
+  # 临时文件：mktemp 失败时退回一个可预测路径，该路径可能不可写或已被占用。
+  # 此时必须【仍然把命令跑起来】——不能因为捕获输出失败就不执行命令，
+  # 否则用户只会看到一个没有原因的失败标记。
+  if ! : >"$tmp" 2>/dev/null; then
+    tmp=''
+  fi
 
   if [[ $TUI_TTY -eq 0 ]]; then
     # 非 TTY 不画 spinner，但仍然捕获输出：失败时必须让用户看到原因，
     # 否则「依赖没装上」会退化成静默故障。
     printf '  %s%s%s %s ... ' "$C_ACCENT" "$I_ARROW" "$C_RESET" "$msg"
-    "$@" >"$tmp" 2>&1
-    rc=$?
+    if [[ -n "$tmp" ]]; then
+      "$@" >"$tmp" 2>&1
+      rc=$?
+    else
+      "$@" >/dev/null 2>&1
+      rc=$?
+    fi
     if [[ $rc -eq 0 ]]; then
       printf '%s%s%s\n' "$C_OK" "$I_OK" "$C_RESET"
     else
       printf '%s%s%s\n' "$C_ERR" "$I_ERR" "$C_RESET"
-      [[ -s "$tmp" ]] && sed -e 's/^/      /' "$tmp"
+      [[ -n "$tmp" && -s "$tmp" ]] && sed -e 's/^/      /' "$tmp"
     fi
-    rm -f "$tmp" 2>/dev/null || true
+    [[ -n "$tmp" ]] && { rm -f "$tmp" 2>/dev/null || true; }
     return $rc
   fi
 
-  "$@" >"$tmp" 2>&1 &
+  if [[ -n "$tmp" ]]; then
+    "$@" >"$tmp" 2>&1 &
+  else
+    "$@" >/dev/null 2>&1 &
+  fi
   local pid=$! i=0
   # spinner 帧必须逐【字符】取：用数组而不是 ${str:i:1}——后者在 C locale 下
   # 是按字节切，会把 3 字节的盲文点阵字符切成半个（服务器上 LANG 常未设置）。
@@ -317,18 +332,20 @@ tui_run() {
     printf '\r  %s%s%s %s%s%s%s\n' "$C_OK" "$I_OK" "$C_RESET" "$C_GRAY" "$msg" "$C_RESET"
   else
     printf '\r  %s%s%s %s%s%s%s\n' "$C_ERR" "$I_ERR" "$C_RESET" "$C_GRAY" "$msg" "$C_RESET"
-    [[ -s "$tmp" ]] && sed -e 's/^/      /' "$tmp"
+    [[ -n "$tmp" && -s "$tmp" ]] && sed -e 's/^/      /' "$tmp"
   fi
-  rm -f "$tmp" 2>/dev/null || true
+  [[ -n "$tmp" ]] && { rm -f "$tmp" 2>/dev/null || true; }
   return $rc
 }
 
 # 确认：返回 0=是 / 1=否。第二个参数是默认值（y|n），默认 y。
+# 提示语走 stderr（与 tui_input / tui_input_secret 保持一致）：
+# 本函数只通过返回码给值，提示不应混进 stdout。
 tui_confirm() {
   local prompt="$1" default="${2:-y}" ans hint
   if [[ "$default" == "y" || "$default" == "Y" ]]; then hint="Y/n"; else hint="y/N"; fi
   if [[ $TUI_TTY -eq 0 ]]; then
-    printf '  %s%s%s %s [%s]: ' "$C_ACCENT" "$I_ARROW" "$C_RESET" "$prompt" "$hint"
+    printf '  %s%s%s %s [%s]: ' "$C_ACCENT" "$I_ARROW" "$C_RESET" "$prompt" "$hint" >&2
     # 用 `|| true` 而不是 `|| ans=''`：read 遇到没有换行符结尾的末行时
     # 返回 1，但变量里已经存着有效内容——`|| ans=''` 会把它抹掉。
     IFS= read -r ans || true
@@ -337,7 +354,7 @@ tui_confirm() {
     [[ "${ans,,}" == y* ]]
     return
   fi
-  printf '  %s%s%s %s %s[%s]%s ' "$C_ACCENT" "$I_ARROW" "$C_RESET" "$prompt" "$C_GRAY" "$hint" "$C_RESET"
+  printf '  %s%s%s %s %s[%s]%s ' "$C_ACCENT" "$I_ARROW" "$C_RESET" "$prompt" "$C_GRAY" "$hint" "$C_RESET" >&2
   IFS= read -rsn1 ans || true
   # 终端回车可能是 CR，也可能被 read 当作行分隔符吞掉（此时 ans 为空）；
   # 两种情况都表示「直接回车」→ 落到默认值，而不是被判成「否」。
@@ -431,31 +448,55 @@ tui_menu() {
       fi
     done
     if [[ -n "$buf" ]]; then
-      printf '     %s编号: %s_%s  %s↑↓ 移动 · Enter 确认 · q 取消%s\n' \
+      # 格式串的 %s 个数必须与实参个数严格相等（6 ↔ 6）：
+      # 多一个 %s 会让 bash printf 复用一次格式串，把提示行打印两遍，
+      # 而重绘统一按 n+1 行回退 → 缓冲区非空时每次重绘少算一行，
+      # 光标逐行下移、ESC[J 清不到上一行残留，菜单整体错位一行。
+      # 另外数字必须在光标【之前】：渲染成 "10_"，不是 "_10"。
+      printf '     %s编号: %s%s%s_  %s↑↓ 移动 · Enter 确认 · q 取消%s%s\n' \
         "$C_GRAY" "$C_ACCENT$C_BOLD" "$buf" "$C_RESET" "$C_GRAY" "$C_RESET"
     else
       printf '     %s↑↓ 移动 · 数字直选 · Enter 确认 · q 取消%s\n' "$C_GRAY" "$C_RESET"
     fi
 
     key=''
-    IFS= read -rsn1 key || true
+    # 必须保留 read 的状态位：read -rsn1 遇回车(LF)返回【空串+rc=0】，
+    # 遇 EOF/Ctrl-D 返回【空串+rc=1】。两者都靠状态位才能区分：
+    # EOF 必须是「取消」(255)，不能当成回车去确认高亮项。
+    local krc=0
+    IFS= read -rsn1 key || krc=$?
+    if (( krc > 0 )); then
+      printf '\033[%dA\033[J' "$((n + 1))"
+      printf '   %s已取消%s\n' "$C_GRAY" "$C_RESET"
+      return 255
+    fi
     # read -n1 碰到回车时返回的是【空串】（状态 0），不是 "\n"；
-    # 终端也可能送 CR。三种情况都表示「用户按了回车」→ 统一成 "\n"，
+    # 终端也可能送 CR。两种情况都表示「用户按了回车」→ 统一成 "\n"，
     # 否则 Enter 会变成一个按下去没反应的死键。
     [[ -z "$key" ]] && key=$'\n'
     key=${key//$'\r'/$'\n'}
 
     if [[ $key == $'\e' ]]; then
       seq=''
-      # ESC 已被上一条 read 吃掉，这里只剩 "[A" / "[B"；-n3 + 超时是为了
-      # 兼容更长的序列（如 "[1~"），代价是每个方向键会多等 0.2s。
-      IFS= read -rsn3 -t 0.2 seq || true
+      # ESC 已被上一条 read 吃掉，方向键只剩 "[A" / "[B" 2 个字节。
+      # 必须用 -n2 精确读这 2 个字节：
+      #   * -n3 会多吞一个字节——用户「按下方向键后立刻回车」时，那个回车
+      #     会被当成方向键序列的第 3 字节吞掉，回车就丢了；
+      #   * -n2 时两个字节齐备就立即返回，不会平白多等 -t 的超时，
+      #     单独按 ESC 时才超时（此时 seq 为空 → 不移动，光标不动）。
+      IFS= read -rsn2 -t 0.2 seq || true
       case "$seq" in
         '[A') idx=$(( (idx - 1 + n) % n )); buf='' ;;
         '[B') idx=$(( (idx + 1) % n )); buf='' ;;
       esac
     elif [[ $key == $'\n' || $key == $'\r' ]]; then
       if [[ -n "$buf" ]]; then
+        # 缓冲区只允许数字：进算术前再守一道，避免 10# 触发 bash 算术错误
+        if [[ ! "$buf" =~ ^[0-9]+$ ]]; then
+          buf=''
+          printf '\033[%dA\033[J' "$((n + 1))"
+          continue
+        fi
         local d=$((10#$buf - 1))
         if (( d >= 0 && d < n )); then
           printf '\033[%dA\033[J' "$((n + 1))"
@@ -484,7 +525,19 @@ tui_menu() {
           printf '   %s%s%s %s\n' "$C_OK" "$I_OK" "$C_RESET" "${items[$d]}"
           return $d
         fi
-        buf+="$more"
+        if [[ "$more" =~ ^[0-9]$ ]]; then
+          buf+="$more"
+        else
+          # 非数字键绝不能进数字缓冲区：否则「1」之后按「q」会得到 buf="1q"，
+          # 10#1q 触发 bash 算术错误 → d 为空 → 范围检查把空值当 0 通过
+          # → 静默选中【第一项】并执行，等于把「取消」变成「继续执行」。
+          buf=''
+          if [[ "$more" == 'q' || "$more" == 'Q' ]]; then
+            printf '\033[%dA\033[J' "$((n + 1))"
+            printf '   %s已取消%s\n' "$C_GRAY" "$C_RESET"
+            return 255
+          fi
+        fi
       fi
     fi
     printf '\033[%dA\033[J' "$((n + 1))"

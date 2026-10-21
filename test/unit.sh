@@ -62,11 +62,18 @@ printf '' | bash "$ROOT/test/helpers/menu_noninteractive.sh" >/dev/null 2>&1; rc
 assert_status 255 "$rc" "非 TTY 菜单遇 EOF 返回 255"
 
 # 确认：默认应为「是」
-out=$(printf '\n' | bash "$ROOT/test/helpers/confirm.sh" y)
+# 提示语走 stderr（stdout 只承载判定结果），这里静音以保持测试输出干净
+out=$(printf '\n' | bash "$ROOT/test/helpers/confirm.sh" y 2>/dev/null)
 assert_contains "$out" "yes" "tui_confirm 默认值 y → yes"
 
-out=$(printf '\n' | bash "$ROOT/test/helpers/confirm.sh" n)
+out=$(printf '\n' | bash "$ROOT/test/helpers/confirm.sh" n 2>/dev/null)
 assert_contains "$out" "no" "tui_confirm 默认值 n → no"
+
+# M4：tui_confirm 的提示语必须走 stderr，stdout 只承载判定结果
+err=$(printf '\n' | bash "$ROOT/test/helpers/confirm.sh" y 2>&1 >/dev/null)
+assert_contains "$err" "确认继续" "tui_confirm 提示语走 stderr"
+out=$(printf '\n' | bash "$ROOT/test/helpers/confirm.sh" y 2>/dev/null)
+assert_eq "yes" "$out" "tui_confirm 的 stdout 只有判定结果"
 
 # 输入：空输入回落到默认值
 # 提示语走 stderr（stdout 只承载用户输入的值），这里静音以保持测试输出干净
@@ -84,7 +91,7 @@ out=$(printf '8080' | bash "$ROOT/test/helpers/input.sh" "默认端口" "443" 2>
 assert_eq "8080" "$out" "tui_input 末行无换行符时不丢输入"
 
 # 确认：显式回答必须覆盖默认值
-out=$(printf 'n\n' | bash "$ROOT/test/helpers/confirm.sh" y)
+out=$(printf 'n\n' | bash "$ROOT/test/helpers/confirm.sh" y 2>/dev/null)
 assert_contains "$out" "no" "tui_confirm 显式回答 n 覆盖默认值 y"
 
 # 菜单：前导零序号必须按十进制解析，且不得触发 bash 的八进制算术报错
@@ -119,5 +126,63 @@ assert_status 255 "$rc" "tui_menu 无项目返回 255"
 # tui_pause 在非 TTY 下必须立即返回，不得阻塞
 tui_pause </dev/null >/dev/null 2>&1; rc=$?
 assert_status 0 "$rc" "tui_pause 非 TTY 立即返回"
+
+test_case "TUI 菜单交互路径（强制 TUI_TTY=1，管道喂按键模拟真终端）"
+
+# 数字缓冲区被非数字污染 → 必须取消，绝不能静默选中第一项
+out=$(printf '1q' | bash "$ROOT/test/helpers/menu_tty.sh" "选择" "A" "B" "C"); rc=$?
+assert_status 255 "$rc" "数字后按 q 必须取消(255)，不得静默选中第一项"
+assert_contains "$out" "已取消" "数字后按 q 显示取消"
+
+# EOF / Ctrl-D → 必须取消，不得当成回车去确认高亮项
+printf '' | bash "$ROOT/test/helpers/menu_tty.sh" "选择" "A" "B" "C" >/dev/null 2>&1; rc=$?
+assert_status 255 "$rc" "EOF 必须取消(255)"
+
+# 缓冲区提示行只能打印一次（printf 格式串 %s 个数必须等于实参个数）
+# 输入必须是【两位数 + 回车】：单个数字会在 0.35s 窗口后立即选中，
+# 根本不会渲染缓冲区提示行（计数恒为 0，无法发现「打印两遍」这个 bug）；
+# 两位数才会进入缓冲区并重绘一次提示行——旧代码这里会打印 2 遍。
+out=$(printf '10\n' | bash "$ROOT/test/helpers/menu_tty.sh" "选择" "A" "B" "C")
+assert_eq "1" "$(printf '%s\n' "$out" | grep -c '编号')" "缓冲区提示行只打印一次"
+
+# 方向键下移后回车 → 选中第 2 项（索引 1）
+out=$( { printf '\033[B'; sleep 0.3; printf '\n'; } | bash "$ROOT/test/helpers/menu_tty.sh" "选择" "A" "B" "C" ); rc=$?
+assert_status 1 "$rc" "方向键下移后回车选中第 2 项(索引 1)"
+
+# 方向键与回车【一次性写入】：方向键只剩 2 字节，-n2 正好读完，
+# 紧跟的回车不能被当成方向键序列的第 3 字节吞掉（-n3 会吞掉）
+out=$(printf '\033[B\n' | bash "$ROOT/test/helpers/menu_tty.sh" "选择" "A" "B" "C"); rc=$?
+assert_status 1 "$rc" "方向键后紧跟的回车不被方向键序列吞掉"
+
+# 方向键之后的【数字键】必须被正常处理，不能被方向键序列一起吃掉。
+# 这是 -n2 与 -n3 唯一可观测的差异：-n3 会把第 3 个字节（这里是 "2"）并进
+# seq → 方向键不生效、且 "2" 丢失 → 选中第 1 项(索引 0)；-n2 下 "2" 被当作
+# 数字直选 → 选中第 2 项(索引 1)。
+out=$(printf '\033[B2\n' | bash "$ROOT/test/helpers/menu_tty.sh" "选择" "A" "B" "C"); rc=$?
+assert_status 1 "$rc" "方向键之后的数字键不被方向键序列吞掉"
+
+# 多位数：>=10 项时输入 10 并回车应选中第 10 项（索引 9）
+# 必须带回车：EOF 现在按 I2 判定为「取消」(255)，不是「确认」
+out=$(printf '10\n' | bash "$ROOT/test/helpers/menu_tty.sh" "选择" 1 2 3 4 5 6 7 8 9 10 11); rc=$?
+assert_status 9 "$rc" "多位数 10 选中第 10 项(索引 9)"
+
+# 直接按 q → 取消
+printf 'q' | bash "$ROOT/test/helpers/menu_tty.sh" "选择" "A" "B" "C" >/dev/null 2>&1; rc=$?
+assert_status 255 "$rc" "直接按 q 返回 255"
+
+test_case "TUI tui_run 降级路径（临时文件不可用）"
+
+# M1：mktemp 失败 + 回落路径不可写时，命令【仍然必须被执行】——
+# 旧实现会因重定向失败而根本不跑命令，用户只看到一个无原因的 ✖
+mkdir -p "/tmp/.tui.$$" 2>/dev/null
+out=$(mktemp() { return 1; }; tui_run "回落不可用" bash -c 'echo ran-ok; exit 7' 2>&1); rc=$?
+rmdir "/tmp/.tui.$$" 2>/dev/null
+assert_status 7 "$rc" "回落路径不可写时命令仍被执行并透传退出码"
+
+# M1：mktemp 失败但回落路径可用时，命令输出仍要被捕获
+out=$(mktemp() { return 1; }; tui_run "回落可用" bash -c 'echo captured-ok; exit 3' 2>&1); rc=$?
+rm -f "/tmp/.tui.$$" 2>/dev/null
+assert_status 3 "$rc" "mktemp 失败时命令仍被执行并透传退出码"
+assert_contains "$out" "captured-ok" "mktemp 失败时仍能捕获命令输出"
 
 test_summary
