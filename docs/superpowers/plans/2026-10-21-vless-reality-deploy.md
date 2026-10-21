@@ -17,8 +17,16 @@
 以下约束适用于**每一个**任务，任务描述不再重复：
 
 - 纯 bash 4.2+，**零第三方 TUI 依赖**（不装 dialog / whiptail / gum / ncurses）
-- 允许使用的外部命令仅限：`curl` `openssl` `systemctl` `ss` `ip` `awk` `sed` `grep` `od` `tr` `cat` `mktemp` `cp` `mv` `rm` `mkdir` `chmod` `chown` `apt-get` `qrencode`(可选) `python3`(可选，仅 urlencode 回退)
-- `lib/tui.sh` **不得**包含任何业务判断、文件写入或系统调用（唯一例外：`mktemp` 用于 `tui_run` 捕获输出）
+- 允许使用的外部命令仅限（**运行时 / 分发物内**，即 `dist/install.sh` 与 `lib/`）：
+  - 基础系统工具（Debian 基础系统自带，coreutils 等）：`awk` `sed` `grep` `tr` `cat` `od` `cut` `head` `sort` `seq` `sleep` `date` `uname` `hostname` `env` `timeout`
+  - 文件与权限：`mktemp` `cp` `mv` `rm` `mkdir` `chmod` `chown`
+  - 网络与系统：`curl` `openssl` `systemctl` `journalctl` `ss` `ip`
+  - 防火墙（三选一，缺失时只提示不改规则）：`ufw` `iptables` `nft`
+  - 包管理：`apt-get`
+  - 可选：`qrencode`（二维码）`python3`（仅 urlencode 回退）
+  - 被部署的负载程序：`xray`（由官方 `install-release.sh` 安装，非系统自带，但显然是允许调用的）
+  - **CI / 开发期脚本**（不随分发物发布，可用范围更宽）：`git` `find` `xargs` `diff` `docker`
+- `lib/tui.sh` **不得**包含任何业务判断、文件写入或系统调用（例外仅两处：`mktemp`/`sed`/`rm` 用于 `tui_run` 捕获输出，`sleep` 用于 spinner 帧间隔）
 - 状态文件 `/etc/vless-reality/deploy.env` 权限 `600`，状态目录 `700`；客户端导出目录 `/root/vless-reality/` 权限 `700`
 - 服务端配置写入流程恒为：**写临时文件 → `xray run -test` 校验 → 通过才 `mv` 原子替换**；不通过则保留旧配置并原样输出 xray 报错
 - 不得使用 `jq`；不得用 `grep` 反解 JSON
