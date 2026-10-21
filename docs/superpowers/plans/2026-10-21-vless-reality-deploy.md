@@ -18,16 +18,18 @@
 
 - 纯 bash 4.2+，**零第三方 TUI 依赖**（不装 dialog / whiptail / gum / ncurses）
 - 允许使用的外部命令仅限（**运行时 / 分发物内**，即 `dist/install.sh` 与 `lib/`）：
-  - 基础系统工具（Debian 基础系统自带，coreutils 等）：`awk` `sed` `grep` `tr` `cat` `od` `cut` `head` `sort` `seq` `sleep` `date` `uname` `hostname` `env` `timeout` `id` `sysctl` `dirname`
+  - 基础系统工具（Debian 基础系统自带，coreutils 等）：`awk` `sed` `grep` `tr` `cat` `od` `cut` `head` `sort` `seq` `sleep` `date` `uname` `hostname` `env` `timeout` `id` `sysctl` `dirname` `bash`（`bash` 就是本工具的解释器本身，Task 6 用 `bash "$installer" install` 调官方安装脚本）
   - 文件与权限：`mktemp` `cp` `mv` `rm` `mkdir` `chmod` `chown`
   - 网络与系统：`curl` `openssl` `systemctl` `journalctl` `ss` `ip`
   - 防火墙（三选一，缺失时只提示不改规则）：`ufw` `iptables` `nft`
   - 包管理：`apt-get`
   - 可选：`qrencode`（二维码）`python3`（仅 urlencode 回退）`netstat`（仅 `ss` 不可用时的端口探测回退）
   - 被部署的负载程序：`xray`（由官方 `install-release.sh` 安装，非系统自带，但显然是允许调用的）
-  - **CI / 开发期脚本**（不随分发物发布，可用范围更宽）：`git` `find` `xargs` `diff` `docker` `stat` `wc` `bash`
+  - **CI / 开发期脚本**（不随分发物发布，可用范围更宽）：`git` `find` `xargs` `diff` `docker` `stat` `wc`
 - `lib/tui.sh` **不得**包含任何业务判断、文件写入或系统调用（例外仅两处：`mktemp`/`sed`/`rm` 用于 `tui_run` 捕获输出，`sleep` 用于 spinner 帧间隔）
 - 状态文件 `/etc/vless-reality/deploy.env` 权限 `600`，状态目录 `700`；客户端导出目录 `/root/vless-reality/` 权限 `700`
+- 服务端配置 `/usr/local/etc/xray/config.json` 含 REALITY **私钥** → 权限 `600`
+  （systemd unit 没有 `User=`，xray 以 root 运行，`600` 不会挡住它读配置）
 - 服务端配置写入流程恒为：**写临时文件 → `xray run -test` 校验 → 通过才 `mv` 原子替换**；不通过则保留旧配置并原样输出 xray 报错
 - 不得使用 `jq`；不得用 `grep` 反解 JSON
 - 所有 `.sh` 文件必须 LF 行尾（`.gitattributes` 已锁定）
@@ -1342,22 +1344,36 @@ save_state() {
 }
 
 load_state() {
-  [[ -f "$STATE_FILE" ]] || return 1
-  # 状态文件是纯变量赋值，正常 source 必定【静默】。
-  # 先在子 shell 里做一次静默探测：语法错误一定有 stderr 输出，而
-  # 「文件最后一条命令返回非零」不会 —— 这样只抓真正的语法错误，
-  # 不会把合法状态文件误判成损坏。命令替换跑在子 shell，变量不会落到当前
-  # 作用域，所以探测之后还要再 source 一次。
-  local probe_err=''
-  probe_err=$( . "$STATE_FILE" 2>&1 >/dev/null ) || true
-  if [[ -n "$probe_err" ]]; then
+  # 「读不到」与「格式错」必须分开报（复评 F-4）：
+  # 早期写法是 [[ -f "$STATE_FILE" ]] || return 1 —— 静默返回，调用方无从判断
+  # 是「还没部署过」还是「状态文件坏了」；而对「文件存在但不可读」的情况，
+  # 子 shell 探测会把权限错误当成「格式错误」报出来，把人带偏。
+  if [[ ! -f "$STATE_FILE" ]]; then
+    tui_err "状态文件不存在：$STATE_FILE"
+    return 1
+  fi
+  if [[ ! -r "$STATE_FILE" ]]; then
+    tui_err "状态文件不可读：$STATE_FILE"
+    return 1
+  fi
+  # 只【解析】不【执行】：用 bash -n 做语法检查。
+  # 早期写法是在子 shell 里 source 一遍做「静默探测」，
+  # 那会把状态文件【执行两次】（探测一次、正式读一次）——
+  # 文件里一旦有副作用就会发生两次，且第一次的副作用对调用方不可见。
+  # bash -n 只做语法分析、不执行任何语句，因此没有副作用
+  # （实测：含 $(touch x) 的状态文件经 bash -n 之后副作用未发生）。
+  # 实测：语法错误 → rc=2 且 stderr 有 "syntax error"；
+  #       合法文件（含末条 false）→ rc=0 且 stderr 为空。
+  local syntax_err=''
+  syntax_err=$( "${BASH:-bash}" -n -- "$STATE_FILE" 2>&1 ) || true
+  if [[ -n "$syntax_err" ]]; then
     tui_err "状态文件格式错误：$STATE_FILE"
-    tui_tip "${probe_err%%$'\n'*}"
+    tui_tip "${syntax_err%%$'\n'*}"
     return 1
   fi
   # shellcheck disable=SC1090
   # 这里的返回码【不作为失败判据】：状态文件最后一条命令返回非零是合法的
-  # （例如末尾是一条返回 1 的语句），真正坏掉的文件已在上面的探测里被拦下。
+  # （例如末尾是一条返回 1 的语句），真正坏掉的文件已在上面的语法检查里被拦下。
   . "$STATE_FILE" || true
   return 0
 }
@@ -1469,6 +1485,20 @@ if [[ -n "$bad_dir" ]]; then
   printf 'PORT=443\nfalse\n' > "$bad_dir/lastfalse.env"
   out=$( ( STATE_FILE="$bad_dir/lastfalse.env"; load_state ) 2>&1 ); rc=$?
   assert_status 0 "$rc" "load_state 对末条命令返回非零的合法状态文件仍视为可读"
+  # 「读不到」与「格式错」必须分开报：不可读是权限问题，提示去改格式会把人带偏。
+  out=$( ( STATE_FILE="$bad_dir/absent.env"; load_state ) 2>&1 ); rc=$?
+  assert_status 1 "$rc" "load_state 对不存在的状态文件返回非零（读不到 ≠ 格式错）"
+  assert_contains "$out" "状态文件不存在" \
+    "load_state 对读不到的状态文件报『不存在』而不是笼统失败"
+  # F-3：load_state 绝不能把状态文件【执行两次】。
+  # 旧写法先在子 shell 里 source 一遍做「静默探测」，再正式 source 一遍
+  # → 文件里的副作用发生两次（且第一次发生在子 shell 里，调用方看不见）。
+  # 计数方式：状态文件里放一条会追加一行的命令，source 一次就多一行。
+  printf 'PORT=443\nprintf "x\\n" >> "%s/sidefx"\n' "$bad_dir" > "$bad_dir/sidefx.env"
+  out=$( ( STATE_FILE="$bad_dir/sidefx.env"; load_state ) 2>&1 ); rc=$?
+  assert_status 0 "$rc" "load_state 对带副作用的合法状态文件仍视为可读"
+  assert_eq "1" "$(wc -l < "$bad_dir/sidefx" 2>/dev/null | tr -d ' ')" \
+    "load_state 只把状态文件执行一次（不得用子 shell 探测导致双执行）"
 else
   assert_eq "mktemp -d 能创建唯一临时目录" "失败（mktemp -d 返回空路径）" \
     "load_state 失败路径用例前提：mktemp -d 必须能创建唯一临时目录"
@@ -1476,13 +1506,48 @@ fi
 rm -rf "$bad_dir"
 
 # ── M-7：urlencode 两个分支的 stdout 必须逐字节一致 ──────────
+# 断言盲区（复评 M-7 / F-5）：原先直接对比「真实 python 分支输出」与「回退分支输出」。
+# 在 python3 缺失、或 python3 存在但【功能异常】（本机是 MS Store 坏存根：
+# command -v 成功、运行退出码 49）的机器上，两侧其实【都是回退分支】——
+# 这条断言恒真，等于什么都没测。
+# 修法：把对比基准换成【确定性的 mock python3】——
+# 它用与 lib/core.sh 回退实现【不同的算法】（按字节取十六进制码）算百分号编码，
+# 因此这条断言在任何机器上都能真正验证回退实现的字节级正确性；
+# 真实 python3 功能可用时，再额外做一次真实两分支对比。
 enc_all="a b'c\\d中文"
-enc_py="$(urlencode "$enc_all")"
+# mock python3：等价实现 RFC 3986 的 quote(s, safe="")。
+# 真实调用形如 python3 -c '<代码>' '<输入>' → 被编码的串是【最后一个】参数。
+mock_python3() {
+  local s="${!#}" i len out='' ch hex
+  local LC_ALL=C
+  len=${#s}
+  for ((i = 0; i < len; i++)); do
+    ch="${s:i:1}"
+    if [[ "$ch" == [a-zA-Z0-9.~_-] ]]; then
+      out+="$ch"
+    else
+      hex=$(printf '%s' "$ch" | od -An -tx1 | tr -d ' \n')
+      out+="%${hex^^}"
+    fi
+  done
+  printf '%s' "$out"
+}
+enc_mock="$( ( python3() { mock_python3 "$@"; }; urlencode "$enc_all" ) )"
 enc_fb="$( ( have_cmd() { return 1; }; urlencode "$enc_all" ) )"
-assert_eq "$enc_py" "$enc_fb" "urlencode 的 python 分支与回退分支输出逐字节一致"
-assert_eq "a%20b%27c%5Cd%E4%B8%AD%E6%96%87" "$enc_py" "urlencode 编码结果正确"
+assert_eq "$enc_mock" "$enc_fb" "urlencode 的 python 分支与回退分支输出逐字节一致（mock python3 基准）"
+assert_eq "a%20b%27c%5Cd%E4%B8%AD%E6%96%87" "$enc_fb" "urlencode 回退分支编码结果正确"
 raw_enc="$(urlencode 'abc' | od -An -c | tr -d ' ')"
 assert_eq "abc" "$raw_enc" "urlencode 输出不含多余的尾换行（od 逐字节可见）"
+# 真实 python3 【功能可用】时（不只是 command -v 找得到），再对比一次真实分支。
+if python3 -c 'import sys,urllib.parse' >/dev/null 2>&1; then
+  enc_real="$(urlencode "$enc_all")"
+  assert_eq "$enc_real" "$enc_fb" "urlencode 的真实 python3 分支与回退分支输出逐字节一致"
+else
+  # python3 不可用不是缺陷（回退分支正是为此存在），此处【不断言失败】，
+  # 只登记一条说明以保持断言条数稳定；python 分支已由上面的 mock 用例覆盖。
+  assert_eq "python3 功能不可用" "python3 功能不可用" \
+    "python3 功能探测未通过：真实 python3 分支对比跳过（已由 mock python3 用例覆盖）"
+fi
 
 # ── O-1：detect_os 必须能处理 CRLF 行尾的 os-release ─────────
 crlf_os=$(mktemp 2>/dev/null)
@@ -1539,6 +1604,170 @@ rm -rf "$perm_dir"
   命令替换只剥 `state_quote` 输出的末尾换行，而输出以 `'` 结尾，什么都没剥；
   save→load 往返实测逐字节一致。请更正 `.superpowers/sdd/.../task-3-report.md`，
   否则后续任务会去「修」一个不存在的 bug。
+
+### 修复轮 2/5（修复轮 1 独立复评 PASS 后追加）—— 本节是**本任务的最终真相**
+
+> 本节由控制器在修复轮 1 的独立复评（结论 **PASS**，限定修复轮 1 范围）之后追加。
+> 复评在核对「修复轮 1 是否做对了」之外，顺带指出了 4 处**复评前就存在**的缺陷。
+> 它们与修复轮 1 的改动无关，但同样会造成「断言恒真」或「谎报成功」，
+> 因此一并在本轮修掉。
+>
+> **Step 3 的代码块已再次同步为最终权威版本**：`lib/core.sh` 必须与它**逐字节一致**。
+> 下面的「新增断言」与 Step 1、修复轮 1 的「新增断言」三者并集，
+> 构成 `test/unit.sh` 里 Task 3 的**必须齐备**用例集合。
+
+#### 逐项发现与处置
+
+| 编号 | 类别 | 处置 | 落在哪 |
+|---|---|---|---|
+| F-2 | **Important** | `save_state` 与 `export_client_artifacts` 的**调用方**忽略返回码：状态没落盘 / 物料没导出，流程却一路走到「部署完成」面板。Task 9 `deploy_wizard` 两处都要 `|| { tui_err ...; return 1; }`（Task 10 `menu_rotate_keys` 在修复轮 1 已加） | Task 9 代码块 |
+| F-3 | **Important** | `load_state` 用「子 shell 静默探测」做语法检查 → 状态文件被**执行两次**（探测一次、正式读一次），副作用会双发且第一次对调用方不可见。改用 `bash -n`（只解析不执行），并补一条断言证明状态文件**只被执行一次** | Step 3 代码块 + 新增断言 |
+| F-4 | Minor | `load_state` 把「读不到」与「格式错」混为一谈：文件存在但不可读（权限问题）也报「格式错误」，把人带偏。改为三态分开报：不存在 / 不可读 / 格式错误 | Step 3 代码块 + 新增断言 |
+| F-5 | Minor | M-7 的「python 分支 vs 回退分支」断言在 python3 缺失或**存在但功能异常**（本机 MS Store 坏存根：`command -v` 成功、运行退出码 49）的机器上**恒真** —— 两侧其实都是回退分支。补「功能可用守卫」+「确定性 mock python3 基准」 | 新增断言 |
+
+#### F-3 为什么必须换实现（加 `|| true` 解决不了）
+
+子 shell 探测的本质是**再执行一遍状态文件**，目的是看它会不会往 stderr 吐东西。
+这个副作用是设计固有的：`|| true` 只能盖住退出码，盖不住「被执行了第二次」。
+`bash -n` 只做语法分析、不执行任何语句（实测：含 `$(touch x)` 的状态文件
+经 `bash -n` 之后副作用未发生），因此是唯一能把「探测」与「执行」分开的做法。
+
+实测记录（开发机 Git Bash，bash 5.x）：
+
+| 输入 | `bash -n` 退出码 | stderr |
+|---|---|---|
+| `PORT=443` + `if then fi` | 2 | `... syntax error near unexpected token 'then'` |
+| `PORT=443` + `false` | 0 | 空 |
+| `save_state` 的真实产物 | 0 | 空 |
+| 文件不存在 | 127 | `... No such file or directory` |
+
+因此顺序必须是：**先判存在 → 再判可读 → 最后才 `bash -n` 判语法**。
+「不存在」时不能拿 `bash -n` 的 127 去当语法错误。
+
+#### F-5 的 mock 基准为什么不是恒真
+
+mock python3 用的是**与 lib/core.sh 回退实现不同的算法**：回退实现靠 bash 的
+`${s:i:1}` 取字符再逐个 case，mock 靠 `od -An -tx1` 取字节的十六进制码。
+两条独立路径算出同一个串，才说明回退实现的字节级处理（含 `'` → `%27`、
+`\` → `%5C`、多字节 UTF-8 逐字节编码）是对的。
+若回退实现写错（例如把 `'` 编成 `%39`），两侧立刻不等 → 断言变红。
+
+真实 python3 分支的覆盖由「功能可用守卫」负责：
+`python3 -c 'import sys,urllib.parse'` 成功才做真实两分支对比，
+否则登记一条说明（**不断言失败** —— python3 是可选依赖，回退分支正是为此存在）。
+
+#### 本轮涉及的断言（三处，全部就地落在修复轮 1 的「新增断言」代码块里）
+
+下列三段就是修复轮 2 之后、修复轮 1「新增断言」代码块里对应片段的**最终形态**。
+以修复轮 1 章节里的代码块为准，本节只是把本轮的增量单独列出来，方便逐条核对。
+
+**(a) T3-8 —— `random_hex` 的 openssl 分支（+2 条）**
+```bash
+# openssl 分支的静默失败必须单独覆盖：旧写法 `openssl ... | tr ...; return 0`
+# 的末尾是【显式】return 0，管道退出码取的是 tr 的 → openssl 失败时返回 0
+# 但输出为空。测试入口的 pipefail 也救不了它（显式 return 0 直接覆盖管道状态）。
+# 只 mock「openssl 不存在」是抓不到这个缺陷的 —— 必须让 have_cmd 说 openssl 存在、
+# 而 openssl 本身失败。
+out=$( ( have_cmd() { return 0; }; openssl() { return 1; }; od() { return 1; }; random_hex 4 ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "random_hex 在 openssl 失败时返回非零（不得静默返回空串）"
+assert_eq "" "$out" "random_hex 在 openssl 失败时不输出任何内容"
+```
+
+**(b) F-3 —— 状态文件只被执行一次（+2 条，紧接在 M-1 块末尾）**
+```bash
+  # F-3：load_state 绝不能把状态文件【执行两次】。
+  # 旧写法先在子 shell 里 source 一遍做「静默探测」，再正式 source 一遍
+  # → 文件里的副作用发生两次（且第一次发生在子 shell 里，调用方看不见）。
+  # 计数方式：状态文件里放一条会追加一行的命令，source 一次就多一行。
+  printf 'PORT=443\nprintf "x\\n" >> "%s/sidefx"\n' "$bad_dir" > "$bad_dir/sidefx.env"
+  out=$( ( STATE_FILE="$bad_dir/sidefx.env"; load_state ) 2>&1 ); rc=$?
+  assert_status 0 "$rc" "load_state 对带副作用的合法状态文件仍视为可读"
+  assert_eq "1" "$(wc -l < "$bad_dir/sidefx" 2>/dev/null | tr -d ' ')" \
+    "load_state 只把状态文件执行一次（不得用子 shell 探测导致双执行）"
+```
+
+**(c) F-4 —— 「读不到」与「格式错」分开报（+2 条）**
+```bash
+  # 「读不到」与「格式错」必须分开报：不可读是权限问题，提示去改格式会把人带偏。
+  out=$( ( STATE_FILE="$bad_dir/absent.env"; load_state ) 2>&1 ); rc=$?
+  assert_status 1 "$rc" "load_state 对不存在的状态文件返回非零（读不到 ≠ 格式错）"
+  assert_contains "$out" "状态文件不存在" \
+    "load_state 对读不到的状态文件报『不存在』而不是笼统失败"
+```
+
+**(d) F-5 —— M-7 块整体替换（3 条 → 4 条）**
+```bash
+# ── M-7：urlencode 两个分支的 stdout 必须逐字节一致 ──────────
+# 断言盲区（复评 M-7 / F-5）：原先直接对比「真实 python 分支输出」与「回退分支输出」。
+# 在 python3 缺失、或 python3 存在但【功能异常】（本机是 MS Store 坏存根：
+# command -v 成功、运行退出码 49）的机器上，两侧其实【都是回退分支】——
+# 这条断言恒真，等于什么都没测。
+# 修法：把对比基准换成【确定性的 mock python3】——
+# 它用与 lib/core.sh 回退实现【不同的算法】（按字节取十六进制码）算百分号编码，
+# 因此这条断言在任何机器上都能真正验证回退实现的字节级正确性；
+# 真实 python3 功能可用时，再额外做一次真实两分支对比。
+enc_all="a b'c\\d中文"
+# mock python3：等价实现 RFC 3986 的 quote(s, safe="")。
+# 真实调用形如 python3 -c '<代码>' '<输入>' → 被编码的串是【最后一个】参数。
+mock_python3() {
+  local s="${!#}" i len out='' ch hex
+  local LC_ALL=C
+  len=${#s}
+  for ((i = 0; i < len; i++)); do
+    ch="${s:i:1}"
+    if [[ "$ch" == [a-zA-Z0-9.~_-] ]]; then
+      out+="$ch"
+    else
+      hex=$(printf '%s' "$ch" | od -An -tx1 | tr -d ' \n')
+      out+="%${hex^^}"
+    fi
+  done
+  printf '%s' "$out"
+}
+enc_mock="$( ( python3() { mock_python3 "$@"; }; urlencode "$enc_all" ) )"
+enc_fb="$( ( have_cmd() { return 1; }; urlencode "$enc_all" ) )"
+assert_eq "$enc_mock" "$enc_fb" "urlencode 的 python 分支与回退分支输出逐字节一致（mock python3 基准）"
+assert_eq "a%20b%27c%5Cd%E4%B8%AD%E6%96%87" "$enc_fb" "urlencode 回退分支编码结果正确"
+raw_enc="$(urlencode 'abc' | od -An -c | tr -d ' ')"
+assert_eq "abc" "$raw_enc" "urlencode 输出不含多余的尾换行（od 逐字节可见）"
+# 真实 python3 【功能可用】时（不只是 command -v 找得到），再对比一次真实分支。
+if python3 -c 'import sys,urllib.parse' >/dev/null 2>&1; then
+  enc_real="$(urlencode "$enc_all")"
+  assert_eq "$enc_real" "$enc_fb" "urlencode 的真实 python3 分支与回退分支输出逐字节一致"
+else
+  # python3 不可用不是缺陷（回退分支正是为此存在），此处【不断言失败】，
+  # 只登记一条说明以保持断言条数稳定；python 分支已由上面的 mock 用例覆盖。
+  assert_eq "python3 功能不可用" "python3 功能不可用" \
+    "python3 功能探测未通过：真实 python3 分支对比跳过（已由 mock python3 用例覆盖）"
+fi
+```
+
+#### 修复轮 2 的验收标准
+
+1. `lib/core.sh` 与本计划 Task 3 的 **Step 3 代码块逐字节一致**（`diff` 为空）。
+2. `test/unit.sh` 含 Step 1 + 修复轮 1 + 修复轮 2 三处「新增断言」的**全部**用例，
+   且 Task 1/2 的 52 条旧断言**一行未删**。
+3. `bash test/unit.sh` 全部通过、退出码 0；断言总数由 149 增至 **156**
+   （T3-8 +2、F-3 +2、F-4 +2、F-5 的 M-7 块 3 → 4 条即 +1）。
+4. `lib/tui.sh` **一字未动**。
+5. 红灯证据（至少给出这五条）：
+   - 把 `load_state` 的 `bash -n` 换回子 shell 探测 → F-3 的「只执行一次」断言变红
+     （副作用计数从 1 变成 2）；
+   - 把 `load_state` 的「不存在 / 不可读」分支去掉 → F-4 的两条断言变红；
+   - 把 `load_state` 换回旧写法（`[[ -f ]] || return 1` + 静默探测）→
+     F-4 的「状态文件不存在」提示断言变红；
+   - 把 `lib/core.sh` 回退实现里的 `out+='%27'` 改成 `out+='%39'`（即把回退实现弄错）
+     → M-7 的 mock 基准断言必须变红（mock 用的是**独立算法**，抓得住回退实现的错）；
+   - **恒真性的直接反证**：同一个变异体（回退实现弄错）+ 把 M-7 的基准换回
+     「真实 python 分支」→ **M-7 的那条对比断言仍然绿**（本机 python3 功能异常，
+     真实分支其实也是回退分支，两侧一起错、一样对），
+     而同一条断言在新的 mock 基准下**变红**——
+     这就是原断言「恒真」的证明：它抓不住任何回退实现的错误。
+     （同一变异下，「urlencode 编码单引号」等**直接的值断言**照样变红，
+     唯独那条【两分支对比】断言是绿的 —— 这正是要证明的那一点。）
+6. **更正实施报告**：`task-3-report.md` 的 §4「分项计数」少 1 条，
+   按本节「修复轮 2 的验收标准」第 3 条的实际条数更正，并把本轮 4 项发现
+   与对应处置补进报告的变更清单。
 
 ---
 
@@ -1801,9 +2030,9 @@ git commit -m "feat(core): 网络探测——公网 IP、端口占用、TLS1.3 �
 - Produces:
   - `xray_parse_keys <raw_output>` → stdout `"priv|pub"`；解析失败返回 `1`
   - `gen_keys` → 设置全局 `PRIVATE_KEY` `PUBLIC_KEY` `SHORT_ID` `UUID`
-  - `render_server_config <outfile> <uuid> <priv> <sni> <port> <shortid>` → 写文件，返回 `0`
+  - `render_server_config <outfile> <uuid> <priv> <sni> <port> <shortid>` → **只渲染到暂存文件**，不落位到正式配置；返回 `0`
   - `xray_test_config <cfgfile>` → `0`/`1`
-  - `write_config_atomic <outfile> <content>` → 临时文件 + 校验 + 原子替换
+  - `write_config_atomic <outfile> <srcfile>` → 复制到临时文件 → `xray run -test` 校验 → 原子替换；**写服务端配置的唯一入口**
 
 **Step 1: 写失败的测试**
 
@@ -1855,6 +2084,34 @@ if python3 -c 'import json' >/dev/null 2>&1; then
 fi
 rm -f "$cfg"
 fi
+
+test_case "服务端配置原子写入"
+
+# write_config_atomic 是写服务端配置的唯一入口，两条路径都必须被覆盖。
+# 校验失败：必须返回非零、【保留原有配置】、并清理临时文件。
+atomic_dir=$(mktemp -d 2>/dev/null)
+if [[ -n "$atomic_dir" ]]; then
+  atarget="$atomic_dir/config.json"
+  printf 'OLD-CONTENT\n' >"$atarget"
+  # 本机没有 xray → xray_test_config 必然失败 → 正好走「校验失败」这条路径
+  out=$( ( XRAY_BIN="$atomic_dir/no-such-xray"; write_config_atomic "$atarget" '{"broken":' ) 2>&1 ); rc=$?
+  assert_status 1 "$rc" "write_config_atomic 在配置校验失败时返回非零"
+  assert_eq "OLD-CONTENT" "$(cat "$atarget")" "write_config_atomic 校验失败时保留原有配置不变"
+  if [[ -e "$atarget.new" ]]; then leftover=1; else leftover=0; fi
+  assert_eq "0" "$leftover" "write_config_atomic 校验失败时清理临时文件"
+  # 校验通过：必须原子替换成新内容（注意 write_config_atomic 收的是【源文件】）
+  printf '{"ok":1}\n' >"$atomic_dir/src.json"
+  out=$( ( xray_test_config() { return 0; }; write_config_atomic "$atarget" "$atomic_dir/src.json" ) 2>&1 ); rc=$?
+  assert_status 0 "$rc" "write_config_atomic 在配置校验通过时返回 0"
+  assert_contains "$(cat "$atarget")" '"ok":1' "write_config_atomic 校验通过时替换成新配置"
+  # 源文件不存在时必须失败，而不是写出空配置
+  out=$( ( xray_test_config() { return 0; }; write_config_atomic "$atarget" "$atomic_dir/no-such-file" ) 2>&1 ); rc=$?
+  assert_status 1 "$rc" "write_config_atomic 在源文件不存在时返回非零"
+else
+  assert_eq "mktemp -d 能创建唯一临时目录" "失败（mktemp -d 返回空路径）" \
+    "write_config_atomic 用例前提：mktemp -d 必须能创建唯一临时目录"
+fi
+rm -rf "$atomic_dir"
 ```
 
 **Step 2: 运行测试确认失败**
@@ -2021,8 +2278,9 @@ render_server_config() {
   }
 }
 EOF
-  mv -f "$tmp" "$outfile"
-  chmod 644 "$outfile"
+  mv -f "$tmp" "$outfile" || { tui_err "无法写入配置：$outfile"; rm -f "$tmp"; return 1; }
+  # 含 REALITY 私钥 → 600
+  chmod 600 "$outfile" || { tui_err "无法设置配置权限：$outfile"; return 1; }
 }
 
 # 校验配置可用。兼容不同 xray 版本的子命令写法。
@@ -2035,18 +2293,27 @@ xray_test_config() {
 }
 
 # 写临时文件 → 校验 → 原子替换。校验失败保留旧文件并输出 xray 报错。
+# 用法: write_config_atomic <目标文件> <源文件>
+#   源文件是刚渲染出来的配置（尚未落位）；本函数负责把它校验后原子替换到目标。
+# 这条路径是【唯一】的写服务端配置入口 —— do_deploy 与 menu_rotate_keys 都必须走它，
+# 不得各自手写「渲染 → 校验 → mv」。两处手写必然分叉：menu_rotate_keys 那份当年
+# 就漏了输出 xray 的原始报错，用户只看到一句「新配置校验未通过」。
 write_config_atomic() {
-  local outfile="$1" content="$2"
+  local outfile="$1" src="$2"
   local tmp="$outfile.new"
-  printf '%s\n' "$content" >"$tmp"
+  [[ -f "$src" ]] || { tui_err "源配置不存在：$src"; return 1; }
+  cp "$src" "$tmp" || { tui_err "无法写入临时文件：$tmp"; return 1; }
+  # 服务端配置含 REALITY 私钥 → 权限必须 600（计划里其余含密文件一律 600）。
+  # systemd unit 没有 User= → xray 以 root 运行 → 600 不会挡住它读配置。
+  chmod 600 "$tmp" || { tui_err "无法设置临时文件权限：$tmp"; rm -f "$tmp"; return 1; }
   if ! xray_test_config "$tmp"; then
     tui_err "配置校验未通过，已保留原有配置不变。"
     "$XRAY_BIN" run -test -config "$tmp" 2>&1 | sed -e 's/^/      /' || true
     rm -f "$tmp"
     return 1
   fi
-  mv -f "$tmp" "$outfile"
-  chmod 644 "$outfile"
+  mv -f "$tmp" "$outfile" || { tui_err "无法写入配置文件：$outfile"; rm -f "$tmp"; return 1; }
+  chmod 600 "$outfile" || { tui_err "无法设置配置文件权限：$outfile"; return 1; }
   return 0
 }
 ```
@@ -2109,6 +2376,39 @@ if ! have_cmd ufw && ! have_cmd nft && ! have_cmd iptables; then
   out=$(open_firewall 443 2>&1) || true
   assert_contains "$out" "防火墙" "无防火墙工具时给出明确提示"
 fi
+
+# open_firewall：ufw 分支必须真的调用 ufw allow 且把失败码传出去。
+# 用 mock 捕获 tui_run 的命令，【不碰真实防火墙】。
+out=$( ( have_cmd() { case "$1" in ufw) return 0 ;; iptables|nft) return 1 ;; *) return 1 ;; esac; }
+            ufw() { printf 'Status: active\n'; }
+            tui_run() { printf '%s\n' "$*"; return 0; }
+            open_firewall 8443 2>&1 ) )
+assert_contains "$out" "8443/tcp" "open_firewall 的 ufw 分支调用了 ufw allow <port>/tcp"
+out=$( ( have_cmd() { case "$1" in ufw) return 0 ;; iptables|nft) return 1 ;; *) return 1 ;; esac; }
+            ufw() { printf 'Status: active\n'; }
+            tui_run() { return 7; }
+            open_firewall 8443 >/dev/null 2>&1 ) ); rc=$?
+assert_status 7 "$rc" "open_firewall 必须把防火墙命令的失败码传出去（不得静默成功）"
+
+# enable_bbr 的成功路径：配置路径由环境变量覆盖 → 不碰宿主机内核参数。
+# （原来的成功路径根本没法测：一写就是真的改宿主机拥塞控制。）
+bbr_dir=$(mktemp -d 2>/dev/null)
+if [[ -n "$bbr_dir" ]]; then
+  out=$( ( sysctl() { case "$1" in -n) printf 'bbr cubic\n' ;; *) return 0 ;; esac; }
+            VLESS_REALITY_SYSCTL_CONF="$bbr_dir/99-bbr.conf"; enable_bbr 2>&1 ) ); rc=$?
+  assert_status 0 "$rc" "enable_bbr 在支持 bbr 时返回 0"
+  assert_contains "$(cat "$bbr_dir/99-bbr.conf" 2>/dev/null)" 'tcp_congestion_control = bbr' "enable_bbr 写入 bbr 配置"
+  # 写不进去时必须返回非零并明确报错（不得谎报「已启用」）
+  out=$( ( sysctl() { case "$1" in -n) printf 'bbr cubic\n' ;; *) return 0 ;; esac; }
+            VLESS_REALITY_SYSCTL_CONF="$bbr_dir/no-such-dir/99-bbr.conf"; enable_bbr 2>&1 ) ); rc=$?
+  assert_status 1 "$rc" "enable_bbr 在无法写入 sysctl 配置时返回非零"
+  if [[ "$out" == *"已启用 bbr"* ]]; then lied=1; else lied=0; fi
+  assert_eq "0" "$lied" "enable_bbr 写失败时不得谎报『已启用 bbr』"
+else
+  assert_eq "mktemp -d 能创建唯一临时目录" "失败（mktemp -d 返回空路径）" \
+    "enable_bbr 用例前提：mktemp -d 必须能创建唯一临时目录"
+fi
+rm -rf "$bbr_dir"
 ```
 
 **Step 2: 运行测试确认失败**
@@ -2139,7 +2439,13 @@ install_xray() {
   # 依赖装不上就必须中止：ensure_packages 会透传 apt 的失败码。
   ensure_packages curl ca-certificates || return 1
   local installer
-  installer=$(mktemp)
+  installer=$(mktemp 2>/dev/null)
+  # mktemp 必须有空值守卫：失败时 installer 为空 → curl -o "" 失败，
+  # 报错会指向「网络」而真实原因是 mktemp 不可用。
+  if [[ -z "$installer" ]]; then
+    tui_err "无法创建临时文件，Xray 安装中止。"
+    return 1
+  fi
   if ! curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o "$installer"; then
     tui_err "下载 Xray 安装脚本失败，请检查网络连通性"
     rm -f "$installer"
@@ -2216,7 +2522,9 @@ open_firewall() {
     if nft list chain inet filter input 2>/dev/null | grep -q "tcp dport $port"; then
       tui_ok "nftables 规则已存在，无需重复添加"
     else
-      tui_run "放行端口 $port/tcp (nftables)" nft insert rule inet filter input tcp dport "$port" ct state new counter accept
+      # 失败必须传播出去：原来这一分支不管 nft insert 成功与否都 return 0，
+      # 调用方（do_deploy）会以为端口已放行。
+      tui_run "放行端口 $port/tcp (nftables)" nft insert rule inet filter input tcp dport "$port" ct state new counter accept || return 1
     fi
     if have_cmd systemctl && systemctl is-enabled nftables >/dev/null 2>&1; then
       tui_tip "nftables 规则由 nftables.service 管理，重启后可能丢失；建议同步写入 /etc/nftables.conf"
@@ -2236,16 +2544,28 @@ enable_bbr() {
     tui_tip "可用算法：${avail:-未知}"
     return 1
   fi
-  local conf=/etc/sysctl.d/99-vless-reality-bbr.conf
-  cat >"$conf" <<'EOF'
-net.core.default_qdisc = fq
+  # 配置路径可被环境变量覆盖 —— 仅为让单元测试能在【不碰宿主机内核参数】的前提下
+  # 覆盖成功路径；生产环境不要设置它。
+  local conf="${VLESS_REALITY_SYSCTL_CONF:-/etc/sysctl.d/99-vless-reality-bbr.conf}"
+  local bbr_conf
+  bbr_conf='net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.ipv4.tcp_fastopen = 3
 net.core.somaxconn = 4096
 net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_slow_start_after_idle = 0
-EOF
-  sysctl -p "$conf" >/dev/null 2>&1 || sysctl --system >/dev/null 2>&1 || true
+net.ipv4.tcp_slow_start_after_idle = 0'
+  # 写失败必须报错并返回非零：原来 `cat >"$conf"` 的失败被后面的 `|| true` 吃掉，
+  # 函数照样 tui_ok「已启用 bbr」并返回 0 —— 失败被伪装成成功。
+  if ! printf '%s\n' "$bbr_conf" >"$conf"; then
+    tui_err "无法写入 sysctl 配置：$conf"
+    tui_tip "可能缺少 root 权限，或该目录不可写。"
+    return 1
+  fi
+  if ! sysctl -p "$conf" >/dev/null 2>&1 && ! sysctl --system >/dev/null 2>&1; then
+    tui_err "内核参数应用失败：$conf"
+    tui_tip "可能缺少 root 权限。"
+    return 1
+  fi
   tui_ok "已启用 bbr 拥塞控制与 fq 队列（$conf）"
   return 0
 }
@@ -2335,6 +2655,38 @@ assert_contains "$(cat "$ccfg")" '"serverName": "www.microsoft.com"' "客户端�
 assert_contains "$(cat "$ccfg")" '"fingerprint": "chrome"' "客户端含 fingerprint"
 rm -f "$ccfg"
 fi
+
+test_case "客户端物料导出"
+
+# export_client_artifacts 此前【完全没有测试】—— 而它正是产出分享链接的函数。
+exp_dir=$(mktemp -d 2>/dev/null)
+if [[ -n "$exp_dir" ]]; then
+  out=$( export_client_artifacts "$exp_dir" "UUID123" "1.2.3.4" "443" "www.microsoft.com" "PUBKEY" "a1b2c3d4" "我的节点" 2>&1 ); rc=$?
+  assert_status 0 "$rc" "export_client_artifacts 成功返回 0"
+  assert_contains "$(cat "$exp_dir/link.txt" 2>/dev/null)" "vless://UUID123@1.2.3.4:443" "link.txt 含分享链接"
+  assert_contains "$(cat "$exp_dir/client.txt" 2>/dev/null)" "UUID: UUID123" "client.txt 含 UUID"
+  # 备注不出现在 client.txt 的明文字段里（只作为分享链接的 fragment，URL 编码后出现）
+  assert_contains "$(cat "$exp_dir/client.txt" 2>/dev/null)" "%E6%88%91%E7%9A%84%E8%8A%82%E7%82%B9" "client.txt 的分享链接里备注被 URL 编码"
+  if [[ -s "$exp_dir/client.json" ]]; then jf=1; else jf=0; fi
+  assert_eq "1" "$jf" "client.json 已生成且非空"
+  # 权限位：只在 chmod 真的生效的文件系统上断言（MSYS 模拟 chmod，会自动跳过）
+  exp_probe="$exp_dir/.probe"
+  : >"$exp_probe"
+  chmod 600 "$exp_probe" 2>/dev/null
+  if [[ "$(stat -c '%a' "$exp_probe" 2>/dev/null)" == "600" ]]; then
+    assert_eq "600" "$(stat -c '%a' "$exp_dir/link.txt" 2>/dev/null)" "link.txt 权限为 600"
+    assert_eq "600" "$(stat -c '%a' "$exp_dir/client.txt" 2>/dev/null)" "client.txt 权限为 600"
+    assert_eq "700" "$(stat -c '%a' "$exp_dir" 2>/dev/null)" "客户端导出目录权限为 700"
+  fi
+else
+  assert_eq "mktemp -d 能创建唯一临时目录" "失败（mktemp -d 返回空路径）" \
+    "export_client_artifacts 用例前提：mktemp -d 必须能创建唯一临时目录"
+fi
+rm -rf "$exp_dir"
+
+# IPv6 地址在分享链接里必须加方括号，否则客户端导入即废。
+link6=$(build_share_link "UUID123" "2001:db8::1" "443" "www.microsoft.com" "PUBKEY" "a1b2c3d4" "v6")
+assert_contains "$link6" "@[2001:db8::1]:443" "IPv6 地址在分享链接里加了方括号"
 ```
 
 **Step 2: 运行测试确认失败**
@@ -2355,10 +2707,18 @@ bash test/unit.sh
 
 build_share_link() {
   local uuid="$1" ip="$2" port="$3" sni="$4" pub="$5" sid="$6" remark="$7"
-  local enc
+  local enc host
   enc=$(urlencode "$remark")
-  printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none#%s' \
-    "$uuid" "$ip" "$port" "$sni" "$pub" "$sid" "$enc"
+  # IPv6 地址在 URL 里必须写成 [addr]:port，否则 vless://uuid@2001:db8::1:443 是非法 URL
+  # → 客户端导入即废。detect_public_ip 允许返回 IPv6，所以这里必须处理。
+  host="$ip"
+  if [[ "$host" == *:* && "$host" != \[*\] ]]; then
+    host="[$host]"
+  fi
+  # FLOW / FINGERPRINT 是全局状态（状态文件里也记着），不能在这里写死 ——
+  # 写死就等于让状态文件里的这两个字段变成死状态。
+  printf 'vless://%s@%s:%s?encryption=none&flow=%s&security=reality&sni=%s&fp=%s&pbk=%s&sid=%s&type=tcp&headerType=none#%s' \
+    "$uuid" "$host" "$port" "${FLOW:-xtls-rprx-vision}" "$sni" "${FINGERPRINT:-chrome}" "$pub" "$sid" "$enc"
 }
 
 render_client_config() {
@@ -2444,19 +2804,22 @@ render_client_config() {
   }
 }
 EOF
-  mv -f "$tmp" "$outfile"
-  chmod 600 "$outfile"
+  mv -f "$tmp" "$outfile" || { tui_err "无法写入客户端配置：$outfile"; rm -f "$tmp"; return 1; }
+  chmod 600 "$outfile" || { tui_err "无法设置客户端配置权限：$outfile"; return 1; }
 }
 
 export_client_artifacts() {
   local outdir="$1" uuid="$2" ip="$3" port="$4" sni="$5" pub="$6" sid="$7" remark="$8"
-  mkdir -p "$outdir"
-  chmod 700 "$outdir"
+  # 目录与文件都含敏感信息（分享链接、UUID、公钥）→ 每一步失败都必须报错并返回非零，
+  # 绝不能让「导出失败」看起来像「导出成功」。
+  mkdir -p "$outdir" || { tui_err "无法创建客户端导出目录：$outdir"; return 1; }
+  chmod 700 "$outdir" || { tui_err "无法设置客户端导出目录权限：$outdir"; return 1; }
 
   local link
   link=$(build_share_link "$uuid" "$ip" "$port" "$sni" "$pub" "$sid" "$remark")
+  [[ -n "$link" ]] || { tui_err "分享链接生成为空"; return 1; }
 
-  render_client_config "$outdir/client.json" "$uuid" "$ip" "$port" "$sni" "$pub" "$sid"
+  render_client_config "$outdir/client.json" "$uuid" "$ip" "$port" "$sni" "$pub" "$sid" || return 1
 
   {
     printf '# VLESS + REALITY 客户端信息\n\n'
@@ -2471,11 +2834,11 @@ export_client_artifacts() {
     printf '指纹 (fp): chrome\n\n'
     printf '分享链接:\n%s\n\n' "$link"
     printf '导入方式: v2rayN / v2rayNG / Clash Verge / Shadowrocket / Hiddify 均可直接粘贴该链接。\n'
-  } >"$outdir/client.txt"
-  chmod 600 "$outdir/client.txt"
+  } >"$outdir/client.txt" || { tui_err "无法写入客户端信息文件：$outdir/client.txt"; return 1; }
+  chmod 600 "$outdir/client.txt" || { tui_err "无法设置客户端信息文件权限：$outdir/client.txt"; return 1; }
 
-  printf '%s' "$link" >"$outdir/link.txt"
-  chmod 600 "$outdir/link.txt"
+  printf '%s' "$link" >"$outdir/link.txt" || { tui_err "无法写入分享链接文件：$outdir/link.txt"; return 1; }
+  chmod 600 "$outdir/link.txt" || { tui_err "无法设置分享链接文件权限：$outdir/link.txt"; return 1; }
 
   # 二维码：缺 qrencode 时跳过，不影响主流程
   if have_cmd qrencode; then
@@ -2517,8 +2880,8 @@ git commit -m "feat(client): 分享链接、客户端配置与二维码导出"
 **Interfaces:**
 - Consumes: Task 3–7 全部
 - Produces:
-  - `install.sh` 支持 `-y/--yes` `-p/--port` `-s/--sni` `-n/--name` `--uuid` `-m/--menu` `--status` `--uninstall` `-h/--help`
-  - `parse_args "$@"` → 设置 `OPT_YES` `OPT_PORT` `OPT_SNI` `OPT_NAME` `OPT_UUID` `OPT_MODE`
+  - `install.sh` 支持 `-y/--yes` `-p/--port` `-s/--sni` `-n/--name` `--uuid` `--addr` `-m/--menu` `--status` `--uninstall` `-h/--help`
+  - `parse_args "$@"` → 设置 `OPT_YES` `OPT_PORT` `OPT_SNI` `OPT_NAME` `OPT_UUID` `OPT_ADDR` `OPT_MODE`
   - `preflight` → `0`/`1`
   - `require_root`
 
@@ -2533,6 +2896,16 @@ run_help=$(bash "$ROOT/install.sh" --help 2>&1)
 assert_contains "$run_help" "--port" "帮助信息含 --port"
 assert_contains "$run_help" "--sni" "帮助信息含 --sni"
 assert_contains "$run_help" "--menu" "帮助信息含 --menu"
+assert_contains "$run_help" "--addr" "帮助信息含 --addr"
+
+# --addr 的字符集校验：会原样进分享链接与客户端 JSON → 必须拒绝引号/空格/$
+out=$(bash "$ROOT/install.sh" --addr 'bad"addr' 2>&1); rc=$?
+assert_status 1 "$rc" "--addr 含引号时以非零码退出"
+assert_contains "$out" "--addr" "--addr 非法时给出明确提示"
+out=$(bash "$ROOT/install.sh" --addr 'a b' 2>&1); rc=$?
+assert_status 1 "$rc" "--addr 含空格时以非零码退出"
+out=$(bash "$ROOT/install.sh" --addr 2>&1); rc=$?
+assert_status 1 "$rc" "--addr 缺少参数时以非零码退出"
 
 # 未知参数必须报错退出
 out=$(bash "$ROOT/install.sh" --definitely-not-a-real-flag 2>&1); rc=$?
@@ -2587,6 +2960,7 @@ OPT_PORT=''
 OPT_SNI=''
 OPT_NAME=''
 OPT_UUID=''
+OPT_ADDR=''
 
 usage() {
   cat <<EOF
@@ -2601,6 +2975,7 @@ ${APP_NAME} v${APP_VERSION}
   -s, --sni <域名>    指定 REALITY 伪装目标
   -n, --name <备注>   指定分享链接备注
       --uuid <UUID>   指定 UUID（默认自动生成）
+      --addr <地址>   指定对外地址（NAT 后的服务器用；默认自动探测公网 IP）
   -m, --menu          直接进入管理菜单
       --status        查看运行状态并退出
       --uninstall     卸载并清理
@@ -2633,6 +3008,16 @@ parse_args() {
       -s|--sni)      OPT_SNI="${2:-}"; [[ -n "$OPT_SNI" ]] || { tui_err "--sni 缺少参数"; exit 1; }; shift 2 ;;
       -n|--name)     OPT_NAME="${2:-}"; [[ -n "$OPT_NAME" ]] || { tui_err "--name 缺少参数"; exit 1; }; shift 2 ;;
       --uuid)        OPT_UUID="${2:-}"; [[ -n "$OPT_UUID" ]] || { tui_err "--uuid 缺少参数"; exit 1; }; shift 2 ;;
+      --addr)        OPT_ADDR="${2:-}"; [[ -n "$OPT_ADDR" ]] || { tui_err "--addr 缺少参数"; exit 1; }
+                     # 地址会原样进入分享链接与客户端 JSON → 字符集必须受限：
+                     # 只允许 IP 字面量与 DNS 主机名会用到的字符（字母数字 . : _ -），
+                     # 引号/反斜杠/空格/$ 一律拒绝（否则破坏 JSON 与 URL）。
+                     if ! [[ "$OPT_ADDR" =~ ^[A-Za-z0-9._:-]+$ ]]; then
+                       tui_err "--addr 只能是 IP 地址或主机名：$OPT_ADDR"
+                       tui_tip "示例：1.2.3.4 / example.com / 2001:db8::1"
+                       exit 1
+                     fi
+                     shift 2 ;;
       *) tui_err "未知参数：$1"; usage; exit 1 ;;
     esac
   done
@@ -2678,14 +3063,20 @@ preflight() {
     ensure_packages qrencode || tui_tip "qrencode 安装失败，稍后仍可手动安装以生成二维码"
   fi
 
-  # 公网 IP
-  SERVER_IP=$(detect_public_ip || true)
-  if [[ -z "$SERVER_IP" ]]; then
-    SERVER_IP=$(detect_local_ip || true)
-    tui_warn "未能探测到公网 IP，回退使用本机地址：${SERVER_IP:-未知}"
-    tui_tip "若服务器位于 NAT 后，请用 --sni/--name 之外的方式确认对外地址后再配置客户端"
+  # 对外地址：优先用 --addr 指定的（NAT 后的服务器探测不到公网 IP，
+  # 探测到的只是内网地址 → 分享链接里的主机名是内网 IP → 客户端根本连不上）。
+  if [[ -n "${OPT_ADDR:-}" ]]; then
+    SERVER_IP="$OPT_ADDR"
+    tui_ok "使用指定的对外地址：$SERVER_IP"
   else
-    tui_ok "公网 IP：$SERVER_IP"
+    SERVER_IP=$(detect_public_ip || true)
+    if [[ -z "$SERVER_IP" ]]; then
+      SERVER_IP=$(detect_local_ip || true)
+      tui_warn "未能探测到公网 IP，回退使用本机地址：${SERVER_IP:-未知}"
+      tui_tip "若服务器位于 NAT 后，请用 --addr 指定对外地址后再配置客户端。"
+    else
+      tui_ok "公网 IP：$SERVER_IP"
+    fi
   fi
 
   return $rc
@@ -2911,18 +3302,21 @@ do_deploy() {
   [[ -n "${OPT_UUID:-}" ]] && UUID="${OPT_UUID:-}"
 
   tui_step "③ 生成服务端配置"
-  mkdir -p "$(dirname "$XRAY_CONFIG")"
+  mkdir -p "$(dirname "$XRAY_CONFIG")" || { tui_err "无法创建配置目录：$(dirname "$XRAY_CONFIG")"; return 1; }
   local cfg
-  cfg=$(mktemp)
-  render_server_config "$cfg" "$UUID" "$PRIVATE_KEY" "$SNI" "$PORT" "$SHORT_ID"
-  if ! xray_test_config "$cfg"; then
-    tui_err "配置校验未通过，已保留原有配置不变。"
-    "$XRAY_BIN" run -test -config "$cfg" 2>&1 | sed -e 's/^/      /' || true
-    rm -f "$cfg"
+  # mktemp 必须有空值守卫：失败时 cfg 为空 → render_server_config 会写到 ".new"
+  # 污染当前目录（还可能在仓库里），而 mv 会因为空路径而失败。
+  cfg=$(mktemp 2>/dev/null)
+  if [[ -z "$cfg" ]]; then
+    tui_err "无法创建临时文件，部署中止。"
     return 1
   fi
-  mv -f "$cfg" "$XRAY_CONFIG"
-  chmod 644 "$XRAY_CONFIG"
+  render_server_config "$cfg" "$UUID" "$PRIVATE_KEY" "$SNI" "$PORT" "$SHORT_ID" || { rm -f "$cfg"; return 1; }
+  # 写服务端配置【必须】走 write_config_atomic（复制到临时文件 → xray 校验 → 原子替换），
+  # 不要在这里手写「校验 + 替换」：两处手写会分叉（menu_rotate_keys 当年就漏了
+  # 输出 xray 的原始报错），而且手写版本漏掉了 mv/chmod 的失败检查。
+  write_config_atomic "$XRAY_CONFIG" "$cfg" || { rm -f "$cfg"; return 1; }
+  rm -f "$cfg"
   tui_ok "服务端配置已写入：$XRAY_CONFIG"
 
   tui_step "④ 配置 systemd 服务"
@@ -2980,12 +3374,15 @@ deploy_wizard() {
   #   · 即使补了全局声明，空的 SERVER_IP 也会让分享链接变成 "vless://uuid@:443?..."
   #     → 主机名为空 → 客户端导入即废。
   # 所以这里必须自己兜底探测一次。
-  if [[ -z "${SERVER_IP:-}" ]]; then
+  if [[ -n "${OPT_ADDR:-}" ]]; then
+    # 用户手工指定了对外地址 → 优先用它（NAT 后的服务器探测到的只是内网 IP）
+    SERVER_IP="$OPT_ADDR"
+  elif [[ -z "${SERVER_IP:-}" ]]; then
     SERVER_IP=$(detect_public_ip 2>/dev/null || true)
     [[ -n "$SERVER_IP" ]] || SERVER_IP=$(detect_local_ip 2>/dev/null || true)
     if [[ -z "$SERVER_IP" ]]; then
       tui_err "无法探测到本机地址，部署中止。"
-      tui_tip "可在 NAT 后的服务器上手工指定地址，或检查出网是否正常。"
+      tui_tip "可用 --addr 手工指定对外地址，或检查出网是否正常。"
       return 1
     fi
     tui_warn "未能自动探测到公网地址，已回退使用本机地址：$SERVER_IP"
@@ -3023,11 +3420,15 @@ deploy_wizard() {
   MODE='native'
   FLOW='xtls-rprx-vision'
   FINGERPRINT='chrome'
-  save_state
+  # 状态没落盘就必须停在这里：继续往下走会打印「部署完成」面板，
+  # 而 --status 会显示未部署、卸载流程拿不到端口 → 防火墙规则被遗留。
+  save_state || { tui_err "状态保存失败，部署状态未落盘。"; return 1; }
 
   # 客户端物料
   tui_section "客户端物料"
-  export_client_artifacts "$OUT_DIR" "$UUID" "$SERVER_IP" "$PORT" "$SNI" "$PUBLIC_KEY" "$SHORT_ID" "$REMARK"
+  # 同理：物料导出失败必须报错退出，不能让「部署完成」面板指向不存在的 client.json。
+  export_client_artifacts "$OUT_DIR" "$UUID" "$SERVER_IP" "$PORT" "$SNI" "$PUBLIC_KEY" "$SHORT_ID" "$REMARK" \
+    || { tui_err "客户端物料导出失败。"; return 1; }
 
   local link
   link=$(build_share_link "$UUID" "$SERVER_IP" "$PORT" "$SNI" "$PUBLIC_KEY" "$SHORT_ID" "$REMARK")
@@ -3185,17 +3586,22 @@ menu_tune() {
 
 menu_rotate_keys() {
   state_exists || { tui_warn "尚未部署，无密钥可轮换"; return 1; }
-  load_state
+  # load_state 自 Task 3 修复轮 1 起会对损坏的状态文件返回非零 → 必须检查，
+  # 否则会用空值渲染出一份非法配置，再被 xray 校验拒绝，报错与真实原因无关。
+  load_state || { tui_err "状态文件读取失败，无法轮换密钥。"; return 1; }
   tui_confirm "轮换密钥与 UUID 会使所有旧客户端失效，继续？" "n" || { tui_info "已取消"; return 0; }
   gen_keys || return 1
-  local cfg; cfg=$(mktemp)
-  render_server_config "$cfg" "$UUID" "$PRIVATE_KEY" "$SNI" "$PORT" "$SHORT_ID"
-  if ! xray_test_config "$cfg"; then
-    tui_err "新配置校验未通过，已保留原有配置。"
-    rm -f "$cfg"; return 1
+  local cfg
+  cfg=$(mktemp 2>/dev/null)
+  if [[ -z "$cfg" ]]; then
+    tui_err "无法创建临时文件，密钥轮换中止。"
+    return 1
   fi
-  mv -f "$cfg" "$XRAY_CONFIG"; chmod 644 "$XRAY_CONFIG"
-  save_state
+  render_server_config "$cfg" "$UUID" "$PRIVATE_KEY" "$SNI" "$PORT" "$SHORT_ID" || { rm -f "$cfg"; return 1; }
+  # 与 do_deploy 走同一个入口：write_config_atomic（校验 → 原子替换 → 600）
+  write_config_atomic "$XRAY_CONFIG" "$cfg" || { rm -f "$cfg"; return 1; }
+  rm -f "$cfg"
+  save_state || { tui_err "状态保存失败"; return 1; }
   restart_service || return 1
   export_client_artifacts "$OUT_DIR" "$UUID" "$SERVER_IP" "$PORT" "$SNI" "$PUBLIC_KEY" "$SHORT_ID" "$REMARK"
   tui_ok "密钥已轮换，请使用新的分享链接更新客户端"
@@ -3517,8 +3923,8 @@ HEADER
       "$ROOT/install.sh"
 } >"$tmp"
 
-chmod +x "$tmp"
-mv -f "$tmp" "$OUT"
+chmod +x "$tmp" || { printf '无法设置可执行权限：%s\n' "$tmp" >&2; rm -f "$tmp"; exit 1; }
+mv -f "$tmp" "$OUT" || { printf '无法写入产物：%s\n' "$OUT" >&2; rm -f "$tmp"; exit 1; }
 printf '已生成 %s (v%s)\n' "$OUT" "$VERSION"
 ```
 
