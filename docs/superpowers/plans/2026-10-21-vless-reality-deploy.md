@@ -35,6 +35,13 @@
 - 所有 `.sh` 文件必须 LF 行尾（`.gitattributes` 已锁定）
 - 非 TTY 环境（`nohup` / `curl | bash` / CI）必须降级为编号列表，**不得挂死**
 - 所有失败路径必须以非零退出码结束，且经 `tui_err` 输出
+- **所有任务的测试用例都必须追加在 `test/unit.sh` 的 `test_summary` 之前**
+  （`test_summary` 必须是文件最后一行）。追加在它之后有两个后果：
+  ① 断言条数统计偏小（`test_summary` 早就跑完了，后面的用例不计入）；
+  ② **用例失败时脚本退出码仍是 0** —— `test_summary` 已经先返回过 0，
+  失败被彻底吞掉 → CI 绿灯放行红灯。
+  （Task 4 修订轮 1 首次组装沙箱时正是踩了这个坑：追加在末尾后
+  摘要显示 155 项、实际执行了 184 项。）
 - 变量命名：全局状态用大写（`PORT` `UUID` `SNI` `PRIVATE_KEY` `PUBLIC_KEY` `SHORT_ID` `SERVER_IP` `REMARK`），函数局部用小写下划线
 - 函数返回约定：成功 `0`，失败非 `0`；菜单类函数返回 **0-based 索引**，取消返回 `255`
 
@@ -1862,6 +1869,7 @@ E1/E2 是本轮最关键的证据：**同一个变异体，在旧基准下恒绿
 **Interfaces:**
 - Consumes: Task 3 的 `have_cmd` `trim`
 - Produces:
+  - `is_valid_ip <str>` → `0`=像样的对外地址 / `1`=不是
   - `detect_public_ip` → stdout IP；失败返回 `1`
   - `detect_local_ip` → stdout IP
   - `port_in_use <port>` → `0`=占用 `1`=空闲
@@ -1874,7 +1882,7 @@ E1/E2 是本轮最关键的证据：**同一个变异体，在旧基准下恒绿
 
 **Step 1: 写失败的测试**
 
-追加到 `test/unit.sh`：
+追加到 `test/unit.sh` 的 `test_summary` **之前**（`test_summary` 必须是文件最后一行 —— 见全局约束）：
 
 ```bash
 test_case "core 网络探测（用可控输入验证解析逻辑）"
@@ -1898,6 +1906,32 @@ assert_false "$rc" "port_in_use 识别出空闲的端口（mock ss 只有表头�
 # 子串陷阱：":8080" 里就含 ":80" —— 对整行 grep 会把 :8080 误判成 :80 已被占用
 mock_port_in_use "${SS_HDR}LISTEN 0 128 0.0.0.0:8080 0.0.0.0:*\n" 80; rc=$?
 assert_false "$rc" "port_in_use 不得把 :8080 误判成 :80 已占用（按字段精确匹配）"
+
+# ── F4-1：port_in_use 不得把 grep -q 直接接在管道上 ──────────
+# 缺陷本体：管道里 `grep -q` 命中即退出 → 上游 awk 收到 SIGPIPE（141）→
+# 在 set -o pipefail 下整条管道的退出码变成 141 → `&& return 0` 不成立 →
+# 一个【已占用】的端口被误判成【空闲】→ 向导选了这个端口 →
+# 部署到一半才报 "address in use"，且错误信息与真实原因无关。
+# 这个缺陷在运行期复现需要 awk 的输出超过其管道缓冲（约 8KB，即 >1000 行），
+# 且是否触发取决于时序 → 【不能】写成一条依赖时序的运行期断言。
+# 因此用【源码静态断言】锁住实现形状（确定性，权威判据）。
+port_in_use_body="$(awk '/^port_in_use\(\) *\{/,/^\}/' "$ROOT/lib/core.sh")"
+[[ -n "$port_in_use_body" ]]; assert_true "$?" \
+  "core.sh 里必须存在 port_in_use 函数（下面那条静态断言的前提）"
+# 检查前必须先去掉整行注释：函数的说明性注释里会写「不能写成 `ss | awk | grep -q`」
+# 这类字样 —— 那是【说明】不是【代码】，不去掉会把自己判成违规（实测踩过）。
+port_in_use_code="$(printf '%s\n' "$port_in_use_body" | grep -v '^[[:space:]]*#')"
+assert_eq "" "$(printf '%s\n' "$port_in_use_code" | grep -n '|[ \t]*grep[ \t]*-q' | tr '\n' ' ')" \
+  "port_in_use 不得把 grep -q 直接接在管道上（SIGPIPE 会把 141 带进退出码）"
+# 辅助（行为）断言：输出量大到超过 awk 的管道缓冲时，判定仍必须是「已占用」。
+# 修好后这条【必然】通过；若有人改回「管道 + grep -q」，它【可能】变红（时序相关），
+# 所以它只是辅助，权威判据是上面那条静态断言。
+big_ss='State Recv-Q Send-Q Local Address:Port Peer Address:Port\nLISTEN 0 128 0.0.0.0:59999 0.0.0.0:*\n'
+for _ in $(seq 1 2000); do
+  big_ss+="LISTEN 0 128 0.0.0.0:$((3000 + _)) 0.0.0.0:*\n"
+done
+mock_port_in_use "$big_ss" 59999; rc=$?
+assert_true "$rc" "port_in_use 在输出量很大时仍能正确判定端口已占用（不得因 SIGPIPE 误判为空闲）"
 # port_occupant 的解析同样用 mock 构造确定场景
 out=$( ( have_cmd() { case "$1" in ss) return 0 ;; *) return 1 ;; esac; }
             ss() { printf '%b' "${SS_HDR}LISTEN 0 128 0.0.0.0:59999 0.0.0.0:* users:((nginx,pid=1,fd=2))\n"; }
@@ -1907,6 +1941,31 @@ out=$( ( have_cmd() { case "$1" in ss) return 0 ;; *) return 1 ;; esac; }
             ss() { printf '%b' "$SS_HDR"; }
             port_occupant 59999 ) 2>&1 )
 assert_eq "" "$out" "port_occupant 在端口空闲时输出为空"
+
+# ── is_valid_ip：挡住「响应体根本不是 IP」的情况 ──────────────
+# 旧判定 `^[0-9a-fA-F:]+$` 太宽：HTTP 状态码响应体（"404" / "403" / "200"，
+# 代理与网关常这么返回）和 "cafebabe" / "12345" 这类纯十六进制串都会被当成 IP
+# → 写进分享链接与配置后客户端必然连不上，而用户完全看不出是「探测错了」。
+assert_succeeds "is_valid_ip 接受合法 IPv4" is_valid_ip 1.2.3.4
+assert_succeeds "is_valid_ip 接受 0 号段（0.0.0.0 是合法写法）" is_valid_ip 0.0.0.0
+assert_succeeds "is_valid_ip 接受 255 号段" is_valid_ip 255.255.255.255
+assert_succeeds "is_valid_ip 接受 IPv6 形态" is_valid_ip "2001:db8::1"
+assert_fails "is_valid_ip 拒绝纯数字串（404 这类 HTTP 状态码）" is_valid_ip 404
+assert_fails "is_valid_ip 拒绝纯十六进制串（cafebabe）" is_valid_ip cafebabe
+assert_fails "is_valid_ip 拒绝五段 IPv4" is_valid_ip 1.2.3.4.5
+assert_fails "is_valid_ip 拒绝每段都大于 255 的伪 IPv4" is_valid_ip 999.999.999.999
+assert_fails "is_valid_ip 拒绝空串" is_valid_ip ""
+
+# detect_public_ip：必须 mock 掉 curl 才能得到确定性结果（真实网络不可依赖）。
+out=$( ( curl() { printf '404'; }; detect_public_ip ) 2>/dev/null ); rc=$?
+assert_status 1 "$rc" "detect_public_ip 面对非 IP 响应体（HTTP 状态码 404）必须返回非零"
+assert_eq "" "$out" "detect_public_ip 面对非 IP 响应体时不得输出任何内容"
+out=$( ( curl() { printf '1.2.3.4'; }; detect_public_ip ) 2>/dev/null ); rc=$?
+assert_status 0 "$rc" "detect_public_ip 遇到合法 IPv4 时返回 0"
+assert_eq "1.2.3.4" "$out" "detect_public_ip 输出正确的公网 IPv4"
+out=$( ( curl() { printf '2001:db8::1'; }; detect_public_ip ) 2>/dev/null ); rc=$?
+assert_status 0 "$rc" "detect_public_ip 遇到 IPv6 时返回 0"
+assert_eq "2001:db8::1" "$out" "detect_public_ip 输出正确的 IPv6"
 
 # 延迟解析：必须用 mock 的 curl，不能依赖「某个域名一定不可达」——
 # 实测本机环境里 invalid.invalid.nonexistent 会被解析并连上，curl 报出 4ms
@@ -1960,6 +2019,29 @@ bash test/unit.sh
 追加到 `lib/core.sh`：
 
 ```bash
+# 判定一个字符串是不是可用的对外地址。
+# 存在的理由：旧的判定 `^[0-9a-fA-F:]+$` 太宽 —— HTTP 状态码响应体
+# （代理/网关常返回 "404" / "403" / "200" 当正文）和 "cafebabe" / "12345"
+# 这类纯十六进制串都会被当成 IP → 写进分享链接与配置后客户端必然连不上，
+# 而用户完全看不出是「探测错了」而不是「服务没起来」。
+is_valid_ip() {
+  local ip="$1" o
+  # IPv4：4 段十进制，每段 0-255
+  if [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+    for o in "${BASH_REMATCH[@]:1:4}"; do
+      # 必须用 10# 前缀：裸算术会把 "08" 当八进制，直接报「value too great for base」。
+      if (( 10#$o > 255 )); then return 1; fi
+    done
+    return 0
+  fi
+  # IPv6：必须含 ':'（否则 "404" 这类纯数字/纯十六进制串会被误收），
+  # 且只允许十六进制字符与冒号。
+  if [[ "$ip" == *:* ]] && [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]]; then
+    return 0
+  fi
+  return 1
+}
+
 detect_public_ip() {
   local ip u
   local urls=(
@@ -1971,7 +2053,7 @@ detect_public_ip() {
   )
   for u in "${urls[@]}"; do
     ip=$(curl -fsS --max-time 8 "$u" 2>/dev/null | tr -d '[:space:]')
-    if [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || "$ip" =~ ^[0-9a-fA-F:]+$ ]]; then
+    if is_valid_ip "$ip"; then
       printf '%s' "$ip"; return 0
     fi
   done
@@ -1986,25 +2068,44 @@ detect_local_ip() {
 }
 
 port_in_use() {
-  local port="$1"
+  local port="$1" rows
   if have_cmd ss; then
-    # 必须按【字段】精确匹配，不能对整行 grep ":$port"：
+    # 先把整段输出【收进变量】再匹配，不能写成 `ss | awk | grep -q`：
+    # 管道里 grep -q 命中即退出 → 上游 awk 收到 SIGPIPE（141）→
+    # 在 set -o pipefail 下整条管道的退出码变成 141 → `&& return 0` 不成立 →
+    # 一个【已占用】的端口被误判成【空闲】→ 向导选了这个端口 →
+    # 部署到一半才报 "address in use"，且错误信息与真实原因无关。
+    # 改成「先收进变量、再对变量 grep」后，grep 读的是 here-string（临时文件），
+    # 整条链路上没有任何会早退的管道 → 不可能有 SIGPIPE。
+    #
+    # 仍必须按【字段】精确匹配，不能对整行 grep ":$port"：
     # ":8080" 这个字符串里就含 ":80" → 全行 grep 会把 8080 误判成 80 已被占用，
     # 于是向导会以为端口 80 被占而改选别的端口。NR>1 跳过 ss 的表头行。
-    ss -ltn "sport = :$port" 2>/dev/null | awk 'NR>1{print $4}' | grep -qE "[:.]$port\$" && return 0
+    rows=$(ss -ltn "sport = :$port" 2>/dev/null | awk 'NR>1{print $4}')
+    [[ -n "$rows" ]] || return 1
+    grep -qE "[:.]$port\$" <<<"$rows" && return 0
     return 1
   fi
   if have_cmd netstat; then
-    netstat -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$port\$" && return 0
+    # netstat 的输出【不受端口过滤】，行数可能很大 → 同样不能把 grep -q 接在管道上。
+    rows=$(netstat -ltn 2>/dev/null | awk '{print $4}')
+    [[ -n "$rows" ]] || return 1
+    grep -qE "[:.]$port\$" <<<"$rows" && return 0
     return 1
   fi
   return 1
 }
 
 port_occupant() {
-  local port="$1"
+  local port="$1" rows
   if have_cmd ss; then
-    ss -ltnp "sport = :$port" 2>/dev/null | awk 'NR>1{print $NF}' | head -1
+    # 用纯 bash 取首行，不用 `| head -1`：head 命中即退出会让上游 awk 收到
+    # SIGPIPE（141）。原写法其实【输出是对的】（head 先读走第一行才退出，
+    # 且函数末尾显式 return 0 覆盖了管道状态），改成纯 bash 后不再有任何管道，
+    # 行为不变但不再依赖那个时序。
+    rows=$(ss -ltnp "sport = :$port" 2>/dev/null | awk 'NR>1{print $NF}')
+    rows="${rows%%$'\n'*}"
+    printf '%s' "$rows"
     return 0
   fi
   printf ''
@@ -2098,6 +2199,57 @@ bash test/unit.sh
 git add lib/core.sh test/unit.sh
 git commit -m "feat(core): 网络探测——公网 IP、端口占用、TLS1.3 与延迟"
 ```
+
+#### 修订轮 1 的逐项发现与处置
+
+> 本节由**控制器**在派发 Task 4 实施者**之前**写入，依据是控制器自己跑的探针实验
+> （见下方「证据」），不是推测。计划 = 真相：上面 Step 1 / Step 3 两处代码块
+> 已是修订后的**权威终版**，实施者必须逐字照抄。
+
+| # | 级别 | 发现 | 处置 |
+|---|---|---|---|
+| F4-1 | **Important** | `port_in_use` 把 `grep -q` 直接接在管道上（`ss \| awk \| grep -q`）。`grep -q` 命中即退出 → 上游 `awk` 收到 SIGPIPE（141）→ 在 `set -o pipefail` 下整条管道的退出码变成 141 → `&& return 0` 不成立 → **已占用**的端口被误判成**空闲** | 改成「先把整段输出收进 `rows` 变量，再对变量 grep」（`<<<` 是 here-string，不是管道）→ 链路上没有任何会早退的管道 → 不可能有 SIGPIPE |
+| F4-2 | **Important** | `detect_public_ip` 的判定 `^[0-9a-fA-F:]+$` 太宽：HTTP 状态码响应体（`"404"` / `"403"` / `"200"`）与 `"cafebabe"` / `"12345"` 都会被当成 IP → 写进分享链接后客户端必然连不上，且用户完全看不出是「探测错了」 | 新增 `is_valid_ip`：IPv4 必须是 4 段十进制且每段 ≤255；IPv6 必须含 `':'`。`detect_public_ip` 改用它 |
+| F4-3 | **Minor** | `port_occupant` 用 `\| head -1` 取首行。**原写法其实输出是对的**（`head` 先读走第一行才退出，且函数末尾显式 `return 0` 覆盖了管道状态），但它依赖那个时序 | 改成纯 bash 取首行（`rows="${rows%%$'\n'*}"`），行为不变但不再有任何管道 |
+| F4-4 | **Minor** | Task 4 完全没有 `detect_public_ip` 的断言 —— 它只在真实网络下工作，没法验证 | 补 mock `curl` 的确定性断言（`"404"` → 返回非零且无输出；`"1.2.3.4"` / `"2001:db8::1"` → 正确输出） |
+| F4-5 | **Important** | 计划只说「追加到 `test/unit.sh`」，**没说追加到哪个位置**。追加在 `test_summary` 之后 → 摘要条数偏小，而且**用例失败时脚本退出码仍是 0**（`test_summary` 已先返回过 0，失败被吞掉）→ CI 绿灯放行红灯 | 已在**全局约束**里写死「所有任务的测试用例都必须追加在 `test_summary` 之前」，并改写 Task 4 Step 1 的措辞 |
+| F4-6 | **Minor** | Task 3 的**宽版**「越权函数」静态断言必须被 Task 4 的收窄版**替换**而不是并存 —— 计划正文已有说明，但没说「旧的这两行要删掉」 | 验收标准里写明：旧的 `offenders=` 与 `assert_eq` 两行**必须删掉**（实测：并存时旧的宽断言把 Task 4 的 10 个函数全当成越权 → 红灯） |
+
+#### 修订轮 1 的证据（控制器自己跑的探针，不是推测）
+
+| 探针 | 内容 | 结果 |
+|---|---|---|
+| P1 | `set -o pipefail` 下 `2000 行 \| grep -q`（grep 命中即退） | **rc=141**（SIGPIPE）→ 证实「管道 + `grep -q`」会把 141 带进退出码 |
+| P2 | 同上但只有 1-2 行 | rc=0 → 解释为什么**测试里的 mock 场景测不出来**（mock 只有 1 行数据） |
+| P3 | `netstat -ltn` 形态的 120 行输出 | rc=0 → netstat 路径要 >4000 行才稳定触发（低概率但真实） |
+| P4 | 旧 IP 判定的正误表 | `"404"` / `"403"` / `"200"` / `"302"` / `"12345"` / `"cafebabe"` **全部被判为 IP**；`"1.2.3.4"` / `"::1"` 判对 |
+| P5 | 旧写法 vs 修好后写法，在 2 行与 120 行输出下的判定 | 旧写法在 120 行时结论正确（靠运气），修好后**永远**正确 |
+
+#### 修订轮 1 的验收标准
+
+1. `lib/core.sh` 末尾追加的网络探测部分与上面 **Step 3 代码块逐字节一致**。
+2. `test/unit.sh` 含上面 **Step 1 代码块的全部用例**（29 条断言），
+   且 Task 1/2/3 现有的 156 条旧断言**一条未删** ——
+   **唯一的例外**是 Task 3 那两条「越权函数」断言（`offenders=` 与配套的 `assert_eq`）：
+   它们必须被 Task 4 的收窄版**替换掉**（删掉旧的这两行），不是并存。
+3. 新用例必须插在 `test/unit.sh` 的 `test_summary` **之前**（`test_summary` 保持最后一行）。
+4. `bash test/unit.sh` 全部通过、退出码 0。
+   断言总数由 156 变为 **184**（156 − 1 条被替换的旧断言 + 29 条新断言 = 184）。
+   **184 是「本机实测值」**（Windows + MSYS）：那 4 条权限相关行为断言在本机被自动跳过，
+   在 Debian / CI（以非 root 运行）上会真正执行，届时总数为 **188**。
+   报告里要写明是哪个平台的数字。
+5. `lib/tui.sh`、`test/lib.sh` **一字未动**。
+6. 红灯证据（至少给出这四条）：
+   - 把 `port_in_use` 改回 `... \| awk \| grep -q` → **F4-1 的静态断言必须变红**
+     （这是权威判据）；大输出那条**辅助**断言**可能**变红（时序相关），
+     必须如实报告实际结果，不许把「可能」写成「一定」；
+   - 把 `is_valid_ip` 的 IPv6 分支去掉（等于让 `detect_public_ip` 回到旧的
+     `^[0-9a-fA-F:]+$` 判定）→ `detect_public_ip 面对非 IP 响应体（HTTP 状态码 404）必须返回非零`
+     必须变红；
+   - 把 `is_valid_ip` 的 IPv4 段数检查去掉 → `is_valid_ip 拒绝五段 IPv4` 必须变红；
+   - 把 `is_valid_ip` 的 `10#$o > 255` 去掉 → `is_valid_ip 拒绝每段都大于 255 的伪 IPv4`
+     必须变红。
+7. **计划文件实施者一个字都不许改** —— 计划修订是控制器的职责。
 
 ---
 
