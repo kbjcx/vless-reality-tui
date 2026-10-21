@@ -1906,4 +1906,464 @@ else
   assert_eq "以 root 运行" "以 root 运行" "非 root 下 --menu 以非零码退出（以 root 运行，前提不成立，已跳过）"
   assert_eq "以 root 运行" "以 root 运行" "非 root 下 --menu 提示需要 root 权限（以 root 运行，前提不成立，已跳过）"
 fi
+
+# ── Task 9：部署向导（全部 mock：不联网、不装内核、不开防火墙、不碰系统目录）──
+# ⚠️ 本段【不写任何会整块跳过的条件块】：原 Step 1 就是栽在这里 ——
+#    「有 openssl + 有外网」才跑断言 → 本机一条都没跑 → 条数在机器之间漂移。
+#    所有外部依赖一律用 shell 函数 mock；mock 一律打印可辨认的标记，
+#    断言据此判断「哪一步真的执行了」以及「执行时拿到了什么值」。
+#
+# ⚠️ assert_not_contains 是 Task 8 段已经定义好的辅助断言，直接用。
+
+# 统一的向导 mock 集合：把 do_deploy / deploy_wizard 依赖的【所有】外部动作
+# 换成会打印标记的假实现。定义一次，各用例用 `eval "$(t9_mocks)"` 引入；
+# 需要改行为的用例，在 eval 之后【重新定义】同名函数覆盖它。
+t9_mocks() {
+  cat <<'MOCKS'
+install_xray() { printf 'MOCK_INSTALL_XRAY\n'; return 0; }
+gen_keys() { UUID='11111111-2222-3333-4444-555555555555'; PRIVATE_KEY='PRIVKEY0123456789abcdefghijklmnopqrstuvwxyzABCDE'; PUBLIC_KEY='PUBKEY0123456789abcdefghijklmnopqrstuvwxyzABCDE'; SHORT_ID='a1b2c3d4'; printf 'MOCK_GEN_KEYS\n'; return 0; }
+render_server_config() { printf 'MOCK_RENDER\n'; return 0; }
+write_config_atomic() { printf 'MOCK_ATOMIC\n'; return 0; }
+setup_systemd() { printf 'MOCK_SYSTEMD\n'; return 0; }
+open_firewall() { printf 'MOCK_FIREWALL\n'; return 0; }
+enable_bbr() { printf 'MOCK_BBR\n'; return 0; }
+save_state() { printf 'MOCK_SAVE_STATE UUID=%s PORT=%s\n' "$UUID" "$PORT"; return 0; }
+export_client_artifacts() { printf 'MOCK_EXPORT DIR=%s PORT=%s\n' "$1" "$4"; return 0; }
+build_share_link() { printf 'vless://11111111-2222-3333-4444-555555555555@203.0.113.9:443?security=reality#node'; return 0; }
+choose_target() { printf 'www.microsoft.com'; return 0; }
+port_in_use() { return 1; }
+port_occupant() { printf ''; return 0; }
+random_free_port() { printf '8443'; return 0; }
+detect_public_ip() { printf '203.0.113.9'; return 0; }
+detect_local_ip() { printf '10.0.0.5'; return 0; }
+have_cmd() { return 0; }
+tui_confirm() { return 0; }
+tui_input() { printf '8443'; return 0; }
+tui_menu() { return 0; }
+tui_pause() { return 0; }
+management_menu() { printf 'MOCK_MENU\n'; return 0; }
+MOCKS
+}
+
+# ⚠️ do_deploy 的 mock 必须【单独】一份：
+#    它和 do_deploy 本身同名 → 放进共享集合会把【被测对象】替换掉，
+#    于是「测 do_deploy」的用例其实在测这个假实现（控制器第一版就栽在这里：
+#    22 条 do_deploy 断言全部变红）。
+t9_mocks_wizard() {
+  cat <<'MOCKS'
+do_deploy() { UUID='11111111-2222-3333-4444-555555555555'; PUBLIC_KEY='PUBKEY0123456789abcdefghijklmnopqrstuvwxyzABCDE'; SHORT_ID='a1b2c3d4'; printf 'MOCK_DO_DEPLOY PORT=%s SNI=%s IP=%s\n' "$PORT" "$SNI" "$SERVER_IP"; FIREWALL_OK=1; return 0; }
+MOCKS
+}
+
+T9_TMP=$(mktemp -d 2>/dev/null)
+if [[ -n "$T9_TMP" ]]; then
+
+test_case "向导：目标探测与排序"
+
+# probe_targets：输出 "host|tls|latency"，按延迟升序，未知延迟 '?' 排最后。
+out=$( ( REALITY_TARGETS=(slow.test ok.test unknown.test)
+         target_supports_tls13() { [[ "$1" == "ok.test" ]]; }
+         target_latency_ms() { case "$1" in slow.test) printf '30' ;; ok.test) printf '10' ;; unknown.test) printf '?' ;; esac; }
+         probe_targets ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "probe_targets 正常路径返回 0"
+assert_contains "$out" "ok.test|ok|10" "probe_targets 输出格式为 host|tls|latency"
+assert_contains "$out" "slow.test|fail|30" "probe_targets 把不支持 TLS1.3 的目标标为 fail"
+assert_contains "$out" "unknown.test|fail|?" "probe_targets 把未知延迟标为 ?"
+assert_eq "ok.test|ok|10" "$(printf '%s\n' "$out" | head -1)" "probe_targets 把延迟最小的目标排在第一"
+assert_eq "unknown.test|fail|?" "$(printf '%s\n' "$out" | tail -1)" "probe_targets 把未知延迟的目标排在最后"
+assert_eq "3" "$(printf '%s\n' "$out" | grep -c '|')" "probe_targets 的输出行数等于候选数"
+
+# probe_targets：mktemp 失败必须报错退出，且【诊断信息不能走 stdout】——
+# 调用方是 `probe=$(probe_targets)`：报错被当成探测数据吞进 probe，
+# choose_target 就会拿一段错误文本当主机名去解析。
+out=$( ( mktemp() { return 1; }
+         target_supports_tls13() { return 0; }
+         target_latency_ms() { printf '10'; }
+         probe_targets ) 2>/dev/null ); rc=$?
+assert_status 1 "$rc" "probe_targets 在 mktemp 失败时返回非零"
+assert_eq "" "$out" "probe_targets 的诊断信息不写 stdout（否则会被当成探测数据吞掉）"
+err=$( ( mktemp() { return 1; }
+         target_supports_tls13() { return 0; }
+         target_latency_ms() { printf '10'; }
+         probe_targets ) 2>&1 >/dev/null )
+assert_contains "$err" "无法创建临时文件" "probe_targets 在 mktemp 失败时给出明确提示"
+
+test_case "向导：伪装目标选择"
+
+# choose_target：探测不可用（返回空）时回退默认目标，
+# 且【提示语不能进 stdout】——调用方是 `SNI=$(choose_target)`。
+sel=$( ( probe_targets() { return 0; }
+         choose_target ) 2>/dev/null )
+assert_eq "www.microsoft.com" "$sel" "choose_target 在探测不可用时回退到默认目标"
+err=$( ( probe_targets() { return 0; }
+         choose_target ) 2>&1 >/dev/null )
+assert_contains "$err" "目标探测不可用" "choose_target 在探测不可用时把提示写到 stderr"
+
+# choose_target：探测【失败】（rc≠0、stdout 为空）时同样走回退路径
+sel=$( ( probe_targets() { return 1; }
+         choose_target ) 2>/dev/null )
+assert_eq "www.microsoft.com" "$sel" "choose_target 在探测失败时回退到默认目标"
+
+# choose_target：--yes 自动挑选「第一个支持 TLS1.3 且延迟已知」的目标
+# ⚠️ 第一个候选必须是「ok 但延迟未知（?）」：否则去掉 `&& "$lat" != '?'`
+#    那个条件，选中的目标【不变】→ 这条断言就恒真了。
+sel=$( ( OPT_YES=1
+         probe_targets() { printf 'a.test|ok|?\nb.test|ok|20\nc.test|ok|30\n'; }
+         choose_target ) 2>/dev/null )
+assert_eq "b.test" "$sel" "choose_target 在 --yes 下自动挑选第一个 ok 且延迟已知的目标"
+
+# choose_target：--yes 且没有 ok 目标时回退到第一个候选
+sel=$( ( OPT_YES=1
+         probe_targets() { printf 'a.test|fail|10\nb.test|fail|20\n'; }
+         choose_target ) 2>/dev/null )
+assert_eq "a.test" "$sel" "choose_target 在 --yes 且无 ok 目标时回退到第一个候选"
+
+# choose_target：交互模式下用菜单返回码取选中项；
+# 菜单文本必须走 stderr —— 它会把整张菜单打到 stdout，
+# 而调用方是 `SNI=$(choose_target)` → SNI 会变成「菜单 + 主机名」的多行串。
+sel=$( ( probe_targets() { printf 'a.test|ok|10\nb.test|ok|20\n'; }
+         tui_menu() { printf '菜单标题\n选项一\n选项二\n'; return 1; }
+         choose_target ) 2>/dev/null )
+assert_eq "b.test" "$sel" "choose_target 用菜单返回码取选中项"
+err=$( ( probe_targets() { printf 'a.test|ok|10\nb.test|ok|20\n'; }
+         tui_menu() { printf '菜单标题\n选项一\n选项二\n'; return 1; }
+         choose_target ) 2>&1 >/dev/null )
+assert_contains "$err" "菜单标题" "choose_target 把菜单渲染到 stderr"
+
+# choose_target：用户取消（返回码 255）时回退到第一项
+sel=$( ( probe_targets() { printf 'a.test|ok|10\nb.test|ok|20\n'; }
+         tui_menu() { printf '菜单标题\n'; return 255; }
+         choose_target ) 2>/dev/null )
+assert_eq "a.test" "$sel" "choose_target 在用户取消时回退到第一项"
+
+test_case "向导：六步部署"
+
+# do_deploy 的六步全部 mock 成功 → 走完全程
+out=$( ( XRAY_CONFIG="$T9_TMP/cfg.json"
+         eval "$(t9_mocks)"
+         do_deploy ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "do_deploy 全部步骤成功时返回 0"
+assert_contains "$out" "MOCK_INSTALL_XRAY" "do_deploy 执行了安装内核这一步"
+assert_contains "$out" "MOCK_GEN_KEYS" "do_deploy 执行了生成密钥这一步"
+assert_contains "$out" "MOCK_RENDER" "do_deploy 执行了渲染配置这一步"
+assert_contains "$out" "MOCK_ATOMIC" "do_deploy 执行了原子写配置这一步"
+assert_contains "$out" "MOCK_SYSTEMD" "do_deploy 执行了配置 systemd 这一步"
+assert_contains "$out" "MOCK_FIREWALL" "do_deploy 执行了放行防火墙这一步"
+assert_contains "$out" "MOCK_BBR" "do_deploy 执行了网络调优这一步"
+assert_contains "$out" "服务端配置已写入" "do_deploy 成功后提示配置已写入"
+assert_contains "$out" "部署完成" "do_deploy 成功后提示部署完成"
+
+# do_deploy：安装内核失败必须中止，且后续步骤一步都不许执行
+out=$( ( XRAY_CONFIG="$T9_TMP/cfg.json"
+         eval "$(t9_mocks)"
+         install_xray() { printf 'MOCK_INSTALL_XRAY\n'; return 1; }
+         do_deploy ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "do_deploy 在安装内核失败时返回非零"
+assert_contains "$out" "Xray 安装失败" "do_deploy 在安装内核失败时给出明确提示"
+assert_not_contains "$out" "MOCK_GEN_KEYS" "do_deploy 在安装内核失败后不继续生成密钥"
+
+# do_deploy：生成密钥失败必须中止
+out=$( ( XRAY_CONFIG="$T9_TMP/cfg.json"
+         eval "$(t9_mocks)"
+         gen_keys() { printf 'MOCK_GEN_KEYS\n'; return 1; }
+         do_deploy ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "do_deploy 在生成密钥失败时返回非零"
+assert_contains "$out" "密钥生成失败" "do_deploy 在生成密钥失败时给出明确提示"
+assert_not_contains "$out" "MOCK_RENDER" "do_deploy 在生成密钥失败后不继续渲染配置"
+
+# do_deploy：渲染配置失败必须中止，且不得再写配置
+out=$( ( XRAY_CONFIG="$T9_TMP/cfg.json"
+         eval "$(t9_mocks)"
+         render_server_config() { printf 'MOCK_RENDER\n'; return 1; }
+         do_deploy ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "do_deploy 在渲染配置失败时返回非零"
+assert_not_contains "$out" "MOCK_ATOMIC" "do_deploy 在渲染配置失败后不写配置"
+
+# do_deploy：写配置失败必须中止，且不得打印「已写入」
+out=$( ( XRAY_CONFIG="$T9_TMP/cfg.json"
+         eval "$(t9_mocks)"
+         write_config_atomic() { printf 'MOCK_ATOMIC\n'; return 1; }
+         do_deploy ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "do_deploy 在写配置失败时返回非零"
+assert_not_contains "$out" "服务端配置已写入" "do_deploy 在写配置失败时不提示配置已写入"
+
+# do_deploy：systemd 配置失败必须中止
+out=$( ( XRAY_CONFIG="$T9_TMP/cfg.json"
+         eval "$(t9_mocks)"
+         setup_systemd() { printf 'MOCK_SYSTEMD\n'; return 1; }
+         do_deploy ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "do_deploy 在 systemd 配置失败时返回非零"
+assert_contains "$out" "systemd 配置失败" "do_deploy 在 systemd 配置失败时给出明确提示"
+
+# do_deploy：防火墙放行失败【不中止】部署，但必须如实标记
+out=$( ( XRAY_CONFIG="$T9_TMP/cfg.json"
+         eval "$(t9_mocks)"
+         open_firewall() { printf 'MOCK_FIREWALL\n'; return 1; }
+         do_deploy
+         printf 'FIREWALL_OK=%s\n' "${FIREWALL_OK:-unset}" ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "do_deploy 在防火墙放行失败时不中止部署"
+assert_contains "$out" "防火墙放行未成功" "do_deploy 在防火墙放行失败时给出警告"
+assert_contains "$out" "FIREWALL_OK=0" "do_deploy 在防火墙放行失败时把状态标记为 0"
+
+# do_deploy：网络调优失败是非致命的
+out=$( ( XRAY_CONFIG="$T9_TMP/cfg.json"
+         eval "$(t9_mocks)"
+         enable_bbr() { printf 'MOCK_BBR\n'; return 1; }
+         do_deploy ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "do_deploy 在网络调优失败时不中止部署"
+assert_contains "$out" "部署完成" "do_deploy 在网络调优失败后仍然提示部署完成"
+
+# do_deploy：mktemp 失败必须中止（否则会把配置写到 ".new" 污染当前目录）
+out=$( ( XRAY_CONFIG="$T9_TMP/cfg.json"
+         eval "$(t9_mocks)"
+         mktemp() { return 1; }
+         do_deploy ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "do_deploy 在 mktemp 失败时返回非零"
+assert_contains "$out" "无法创建临时文件" "do_deploy 在 mktemp 失败时给出明确提示"
+
+test_case "向导：部署参数确认与收尾"
+
+# deploy_wizard 的正常路径：端口 / 地址 / 伪装目标都要正确传给后续步骤
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=1
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "deploy_wizard 正常路径返回 0"
+assert_contains "$out" "PORT=443" "deploy_wizard 把默认端口 443 传给 do_deploy"
+assert_contains "$out" "SNI=www.microsoft.com" "deploy_wizard 把伪装目标传给 do_deploy"
+assert_contains "$out" "IP=203.0.113.9" "deploy_wizard 把探测到的公网地址传给 do_deploy"
+assert_contains "$out" "MOCK_SAVE_STATE UUID=11111111-2222-3333-4444-555555555555" "deploy_wizard 保存的状态里带着生成的 UUID"
+assert_contains "$out" "MOCK_EXPORT" "deploy_wizard 导出客户端物料"
+assert_contains "$out" "部署完成" "deploy_wizard 成功后打印部署完成面板"
+assert_contains "$out" "vless://11111111-2222-3333-4444-555555555555@203.0.113.9:443" "deploy_wizard 打印分享链接"
+assert_not_contains "$out" "MOCK_MENU" "deploy_wizard 在 --yes 下不进入管理菜单"
+
+# deploy_wizard：--addr 指定的地址优先于探测
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=1
+         OPT_ADDR='198.51.100.7'
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "deploy_wizard 在指定 --addr 时返回 0"
+assert_contains "$out" "IP=198.51.100.7" "deploy_wizard 优先使用 --addr 指定的地址"
+
+# deploy_wizard：探测不到公网 IP 时回退到本机地址并提示
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=1
+         detect_public_ip() { return 1; }
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "deploy_wizard 在探测不到公网 IP 时回退到本机地址"
+assert_contains "$out" "IP=10.0.0.5" "deploy_wizard 回退使用本机地址"
+assert_contains "$out" "未能自动探测到公网地址" "deploy_wizard 回退时给出提示"
+
+# deploy_wizard：公网 IP 与本机地址都探测不到必须中止
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=1
+         detect_public_ip() { return 1; }
+         detect_local_ip() { return 1; }
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "deploy_wizard 在探测不到任何地址时返回非零"
+assert_contains "$out" "无法探测到本机地址" "deploy_wizard 在探测不到任何地址时给出明确提示"
+
+# deploy_wizard：伪装目标为空必须中止
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=1
+         choose_target() { return 0; }
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "deploy_wizard 在伪装目标为空时返回非零"
+assert_contains "$out" "未确定伪装目标" "deploy_wizard 在伪装目标为空时给出明确提示"
+
+# deploy_wizard：用户不确认必须中止
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=0
+         tui_confirm() { return 1; }
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "deploy_wizard 在用户不确认时返回非零"
+assert_contains "$out" "已取消" "deploy_wizard 在用户不确认时给出取消提示"
+assert_not_contains "$out" "MOCK_DO_DEPLOY" "deploy_wizard 在用户不确认时不执行部署"
+
+# deploy_wizard：部署失败必须中止，且不得保存状态
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=1
+         do_deploy() { printf 'MOCK_DO_DEPLOY\n'; return 1; }
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "deploy_wizard 在部署失败时返回非零"
+assert_not_contains "$out" "MOCK_SAVE_STATE" "deploy_wizard 在部署失败时不保存状态"
+
+# deploy_wizard：状态没落盘必须停在这里（否则 --status 会显示未部署）
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=1
+         save_state() { printf 'MOCK_SAVE_STATE\n'; return 1; }
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "deploy_wizard 在状态保存失败时返回非零"
+assert_contains "$out" "状态保存失败" "deploy_wizard 在状态保存失败时给出明确提示"
+assert_not_contains "$out" "MOCK_EXPORT" "deploy_wizard 在状态保存失败后不导出客户端物料"
+
+# deploy_wizard：物料导出失败必须中止
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=1
+         export_client_artifacts() { printf 'MOCK_EXPORT\n'; return 1; }
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "deploy_wizard 在客户端物料导出失败时返回非零"
+assert_contains "$out" "客户端物料导出失败" "deploy_wizard 在物料导出失败时给出明确提示"
+
+# deploy_wizard：分享链接为空必须中止（空链接粘到客户端就是一条废链接）
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=1
+         build_share_link() { return 0; }
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "deploy_wizard 在分享链接为空时返回非零"
+assert_contains "$out" "分享链接生成为空" "deploy_wizard 在分享链接为空时给出明确提示"
+
+# deploy_wizard：防火墙放行失败必须在最终面板里如实反映
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=1
+         do_deploy() { printf 'MOCK_DO_DEPLOY\n'; FIREWALL_OK=0; return 0; }
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "deploy_wizard 在防火墙放行失败时仍完成部署"
+assert_contains "$out" "放行失败" "deploy_wizard 在部署完成面板里如实反映防火墙放行失败"
+
+# deploy_wizard：有终端二维码文件才打印
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=1
+         mkdir -p "$T9_TMP/out"
+         printf 'QR-PLACEHOLDER\n' > "$T9_TMP/out/qrcode.txt"
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1 ); rc=$?
+assert_contains "$out" "QR-PLACEHOLDER" "deploy_wizard 在存在 qrcode.txt 时打印终端二维码"
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=1
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out-noqr"
+         deploy_wizard ) 2>&1 ); rc=$?
+assert_not_contains "$out" "QR-PLACEHOLDER" "deploy_wizard 在没有 qrcode.txt 时不打印二维码"
+assert_not_contains "$out" "终端二维码" "deploy_wizard 在没有 qrcode.txt 时不打印二维码小节标题"
+
+# deploy_wizard：交互模式（--yes=0）确认后进入管理菜单
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=0
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "deploy_wizard 在交互模式完成部署后返回 0"
+assert_contains "$out" "MOCK_MENU" "deploy_wizard 在交互模式下进入管理菜单"
+
+test_case "向导：端口冲突处理"
+
+# 端口被占用 + --yes → 自动改用随机空闲端口
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=1
+         port_in_use() { [[ "$1" == "443" ]] && return 0 || return 1; }
+         port_occupant() { printf 'nginx'; return 0; }
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "deploy_wizard 在端口冲突且 --yes 时自动改端口并继续"
+assert_contains "$out" "已被占用" "deploy_wizard 在端口被占用时给出提示"
+assert_contains "$out" "PORT=8443" "deploy_wizard 在端口冲突时改用随机空闲端口"
+
+# 端口被占用 + 交互 + 选「改用随机空闲端口」
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=0
+         port_in_use() { [[ "$1" == "443" ]] && return 0 || return 1; }
+         tui_menu() { return 0; }
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "deploy_wizard 在菜单选「改用随机端口」时继续部署"
+assert_contains "$out" "PORT=8443" "deploy_wizard 按菜单选择改用随机端口"
+
+# 端口被占用 + 交互 + 选「我手动指定其它端口」
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=0
+         port_in_use() { [[ "$1" == "443" ]] && return 0 || return 1; }
+         tui_menu() { return 1; }
+         tui_input() { printf '9443'; return 0; }
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1); rc=$?
+assert_status 0 "$rc" "deploy_wizard 在用户手动指定端口时继续部署"
+assert_contains "$out" "PORT=9443" "deploy_wizard 使用用户手动输入的端口"
+
+# 端口被占用 + 交互 + 输入非法端口必须中止
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=0
+         port_in_use() { [[ "$1" == "443" ]] && return 0 || return 1; }
+         tui_menu() { return 1; }
+         tui_input() { printf 'abc'; return 0; }
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1); rc=$?
+assert_status 1 "$rc" "deploy_wizard 在用户输入非法端口时返回非零"
+assert_contains "$out" "端口非法" "deploy_wizard 在用户输入非法端口时给出明确提示"
+
+# 端口被占用 + 用户取消必须中止
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=0
+         port_in_use() { [[ "$1" == "443" ]] && return 0 || return 1; }
+         tui_menu() { return 255; }
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1); rc=$?
+assert_status 1 "$rc" "deploy_wizard 在用户取消端口冲突处理时返回非零"
+assert_contains "$out" "已取消部署" "deploy_wizard 在用户取消时给出取消提示"
+
+# 随机端口仍然被占用必须中止（random_free_port 的兜底端口从未校验过）
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=1
+         port_in_use() { return 0; }
+         random_free_port() { printf '8443'; return 0; }
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1); rc=$?
+assert_status 1 "$rc" "deploy_wizard 在改用的端口仍被占用时返回非零"
+assert_contains "$out" "仍被占用" "deploy_wizard 在改用的端口仍被占用时给出明确提示"
+
+# 同上，但走的是「菜单选 0 改用随机端口」那条路径（与上面是【两处】代码）
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=0
+         port_in_use() { return 0; }
+         tui_menu() { return 0; }
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1); rc=$?
+assert_status 1 "$rc" "deploy_wizard 在菜单改端口后遇到占用端口时中止"
+assert_contains "$out" "仍被占用" "deploy_wizard 在菜单改端口后遇到占用端口时给出明确提示"
+
+# 端口探测不可用（既没有 ss 也没有 netstat）时必须提示
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=1
+         have_cmd() { case "$1" in ss|netstat) return 1 ;; *) return 0 ;; esac; }
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1); rc=$?
+assert_contains "$out" "无法确认端口是否空闲" "deploy_wizard 在端口探测不可用时给出提示"
+
+else
+  assert_eq "mktemp -d 能创建唯一临时目录" "失败（mktemp -d 返回空路径）" \
+    "Task 9 用例前提：mktemp -d 必须能创建唯一临时目录"
+fi
+rm -rf "$T9_TMP"
+
 test_summary

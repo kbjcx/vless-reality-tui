@@ -469,3 +469,301 @@ service_status() {
     fi
   fi
 }
+# 并发探测候选伪装目标：TLS1.3 支持 + 连通延迟，按延迟升序输出 "host|tls|latency"
+# 未知延迟（'?'）视为最大，排在最后
+probe_targets() {
+  local host tmp sortkey h t l pid
+  tmp=$(mktemp)
+  # mktemp 失败时 tmp 为空 → 后面会写出 ".<host>" 污染当前目录 → 必须守卫。
+  if [[ -z "$tmp" ]]; then
+    # ⚠️ 诊断信息必须走 stderr：调用方是 `probe=$(probe_targets)` ——
+    #    tui_err 默认写 stdout → 这条报错会被当成【探测数据】吞进 probe，
+    #    于是 choose_target 拿到的是一段错误文本而不是空串 → 解析出垃圾主机名。
+    tui_err "无法创建临时文件，目标探测中止" >&2
+    return 1
+  fi
+  local -a pids=() hosts=()
+  for host in "${REALITY_TARGETS[@]}"; do
+    (
+      t='fail'
+      target_supports_tls13 "$host" && t='ok'
+      l=$(target_latency_ms "$host")
+      printf '%s|%s|%s\n' "$host" "$t" "$l" >"$tmp.$host"
+    ) &
+    pids+=($!)
+    hosts+=("$host")
+  done
+  # 循环变量是 PID，不是主机名 —— 名字写错会让人以为 wait 的是 host。
+  for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+  for host in "${hosts[@]}"; do
+    [[ -f "$tmp.$host" ]] || continue
+    IFS='|' read -r h t l <"$tmp.$host"
+    sortkey="$l"
+    [[ -z "$sortkey" || "$sortkey" == '?' ]] && sortkey=999999
+    printf '%s|%s|%s|%s\n' "$sortkey" "$h" "$t" "$l"
+    rm -f "$tmp.$host"
+  done | sort -t'|' -k1,1n -k2,2 | cut -d'|' -f2-
+  rm -f "$tmp"
+}
+
+choose_target() {
+  local probe line host tls lat
+  probe=$(probe_targets)
+  if [[ -z "$probe" ]]; then
+    # ⚠️ 提示语必须走 stderr：调用方是 `SNI=$(choose_target)` ——
+    #    tui_warn 默认写 stdout → 这条提示会被当成【主机名】吞进去，
+    #    SNI 变成「提示文本 + 主机名」的多行串 → 写进 config.json 就是废配置。
+    tui_warn "目标探测不可用，回退默认：www.microsoft.com" >&2
+    printf 'www.microsoft.com'; return 0
+  fi
+  local -a labels=() hosts=()
+  while IFS='|' read -r host tls lat; do
+    [[ -z "$host" ]] && continue
+    hosts+=("$host")
+    if [[ "$tls" == 'ok' ]]; then
+      labels+=("${host}    TLS1.3 ✔   ${lat}ms")
+    else
+      labels+=("${host}    TLS1.3 ✘   ${lat}ms")
+    fi
+  done <<<"$probe"
+
+  # 用 ${OPT_YES:-0} 而不是 $OPT_YES：OPT_* 是 install.sh 的全局，
+  # deploy.sh 单独被 source（单元测试 / helper）时它们可能根本没定义，
+  # 在 `set -u` 下会直接报 unbound variable。
+  if [[ ${OPT_YES:-0} -eq 1 ]]; then
+    # 自动挑选第一个支持 TLS1.3 且延迟已知的目标
+    local pick=''
+    while IFS='|' read -r host tls lat; do
+      if [[ "$tls" == 'ok' && "$lat" != '?' ]]; then pick="$host"; break; fi
+    done <<<"$probe"
+    [[ -z "$pick" ]] && pick="${hosts[0]}"
+    printf '%s' "$pick"; return 0
+  fi
+
+  # 交由 tui_menu 统一渲染，避免重复打印列表
+  # tui_menu 把整张菜单打到 stdout，【不能】用 $(...) 捕获——那样拿到的是菜单文本。
+  # 必须用返回码取选中项。注意返回码本身就是 0-based 索引：
+  #   0  = 选中第一项（成功）
+  #   1..n-1 = 选中第 n 项（成功，但也是非零码，不能用 && || 区分）
+  #   255 = 用户取消
+  local sel=0 rc=0
+  # 必须把 tui_menu 的输出重定向到 stderr：tui_menu 会把【整张菜单】打到 stdout，
+  # 而调用方是 `SNI=$(choose_target)` —— 不重定向的话，SNI 会变成
+  # 「菜单标题 + 选项列表 + 选中的 host」的多行字符串，随后被原样写进
+  # config.json → JSON 非法 → xray run -test 失败 → 部署以一句看不懂的报错中止。
+  # 选中项一律用【返回码】取，stdout 只留最后 printf 的那个 host。
+  tui_menu "选择 REALITY 伪装目标（SNI）" "${labels[@]}" >&2 || rc=$?
+  if (( rc == 255 )); then
+    # ⚠️ 提示语必须走 stderr：调用方是 `SNI=$(choose_target)` ——
+    #    tui_warn 默认写 stdout → 这条提示会被当成【主机名】吞进去。
+    tui_warn "未选择伪装目标，回退到第一项" >&2
+    sel=0
+  else
+    sel=$rc
+  fi
+  printf '%s' "${hosts[$sel]}"
+}
+
+do_deploy() {
+  tui_section "执行部署"
+
+  tui_step "① 安装 Xray 内核"
+  install_xray || { tui_err "Xray 安装失败，部署中止"; return 1; }
+
+  tui_step "② 生成 REALITY 密钥与 UUID"
+  gen_keys || { tui_err "密钥生成失败，部署中止"; return 1; }
+  [[ -n "${OPT_UUID:-}" ]] && UUID="${OPT_UUID:-}"
+
+  tui_step "③ 生成服务端配置"
+  mkdir -p "$(dirname "$XRAY_CONFIG")" || { tui_err "无法创建配置目录：$(dirname "$XRAY_CONFIG")"; return 1; }
+  local cfg
+  # mktemp 必须有空值守卫：失败时 cfg 为空 → render_server_config 会写到 ".new"
+  # 污染当前目录（还可能在仓库里），而 mv 会因为空路径而失败。
+  cfg=$(mktemp 2>/dev/null)
+  if [[ -z "$cfg" ]]; then
+    tui_err "无法创建临时文件，部署中止。"
+    return 1
+  fi
+  render_server_config "$cfg" "$UUID" "$PRIVATE_KEY" "$SNI" "$PORT" "$SHORT_ID" || { rm -f "$cfg"; return 1; }
+  # 写服务端配置【必须】走 write_config_atomic（复制到临时文件 → xray 校验 → 原子替换），
+  # 不要在这里手写「校验 + 替换」：两处手写会分叉（menu_rotate_keys 当年就漏了
+  # 输出 xray 的原始报错），而且手写版本漏掉了 mv/chmod 的失败检查。
+  write_config_atomic "$XRAY_CONFIG" "$cfg" || { rm -f "$cfg"; return 1; }
+  rm -f "$cfg"
+  tui_ok "服务端配置已写入：$XRAY_CONFIG"
+
+  tui_step "④ 配置 systemd 服务"
+  setup_systemd || { tui_err "systemd 配置失败，部署中止"; return 1; }
+
+  tui_step "⑤ 放行防火墙端口 $PORT/tcp"
+  # 防火墙放行失败【不中止】部署（用户可能用云安全组/云防火墙管端口），
+  # 但必须把失败状态带进最终的「部署完成」面板 ——
+  # 否则用户看到「部署完成」就以为端口通了，实际客户端连不上。
+  FIREWALL_OK=1
+  if ! open_firewall "$PORT"; then
+    tui_warn "防火墙放行未成功，请手工确认"
+    FIREWALL_OK=0
+  fi
+
+  tui_step "⑥ 网络调优"
+  enable_bbr || tui_tip "已跳过网络调优（非致命）"
+
+  tui_ok "部署完成"
+  return 0
+}
+
+deploy_wizard() {
+  tui_section "部署参数"
+
+  # 端口
+  PORT="${OPT_PORT:-443}"
+  # ⚠️ 端口探测不可用时必须提示：
+  #    port_in_use 在【既没有 ss 也没有 netstat】时恒返回 1（= 端口空闲）
+  #    → 用户以为端口干净 → 部署走到 systemd 阶段才炸，
+  #    而且首句报错是「systemd 配置失败」，与真正原因（端口被占）无关。
+  if ! have_cmd ss && ! have_cmd netstat; then
+    tui_warn "无法确认端口是否空闲（系统缺少 ss 与 netstat）"
+    tui_tip "若部署时报端口被占用，请用 --port 指定其它端口。"
+  fi
+  if port_in_use "$PORT"; then
+    local occ
+    occ=$(port_occupant "$PORT")
+    tui_warn "端口 $PORT 已被占用${occ:+（$occ）}"
+    if [[ ${OPT_YES:-0} -eq 1 ]]; then
+      PORT=$(random_free_port)
+      # ⚠️ random_free_port 的兜底端口 44321 从未校验过是否被占用
+      #    → 这里【必须】再验一次，否则会把一个占用端口写进 config.json，
+      #    直到 systemd 阶段才以「address already in use」失败。
+      [[ -n "$PORT" ]] || { tui_err "找不到空闲端口，部署中止。"; return 1; }
+      if port_in_use "$PORT"; then
+        tui_err "端口 $PORT 仍被占用，部署中止。"
+        return 1
+      fi
+      tui_tip "已自动改用空闲端口：$PORT"
+    else
+      # 同上：用返回码取选中项，不要用 $(...) 捕获 stdout
+      local choice=0 crc=0
+      tui_menu "如何处理端口冲突？" \
+        "改用随机空闲端口" \
+        "我手动指定其它端口" \
+        "取消部署" || crc=$?
+      if (( crc == 255 )); then
+        choice=2
+      else
+        choice=$crc
+      fi
+      case $choice in
+        0) PORT=$(random_free_port)
+            [[ -n "$PORT" ]] || { tui_err "找不到空闲端口，部署中止。"; return 1; }
+            if port_in_use "$PORT"; then
+              tui_err "端口 $PORT 仍被占用，部署中止。"
+              return 1
+            fi
+            tui_tip "已改用端口 $PORT" ;;
+        1) PORT=$(tui_input "请输入新端口" "$PORT" "1-65535")
+            # 用 10# 前缀：裸算术会把 "08" 当八进制，直接报「value too great for base」。
+            # ⚠️ 必须是 10#$PORT（带 $）：bash 不会在 10# 后解析【变量名】，
+            #    10#PORT 会被当成「以 10 为基的数字 PORT」→ 直接报
+            #    "value too great for base" → 用户手动指定的端口【必然】被判非法。
+            [[ "$PORT" =~ ^[0-9]+$ ]] && (( 10#$PORT > 0 && 10#$PORT < 65536 )) || { tui_err "端口非法"; return 1; } ;;
+        *) tui_info "已取消部署"; return 1 ;;
+      esac
+    fi
+  fi
+
+  # SERVER_IP 由 preflight 负责探测，但 --menu 路径【不经过 preflight】
+  # （install.sh 的 --menu 分支只有 require_root + load_state + management_menu）。
+  # 未部署时 load_state 什么都没赋值 → SERVER_IP 未绑定：
+  #   · 引用它 → set -u 下 bash 直接退出，用户只看到 "SERVER_IP: unbound variable"；
+  #   · 即使补了全局声明，空的 SERVER_IP 也会让分享链接变成 "vless://uuid@:443?..."
+  #     → 主机名为空 → 客户端导入即废。
+  # 所以这里必须自己兜底探测一次。
+  if [[ -n "${OPT_ADDR:-}" ]]; then
+    # 用户手工指定了对外地址 → 优先用它（NAT 后的服务器探测到的只是内网 IP）
+    SERVER_IP="$OPT_ADDR"
+  elif [[ -z "${SERVER_IP:-}" ]]; then
+    SERVER_IP=$(detect_public_ip 2>/dev/null || true)
+    [[ -n "$SERVER_IP" ]] || SERVER_IP=$(detect_local_ip 2>/dev/null || true)
+    if [[ -z "$SERVER_IP" ]]; then
+      tui_err "无法探测到本机地址，部署中止。"
+      tui_tip "可用 --addr 手工指定对外地址，或检查出网是否正常。"
+      return 1
+    fi
+    tui_warn "未能自动探测到公网地址，已回退使用本机地址：$SERVER_IP"
+  fi
+
+  # 伪装目标
+  SNI="${OPT_SNI:-}"
+  if [[ -z "$SNI" ]]; then
+    SNI=$(choose_target)
+  fi
+  TARGET="$SNI"
+  [[ -z "$SNI" ]] && { tui_err "未确定伪装目标"; return 1; }
+  tui_kv "伪装目标 (SNI)" "$SNI"
+
+  # 备注
+  REMARK="${OPT_NAME:-$SNI}"
+
+  # 确认
+  tui_panel "即将应用的配置" \
+    "服务器地址|$SERVER_IP" \
+    "监听端口|$PORT" \
+    "伪装目标|$SNI" \
+    "备注|$REMARK" \
+    "UUID|${OPT_UUID:-自动生成}" \
+    "REALITY 密钥|自动生成" \
+    "内核|原生二进制 + systemd"
+
+  if [[ ${OPT_YES:-0} -eq 0 ]]; then
+    tui_confirm "确认开始部署？" "y" || { tui_info "已取消"; return 1; }
+  fi
+
+  do_deploy || return 1
+
+  # 保存状态
+  MODE='native'
+  FLOW='xtls-rprx-vision'
+  FINGERPRINT='chrome'
+  # 状态没落盘就必须停在这里：继续往下走会打印「部署完成」面板，
+  # 而 --status 会显示未部署、卸载流程拿不到端口 → 防火墙规则被遗留。
+  save_state || { tui_err "状态保存失败，部署状态未落盘。"; return 1; }
+
+  # 客户端物料
+  tui_section "客户端物料"
+  # 同理：物料导出失败必须报错退出，不能让「部署完成」面板指向不存在的 client.json。
+  export_client_artifacts "$OUT_DIR" "$UUID" "$SERVER_IP" "$PORT" "$SNI" "$PUBLIC_KEY" "$SHORT_ID" "$REMARK" \
+    || { tui_err "客户端物料导出失败。"; return 1; }
+
+  local link
+  link=$(build_share_link "$UUID" "$SERVER_IP" "$PORT" "$SNI" "$PUBLIC_KEY" "$SHORT_ID" "$REMARK")
+  # 生成为空说明参数不全（缺 UUID/公钥/地址）→ 空的分享链接框用户会直接复制走，
+  # 粘到客户端就是一条废链接。必须报错退出。
+  [[ -n "$link" ]] || { tui_err "分享链接生成为空，部署结果不可用。"; return 1; }
+  # 防火墙那一行必须如实反映 do_deploy ⑤ 的结果。
+  local fw_row="已放行 $PORT/tcp"
+  [[ "${FIREWALL_OK:-1}" -eq 1 ]] || fw_row="放行失败，请手工放行 $PORT/tcp"
+  tui_panel "部署完成" \
+    "地址|$SERVER_IP:$PORT" \
+    "UUID|$UUID" \
+    "SNI|$SNI" \
+    "公钥 pbk|$PUBLIC_KEY" \
+    "ShortID sid|$SHORT_ID" \
+    "防火墙|$fw_row" \
+    "客户端配置|$OUT_DIR/client.json" \
+    "二维码|$OUT_DIR/qrcode.png"
+
+  tui_box "分享链接（可直接粘贴到客户端导入）"
+  tui_box_line "$link"
+  tui_box_end
+
+  if [[ -f "$OUT_DIR/qrcode.txt" ]]; then
+    tui_section "终端二维码"
+    cat "$OUT_DIR/qrcode.txt"
+  fi
+
+  if [[ ${OPT_YES:-0} -eq 0 ]]; then
+    tui_pause
+    management_menu
+  fi
+  return 0
+}
