@@ -6210,7 +6210,7 @@ git commit -m "feat(wizard): 部署向导——参数确认、目标探测与六
 
 #### 控制器的变异判据修正（落盘后追加）
 
-第一次跑这 24 条变异时，**C1 / C2 / D3 三条没有命中点名的断言**。
+第一次跑这 23 条变异时，**C1 / C2 / D3 三条没有命中点名的断言**。
 归因是**沙箱实证**，不是猜测：
 
 | 变异 | 第一版（只拆一道守卫） | 为什么没命中点名的断言 |
@@ -6318,7 +6318,7 @@ git commit -m "feat(wizard): 部署向导——参数确认、目标探测与六
    Debian **以非 root 运行** **630**（= GitHub Actions runner 的身份）。
    （底座 545 + Task 10 修订轮 1 的 78）
    报告里必须写明「哪个平台 **+ 以什么身份运行**」。
-6. 红灯证据（**24 条变异**，每条都要贴出**变红的断言原文**）：
+6. 红灯证据（**23 条变异**，每条都要贴出**变红的断言原文**）：
    - A1 把 `management_menu` 的「尚未部署」提示去掉
      → 「未部署时给出明确提示」必须变红；
    - A2 把 `management_menu` 的 `tui_menu` 的 `>&2` 去掉
@@ -6994,26 +6994,376 @@ git commit -m "feat(menu): 管理菜单——查看、重启、日志、更新�
 **Files:**
 - Create: `uninstall.sh`
 - Modify: `test/unit.sh`
+- Modify: `test/lib.sh`（补 `assert_not_contains`）
+- Modify: `install.sh`（定点修订 P1）
+- Modify: `lib/deploy.sh`（定点修订 P2）
 
 **Interfaces:**
-- Consumes: Task 3 `STATE_FILE` `OUT_DIR` `XRAY_CONFIG`；Task 6 `have_cmd`
+- Consumes: Task 3 `STATE_FILE` `OUT_DIR` `XRAY_CONFIG` `load_state`；Task 6 `have_cmd`；Task 2 `tui_confirm`
 - Produces:
-  - `uninstall.sh [--purge]` → `0`/`1`
+  - `uninstall.sh [--purge] [--yes]` → `0`/`1`
+  - `uninstall.sh` 必须**可被 source 而不执行 main**（`UNINSTALL_SH_NO_MAIN=1` + `BASH_SOURCE[0] == $0` 双条件守卫），
+    供单元测试逐个函数驱动
 
 **Step 1: 写失败的测试**
 
-追加到 `test/unit.sh`：
+第一块 —— 给断言库补 `assert_not_contains`（**追加到 `test/lib.sh` 的末尾**）：
 
 ```bash
-test_case "uninstall 参数校验"
 
-out=$(bash "$ROOT/uninstall.sh" --not-a-flag 2>&1)
-assert_status 1 "$?" "uninstall 未知参数以非零码退出"
-assert_contains "$out" "未知" "uninstall 未知参数给出提示"
+# 「不包含子串」断言：Task 11 用来证明「某些危险动作【没有】发生」
+# （例如备份失败时绝不删除原配置、用户取消时绝不碰服务与文件）。
+# 必须与 assert_contains 成对存在：只断言「包含」区分不了
+# 「根本没做」与「做了但输出被吞了」—— 而这正是卸载脚本最需要分清的两件事。
+assert_not_contains() {
+  local haystack="$1" needle="$2" msg="${3:-不包含子串}"
+  if [[ "$haystack" != *"$needle"* ]]; then
+    TEST_PASS=$((TEST_PASS + 1))
+    printf '    \033[32m✔\033[0m %s\n' "$msg"
+  else
+    TEST_FAIL=$((TEST_FAIL + 1))
+    printf '    \033[31m✘\033[0m %s\n' "$msg"
+    printf '        期望不包含: %s\n' "$needle"
+    printf '        实际: %s\n' "$haystack"
+  fi
+}
+```
 
-out=$(bash "$ROOT/uninstall.sh" --help 2>&1)
-assert_status 0 "$?" "uninstall --help 退出码为 0"
-assert_contains "$out" "purge" "uninstall 帮助含 --purge"
+第二块 —— 追加到 `test/unit.sh` 的 `test_summary` **之前**：
+
+```bash
+# ── Task 11：卸载脚本（全部 mock：不碰系统目录、不动防火墙，不停真服务）──
+# ⚠️ 本段【不写任何会整块跳过的条件块】：外部依赖一律用 shell 函数 mock。
+# ⚠️ 共享 mock 集合里【不许】出现与被测对象同名的函数
+#    （被测对象是 uninstall.sh 里的那些函数，一个都不许出现在共享集合里）。
+#
+# ⚠️ uninstall.sh 必须【可被 source 而不执行 main】——
+#    否则单元测试只能测参数解析，主流程（停服务 / 备份 / 删配置 / 撤防火墙）
+#    一条都测不到；而 main 里的 root 检查在非 root 机器上会直接 exit。
+#    所以测试用 `UNINSTALL_SH_NO_MAIN=1` + `source` 的方式引入，
+#    再逐个函数用 mock 驱动。
+#
+# ⚠️ mock 的「调用记录」必须走【日志文件】，不能走 stdout：
+#    实现里有几处刻意丢弃外部命令的输出（systemctl >/dev/null 2>&1、
+#    ufw delete >/dev/null 2>&1）—— 那正是这些命令「成功了但没话说」的正常表现。
+#    用 stdout 当记录通道会有两个问题：
+#      ① 「命令被调用过」和「命令自己的输出」混在一起，分不清；
+#      ② 凡是实现里带了 >/dev/null 的，记录被吞掉 → 断言根本无从观察。
+#    记录走日志文件后，「命令被调用过」（calls）与「给用户看的提示」（out）
+#    是两条互相独立的通道。
+
+T11_TMP=$(mktemp -d 2>/dev/null)
+T11_LOG=''
+T11_STATE_DIR="${T11_TMP}/state"
+T11_STATE_FILE="${T11_STATE_DIR}/deploy.env"
+T11_CONFIG="${T11_TMP}/config.json"
+T11_OUT_DIR="${T11_TMP}/out"
+T11_SYSCTL_CONF="${T11_TMP}/bbr.conf"
+
+# 共享 mock 集合：卸载流程依赖的【所有】外部动作换成会记日志的假实现。
+# ⚠️ cp / rm / mkdir 【不 mock】—— 它们的操作目标全在 $T11_TMP 临时目录里，
+#    用真命令跑更真实（还能验证「文件真的被删了」而不只是「调用了 rm」）。
+#    只有需要模拟「备份失败 / 删除失败 / 目录建不出来」的那三个用例里
+#    才临时覆盖对应的命令。
+t11_mocks() {
+  cat <<'MOCKS'
+have_cmd() { case "$1" in ufw|iptables|nft) return 1 ;; *) return 0 ;; esac; }
+systemctl() { printf 'MOCK_SYSTEMCTL %s\n' "$*" >> "$T11_LOG"; return 0; }
+ufw() { case "$1" in status) printf 'Status: inactive\n' ;; *) printf 'MOCK_UFW %s\n' "$*" >> "$T11_LOG" ;; esac; return 0; }
+iptables() { case "$1" in -C) return 1 ;; *) printf 'MOCK_IPTABLES %s\n' "$*" >> "$T11_LOG" ;; esac; return 0; }
+nft() { case "$1" in -a) printf 'table inet filter {\n chain input {\n }\n}\n' ;; *) printf 'MOCK_NFT %s\n' "$*" >> "$T11_LOG" ;; esac; return 0; }
+sysctl() { printf 'MOCK_SYSCTL %s\n' "$*" >> "$T11_LOG"; return 0; }
+tui_confirm() { printf 'MOCK_CONFIRM %s\n' "$*" >> "$T11_LOG"; return 0; }
+tui_panel() { printf 'MOCK_PANEL %s\n' "$*" >> "$T11_LOG"; return 0; }
+tui_banner() { printf 'MOCK_BANNER\n' >> "$T11_LOG"; return 0; }
+tui_init() { printf 'MOCK_TUI_INIT\n' >> "$T11_LOG"; return 0; }
+MOCKS
+}
+
+# 把 uninstall.sh 引进来但不跑 main，并装好全套 mock。
+# ⚠️ 必须【直接调用】t11_load，绝不能写成 `eval "$(t11_load)"`：
+#    `$(...)` 会在【子 shell】里执行 t11_load → 里面 source 进来的被测函数与
+#    eval 出来的 mock 全部随子 shell 一起消失 → 被测函数根本不存在，
+#    每次调用都是 "command not found"（rc=127）；而断言大多只看输出文本，
+#    就会得到一堆【看似失败、实则根本没测到】的红。
+t11_load() {
+  export UNINSTALL_SH_NO_MAIN=1
+  export STATE_DIR="$T11_STATE_DIR"
+  export STATE_FILE="$T11_STATE_FILE"
+  export XRAY_CONFIG="$T11_CONFIG"
+  export OUT_DIR="$T11_OUT_DIR"
+  # sysctl 调优文件必须指到临时目录：remove_tuning 会真的 rm 掉它，
+  # 用默认路径会【真的删掉这台机器上的 /etc/sysctl.d/99-vless-reality-bbr.conf】。
+  export VLESS_REALITY_SYSCTL_CONF="$T11_SYSCTL_CONF"
+  # 这几个文件必须【真的存在】：
+  #   ① $XRAY_CONFIG —— 被测代码用 [[ -f ]] 判断「配置在不在」，
+  #      文件不存在就直接跳过整段备份逻辑 → 备份分支一条都走不到；
+  #   ② $STATE_FILE —— 同理，revoke_firewall 用它判断「有没有部署过」；
+  #   ③ $VLESS_REALITY_SYSCTL_CONF —— 用来验证 remove_tuning 真的删掉了它。
+  # 状态文件里写一个端口：让 revoke_firewall 走得到防火墙分支。
+  mkdir -p "$STATE_DIR" "$OUT_DIR"
+  printf "PORT='443'\n" > "$STATE_FILE"
+  : > "$XRAY_CONFIG"
+  : > "$VLESS_REALITY_SYSCTL_CONF"
+  # shellcheck source=/dev/null
+  source "$ROOT/uninstall.sh"
+  eval "$(t11_mocks)"
+}
+
+if [[ -n "$T11_TMP" ]]; then
+  T11_LOG="${T11_TMP}/calls.log"
+  : > "$T11_LOG"
+
+  test_case "uninstall：参数解析"
+
+  # 未知参数 → 非零退出 + 明确提示
+  out=$(bash "$ROOT/uninstall.sh" --not-a-flag 2>&1); rc=$?
+  assert_status 1 "$rc" "uninstall 未知参数以非零码退出"
+  assert_contains "$out" "未知" "uninstall 未知参数给出提示"
+
+  # --help → 0 退出，且帮助里说清 --purge 与「用 bash 调用」
+  out=$(bash "$ROOT/uninstall.sh" --help 2>&1); rc=$?
+  assert_status 0 "$rc" "uninstall --help 退出码为 0"
+  assert_contains "$out" "purge" "uninstall 帮助含 --purge"
+  assert_contains "$out" "bash uninstall.sh" "uninstall 帮助用 bash 调用（不依赖执行位）"
+
+  test_case "uninstall：root 检查与可 source 性"
+
+  # ⚠️ EUID 是 bash 的【只读】变量 → 本机无法注入 root 身份 →
+  #    「非 root 时返回非零」这条断言在本机与 Debian 上的结果【相反】，
+  #    写进单元测试就会让条数随平台漂移 → 只做源码级断言。
+  src=$(cat "$ROOT/uninstall.sh")
+  assert_contains "$src" "EUID" "uninstall.sh 用 EUID 判定 root 身份"
+  assert_contains "$src" "需要 root 权限" "uninstall.sh 在非 root 时给出明确提示"
+  assert_contains "$src" "UNINSTALL_SH_NO_MAIN" "uninstall.sh 有「被 source 时不跑 main」的开关"
+  assert_contains "$src" "BASH_SOURCE[0]" "uninstall.sh 用 BASH_SOURCE 守卫主流程"
+
+  test_case "uninstall：备份与删除配置"
+
+  # 备份失败 → 必须中止，且【绝不】删除原配置（这是本脚本最关键的安全性质）
+  : > "$T11_LOG"
+  out=$( ( t11_load
+           cp() { return 1; }
+           backup_and_remove_config ) 2>&1 ); rc=$?
+  assert_status 1 "$rc" "backup_and_remove_config 在备份失败时返回非零"
+  assert_contains "$out" "备份配置失败" "备份失败时给出明确提示"
+  assert_contains "$out" "未删除原配置" "备份失败时明确说明原配置未被删除"
+  if [[ -f "$T11_CONFIG" ]]; then rc=0; else rc=1; fi
+  assert_true "$rc" "备份失败时原配置文件仍在（绝没有被删）"
+
+  # 备份目录建不出来 → 同样必须中止，且不删原配置
+  : > "$T11_LOG"
+  out=$( ( t11_load
+           mkdir() { return 1; }
+           backup_and_remove_config ) 2>&1 ); rc=$?
+  assert_status 1 "$rc" "backup_and_remove_config 在备份目录建不出来时返回非零"
+  assert_contains "$out" "无法创建备份目录" "备份目录建不出来时给出明确提示"
+  if [[ -f "$T11_CONFIG" ]]; then rc=0; else rc=1; fi
+  assert_true "$rc" "备份目录建不出来时原配置文件仍在"
+
+  # 备份成功 → 删配置 + 报告备份路径
+  : > "$T11_LOG"
+  out=$( ( t11_load
+           backup_and_remove_config ) 2>&1 ); rc=$?
+  assert_status 0 "$rc" "backup_and_remove_config 在备份成功时返回 0"
+  assert_contains "$out" "配置已备份并移除" "备份成功时给出明确提示"
+  missing=1
+  for f in "$T11_OUT_DIR"/backup/config.json.*; do
+    [[ -e "$f" ]] && missing=0
+  done
+  assert_true "$missing" "备份成功时备份文件真的生成了"
+  if [[ ! -f "$T11_CONFIG" ]]; then rc=0; else rc=1; fi
+  assert_true "$rc" "备份成功时原配置真的被删除了"
+
+  # 删配置失败 → 必须报错（备份已在，但不能悄悄说成功）
+  : > "$T11_LOG"
+  out=$( ( t11_load
+           rm() { return 1; }
+           backup_and_remove_config ) 2>&1 ); rc=$?
+  assert_status 1 "$rc" "backup_and_remove_config 在删除原配置失败时返回非零"
+  assert_contains "$out" "原配置删除失败" "删除原配置失败时给出明确提示"
+  missing=1
+  for f in "$T11_OUT_DIR"/backup/config.json.*; do
+    [[ -e "$f" ]] && missing=0
+  done
+  assert_true "$missing" "删除原配置失败时备份文件已经存在（没有回滚丢失）"
+
+  test_case "uninstall：撤销防火墙规则"
+
+  # ufw 处于 active → 必须删规则
+  : > "$T11_LOG"
+  out=$( ( t11_load
+           have_cmd() { case "$1" in ufw) return 0 ;; iptables|nft) return 1 ;; *) return 0 ;; esac; }
+           ufw() { case "$1" in status) printf 'Status: active\n' ;; *) printf 'MOCK_UFW %s\n' "$*" >> "$T11_LOG" ;; esac; return 0; }
+           load_state() { PORT=443; return 0; }
+           revoke_firewall ) 2>&1 ); rc=$?
+  calls=$(cat "$T11_LOG")
+  assert_status 0 "$rc" "revoke_firewall 在 ufw 分支正常返回 0"
+  assert_contains "$out" "已撤销 ufw 规则 443/tcp" "revoke_firewall 如实报告撤销了 ufw 规则"
+  assert_contains "$calls" "MOCK_UFW delete allow 443/tcp" "revoke_firewall 真的调用了 ufw delete allow"
+
+  # ufw 存在但没激活 → 不删 ufw 规则
+  : > "$T11_LOG"
+  out=$( ( t11_load
+           have_cmd() { case "$1" in ufw) return 0 ;; iptables|nft) return 1 ;; *) return 0 ;; esac; }
+           ufw() { case "$1" in status) printf 'Status: inactive\n' ;; *) printf 'MOCK_UFW %s\n' "$*" >> "$T11_LOG" ;; esac; return 0; }
+           load_state() { PORT=443; return 0; }
+           revoke_firewall ) 2>&1 ); rc=$?
+  calls=$(cat "$T11_LOG")
+  assert_status 0 "$rc" "revoke_firewall 在 ufw 未激活时正常返回 0"
+  assert_not_contains "$calls" "MOCK_UFW delete" "ufw 未激活时不删 ufw 规则"
+
+  # iptables 分支：必须【数一数】真删了几条，不能只说「已撤销」
+  : > "$T11_LOG"
+  out=$( ( t11_load
+           have_cmd() { case "$1" in iptables) return 0 ;; ufw|nft) return 1 ;; *) return 0 ;; esac; }
+           IPT_C=0
+           iptables() { case "$1" in
+               -C) IPT_C=$((IPT_C+1)); [[ $IPT_C -le 2 ]] && return 0; return 1 ;;
+               -D) printf 'MOCK_IPTABLES %s\n' "$*" >> "$T11_LOG"; return 0 ;;
+               *) return 0 ;; esac; }
+           load_state() { PORT=443; return 0; }
+           revoke_firewall ) 2>&1 ); rc=$?
+  calls=$(cat "$T11_LOG")
+  assert_status 0 "$rc" "revoke_firewall 在 iptables 分支正常返回 0"
+  assert_contains "$out" "已撤销 iptables 规则 443/tcp" "revoke_firewall 如实报告撤销了 iptables 规则"
+  assert_contains "$out" "2 条" "revoke_firewall 如实报告撤销的条数"
+  assert_contains "$calls" "MOCK_IPTABLES -D INPUT" "revoke_firewall 真的调用了 iptables -D"
+
+  # iptables 分支一条都没有 → 不能谎报「已撤销」
+  : > "$T11_LOG"
+  out=$( ( t11_load
+           have_cmd() { case "$1" in iptables) return 0 ;; ufw|nft) return 1 ;; *) return 0 ;; esac; }
+           iptables() { case "$1" in -C) return 1 ;; *) return 0 ;; esac; }
+           load_state() { PORT=443; return 0; }
+           revoke_firewall ) 2>&1 ); rc=$?
+  assert_status 0 "$rc" "revoke_firewall 在没有 iptables 规则时正常返回 0"
+  assert_contains "$out" "未找到 iptables 规则" "没有 iptables 规则时如实说明未找到"
+
+  # nft 分支：必须用【handle】而不是行号
+  : > "$T11_LOG"
+  out=$( ( t11_load
+           have_cmd() { case "$1" in nft) return 0 ;; ufw|iptables) return 1 ;; *) return 0 ;; esac; }
+           nft() { case "$1" in
+               -a) printf 'table inet filter {\n chain input {\n  tcp dport 443 accept # handle 7\n }\n}\n' ;;
+               *) printf 'MOCK_NFT %s\n' "$*" >> "$T11_LOG" ;; esac; return 0; }
+           load_state() { PORT=443; return 0; }
+           revoke_firewall ) 2>&1 ); rc=$?
+  calls=$(cat "$T11_LOG")
+  assert_status 0 "$rc" "revoke_firewall 在 nft 分支正常返回 0"
+  assert_contains "$out" "handle 7" "revoke_firewall 用 nft 的 handle（不是行号）删除规则"
+  assert_contains "$calls" "MOCK_NFT delete rule inet filter input handle 7" "revoke_firewall 按 handle 删除 nft 规则"
+
+  # 状态文件读不到 → 必须提示，且【不碰】防火墙
+  : > "$T11_LOG"
+  out=$( ( t11_load
+           load_state() { return 1; }
+           revoke_firewall ) 2>&1 ); rc=$?
+  calls=$(cat "$T11_LOG")
+  assert_status 0 "$rc" "revoke_firewall 在状态文件读不到时正常返回 0"
+  assert_contains "$out" "状态文件读取失败" "状态文件读不到时给出明确提示"
+  assert_not_contains "$calls" "MOCK_UFW" "状态文件读不到时不碰防火墙"
+
+  # 端口未知（状态文件里没有端口）→ 跳过防火墙，且说明原因
+  : > "$T11_LOG"
+  out=$( ( t11_load
+           load_state() { PORT=''; return 0; }
+           revoke_firewall ) 2>&1 ); rc=$?
+  calls=$(cat "$T11_LOG")
+  assert_status 0 "$rc" "revoke_firewall 在端口未知时正常返回 0"
+  assert_contains "$out" "未能确定监听端口" "端口未知时如实说明跳过了防火墙撤销"
+  assert_not_contains "$calls" "MOCK_UFW" "端口未知时不碰 ufw"
+
+  test_case "uninstall：网络调优与状态清理"
+
+  # sysctl 文件路径必须与 enable_bbr 用的是同一个变量
+  : > "$T11_LOG"
+  out=$( ( t11_load
+           remove_tuning ) 2>&1 ); rc=$?
+  calls=$(cat "$T11_LOG")
+  assert_status 0 "$rc" "remove_tuning 正常返回 0"
+  if [[ ! -f "$T11_SYSCTL_CONF" ]]; then rc=0; else rc=1; fi
+  assert_true "$rc" "remove_tuning 真的删掉了 sysctl 调优文件"
+  assert_contains "$calls" "MOCK_SYSCTL --system" "remove_tuning 重载了 sysctl"
+
+  # --purge → 删状态文件
+  : > "$T11_LOG"
+  out=$( ( t11_load
+           PURGE=1
+           clean_state ) 2>&1 ); rc=$?
+  assert_status 0 "$rc" "clean_state 在 --purge 下正常返回 0"
+  assert_contains "$out" "已删除状态文件" "clean_state 在 --purge 下给出明确提示"
+  if [[ ! -f "$T11_STATE_FILE" ]]; then rc=0; else rc=1; fi
+  assert_true "$rc" "clean_state 在 --purge 下真的删掉了状态文件"
+
+  # 不加 --purge → 保留状态文件
+  : > "$T11_LOG"
+  out=$( ( t11_load
+           PURGE=0
+           clean_state ) 2>&1 ); rc=$?
+  assert_status 0 "$rc" "clean_state 在默认模式下正常返回 0"
+  assert_contains "$out" "保留状态文件" "clean_state 在默认模式下说明状态文件被保留"
+  if [[ -f "$T11_STATE_FILE" ]]; then rc=0; else rc=1; fi
+  assert_true "$rc" "不加 --purge 时状态文件仍在"
+
+  test_case "uninstall：主流程与卸载前确认"
+
+  # 用户不确认 → 必须取消，且【一步都不许做】
+  : > "$T11_LOG"
+  out=$( ( t11_load
+           require_root() { return 0; }
+           tui_confirm() { printf 'MOCK_CONFIRM %s\n' "$*" >> "$T11_LOG"; return 1; }
+           ASSUME_YES=0
+           main ) 2>&1 ); rc=$?
+  calls=$(cat "$T11_LOG")
+  assert_status 0 "$rc" "用户在卸载前取消时退出码为 0"
+  assert_contains "$out" "已取消" "用户取消时给出明确提示"
+  assert_not_contains "$calls" "MOCK_SYSTEMCTL" "用户取消时不停止服务"
+  if [[ -f "$T11_CONFIG" ]]; then rc=0; else rc=1; fi
+  assert_true "$rc" "用户取消时不删除服务端配置"
+  if [[ -f "$T11_STATE_FILE" ]]; then rc=0; else rc=1; fi
+  assert_true "$rc" "用户取消时不删除状态文件"
+
+  # --yes → 走完整流程
+  : > "$T11_LOG"
+  out=$( ( t11_load
+           require_root() { return 0; }
+           ASSUME_YES=1
+           main ) 2>&1 ); rc=$?
+  calls=$(cat "$T11_LOG")
+  assert_status 0 "$rc" "main 在 --yes 下返回 0"
+  assert_contains "$calls" "MOCK_SYSTEMCTL disable --now xray" "main 停用了 xray 服务"
+  assert_contains "$out" "卸载完成" "main 结束时打印卸载完成"
+
+  # --yes + --purge → 状态文件也被删
+  : > "$T11_LOG"
+  out=$( ( t11_load
+           require_root() { return 0; }
+           ASSUME_YES=1
+           PURGE=1
+           main ) 2>&1 ); rc=$?
+  assert_status 0 "$rc" "main 在 --yes --purge 下返回 0"
+  assert_contains "$out" "已删除状态文件" "main 在 --purge 下删除了状态文件"
+  if [[ ! -f "$T11_STATE_FILE" ]]; then rc=0; else rc=1; fi
+  assert_true "$rc" "main 在 --purge 下真的删掉了状态文件"
+
+  test_case "uninstall：可执行位（定点修订）"
+
+  # ⚠️ 仓库里所有 .sh 的提交模式都是 100644（core.fileMode=false）→
+  #    新克隆的仓库里 uninstall.sh 【不可执行】→ 用 -x 判定会永远判成「没有」，
+  #    卸载入口就是死的。必须用 -f 判定 + `bash` 显式执行。
+  inst=$(cat "$ROOT/install.sh")
+  assert_not_contains "$inst" 'if [[ -x "$ROOT_DIR/uninstall.sh" ]]' "install.sh 不再用 -x 判定 uninstall.sh"
+  assert_contains "$inst" 'exec bash "$ROOT_DIR/uninstall.sh"' "install.sh 用 bash 显式执行 uninstall.sh（不依赖执行位）"
+  dep=$(cat "$ROOT/lib/deploy.sh")
+  assert_not_contains "$dep" 'if [[ ! -x "$ROOT_DIR/uninstall.sh" ]]' "menu_uninstall 不再用 -x 判定 uninstall.sh"
+  assert_contains "$dep" 'exec bash "$ROOT_DIR/uninstall.sh"' "menu_uninstall 用 bash 显式执行 uninstall.sh（不依赖执行位）"
+
+else
+  assert_eq "mktemp -d 能创建唯一临时目录" "失败（mktemp -d 返回空路径）" \
+    "Task 11 用例前提：mktemp -d 必须能创建唯一临时目录"
+fi
+rm -rf "$T11_TMP"
 ```
 
 **Step 2: 运行测试确认失败**
@@ -7022,7 +7372,10 @@ assert_contains "$out" "purge" "uninstall 帮助含 --purge"
 bash test/unit.sh
 ```
 
-预期：FAIL，`uninstall.sh: No such file or directory`。
+预期：FAIL —— `uninstall.sh: No such file or directory`（参数解析那几条红），
+且 `test/lib.sh` 里没有 `assert_not_contains` → 断言库那一条也红。
+⚠️ 这一步的失败**必须真的红**（不是「0 条红」）：0 条红说明测试根本没跑起来，
+后面「实现后全绿」就没有意义了。
 
 **Step 3: 实现 `uninstall.sh`**
 
@@ -7031,6 +7384,15 @@ bash test/unit.sh
 ```bash
 #!/usr/bin/env bash
 # uninstall.sh — 卸载 VLESS + REALITY 部署
+#
+# 用法:
+#   sudo bash uninstall.sh            交互式（卸载前确认）
+#   sudo bash uninstall.sh --yes      跳过确认直接卸载
+#   sudo bash uninstall.sh --purge    同时删除状态文件
+#
+# ⚠️ 用 `bash uninstall.sh` 而不是 `./uninstall.sh`：
+#    仓库里的 .sh 提交模式是 100644（core.fileMode=false），
+#    新克隆的仓库里这个文件【不可执行】→ ./uninstall.sh 会 Permission denied。
 set -uo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -7040,120 +7402,238 @@ source "$ROOT_DIR/lib/tui.sh"
 source "$ROOT_DIR/lib/core.sh"
 
 PURGE=0
+ASSUME_YES=0
+
 usage() {
   cat <<EOF
 卸载 VLESS + REALITY 部署
 
 用法:
-  sudo ./uninstall.sh [--purge]
+  sudo bash uninstall.sh [选项]
 
 选项:
-      --purge   同时删除状态文件 $STATE_FILE（默认保留）
-  -h, --help   显示本帮助
+      --purge    同时删除状态文件 $STATE_FILE（默认保留）
+  -y, --yes      跳过卸载前的确认（用于无人值守场景）
+  -h, --help     显示本帮助
 EOF
 }
 
-for a in "$@"; do
-  case "$a" in
-    --purge) PURGE=1 ;;
-    -h|--help) usage; exit 0 ;;
-    *) tui_err "未知参数：$a"; usage; exit 1 ;;
-  esac
-done
+parse_args() {
+  for a in "$@"; do
+    case "$a" in
+      --purge) PURGE=1 ;;
+      -y|--yes) ASSUME_YES=1 ;;
+      -h|--help) usage; exit 0 ;;
+      *) tui_err "未知参数：$a"; usage; exit 1 ;;
+    esac
+  done
+  return 0
+}
 
-if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
-  tui_err "需要 root 权限，请使用 sudo 重新执行。"
-  exit 1
-fi
+require_root() {
+  # EUID 是 bash 的只读变量，无法在测试里注入 → 返回状态、由调用方决定退出码。
+  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+    tui_err "需要 root 权限，请使用 sudo 重新执行。"
+    return 1
+  fi
+  return 0
+}
 
-tui_init
-tui_banner "卸载工具" "VLESS + REALITY"
+stop_service() {
+  tui_section "停止服务"
+  if ! have_cmd systemctl; then
+    tui_warn "未找到 systemctl，跳过停止服务。"
+    return 0
+  fi
+  if systemctl disable --now xray >/dev/null 2>&1; then
+    tui_ok "xray 服务已停止并取消开机自启"
+  else
+    tui_warn "xray 服务停止失败（可能未安装）"
+  fi
+  return 0
+}
 
-tui_section "停止服务"
-if have_cmd systemctl; then
-  systemctl disable --now xray >/dev/null 2>&1 && tui_ok "xray 服务已停止并取消开机自启" || tui_warn "xray 服务停止失败（可能未安装）"
-fi
-
-tui_section "备份并移除配置"
-if [[ -f "$XRAY_CONFIG" ]]; then
+backup_and_remove_config() {
+  tui_section "备份并移除配置"
+  if [[ ! -f "$XRAY_CONFIG" ]]; then
+    tui_info "服务端配置不存在，跳过。"
+    return 0
+  fi
   # 备份失败时【绝不能】继续删原配置：否则用户的服务端配置直接丢失、
   # 且没有任何可回滚的副本。备份失败就停在这里，让用户自己决定。
   if ! mkdir -p "$OUT_DIR/backup"; then
     tui_err "无法创建备份目录：$OUT_DIR/backup"
     tui_err "为避免丢失配置，未删除原配置：$XRAY_CONFIG"
-    exit 1
+    return 1
   fi
-  backup_file="$OUT_DIR/backup/config.json.$(date +%Y%m%d%H%M%S)"
+  # 备份名带 PID：同一秒内卸载两次也不会互相覆盖。
+  local backup_file="$OUT_DIR/backup/config.json.$(date +%Y%m%d%H%M%S).$$"
   if ! cp -f "$XRAY_CONFIG" "$backup_file"; then
     tui_err "备份配置失败：$XRAY_CONFIG"
     tui_err "为避免丢失配置，未删除原配置。请检查 $OUT_DIR 的剩余空间与权限。"
-    exit 1
+    return 1
   fi
   if ! rm -f "$XRAY_CONFIG"; then
     tui_err "备份已保存到 $backup_file，但原配置删除失败：$XRAY_CONFIG"
-    exit 1
+    return 1
   fi
   tui_ok "配置已备份并移除：$backup_file"
-fi
+  return 0
+}
 
-tui_section "撤销防火墙规则"
-# 必须用 load_state（Task 3 提供的唯一读状态入口），不要直接 `. "$STATE_FILE"`：
-#   ① 直接 source 会把状态文件【执行】一遍（Task 3 修复轮 2 刚把这条改掉）；
-#   ② 没有语法检查，状态文件损坏时报错与真实原因无关；
-#   ③ load_state 能区分「读不到」与「格式错」。
-PORT=''
-if [[ -f "$STATE_FILE" ]]; then
-  load_state || tui_warn "状态文件读取失败，无法确定端口（防火墙规则可能残留）。"
-  PORT="${PORT:-}"
-fi
-if [[ -n "$PORT" ]]; then
-  if have_cmd ufw && ufw status 2>/dev/null | grep -q 'Status: active'; then
-    # 失败必须有提示：静默跳过会让人以为规则已撤销，实际还开着。
-    if ufw delete allow "$PORT/tcp" >/dev/null 2>&1; then
-      tui_ok "已撤销 ufw 规则 $PORT/tcp"
+revoke_firewall() {
+  tui_section "撤销防火墙规则"
+  # 必须用 load_state（Task 3 提供的唯一读状态入口），不要直接 `. "$STATE_FILE"`：
+  #   ① 直接 source 会把状态文件【执行】一遍（Task 3 修复轮 2 刚把这条改掉）；
+  #   ② 没有语法检查，状态文件损坏时报错与真实原因无关；
+  #   ③ load_state 能区分「读不到」与「格式错」。
+  # 用局部变量 port，不去污染全局的 PORT。
+  local port=''
+  if [[ -f "$STATE_FILE" ]]; then
+    if load_state; then
+      port="${PORT:-}"
     else
-      tui_warn "ufw 规则 $PORT/tcp 撤销失败（可能本来就没有该规则）。"
+      tui_warn "状态文件读取失败，无法确定端口（防火墙规则可能残留）。"
     fi
-  elif have_cmd iptables; then
+  fi
+  if [[ -z "$port" ]]; then
+    tui_warn "未能确定监听端口，跳过防火墙规则撤销（规则可能残留）。"
+    return 0
+  fi
+
+  if have_cmd ufw; then
+    # 先把整段输出【收进变量】再匹配，不要写 `ufw status | grep -q`：
+    # grep -q 命中即退出 → 上游 ufw 收到 SIGPIPE(141) → 在 set -o pipefail 下
+    # 整条管道的退出码变成 141 → 条件判假 → ufw 明明是 active 也走错分支
+    # → 规则撤不掉（卸载后端口还开着）。
+    # （实测 ufw status 的输出很小、暂时不会真的触发 SIGPIPE，
+    #   但与本仓库 open_firewall 的既定写法保持一致，避免以后输出变大时踩同一个坑。）
+    local ufw_status=''
+    ufw_status=$(ufw status 2>/dev/null || printf '')
+    if [[ "$ufw_status" == *"Status: active"* ]]; then
+      if ufw delete allow "$port/tcp" >/dev/null 2>&1; then
+        tui_ok "已撤销 ufw 规则 $port/tcp"
+      else
+        tui_warn "ufw 规则 $port/tcp 撤销失败（可能本来就没有该规则）。"
+      fi
+      return 0
+    fi
+  fi
+
+  if have_cmd iptables; then
     # 必须数一数真删了几条：循环一次都没进也报「已撤销」就是谎报成功。
+    # ⚠️ 这个变量必须是函数内的普通局部变量：原计划写的是【函数外的】
+    #    `local ipt_removed=0` → bash 报 "local: can only be used in a function"
+    #    且【赋值根本不发生】→ 变量保持未定义 → `(( ipt_removed > 0 ))` 在 set -u 下
+    #    报 "unbound variable" → 卸载脚本在 iptables 分支【中途死亡】(rc=127)，
+    #    此时服务已停、配置已删，但防火墙规则没撤、状态没清。
     local ipt_removed=0
-    while iptables -C INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null; do
-      iptables -D INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || break
+    while iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; do
+      iptables -D INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || break
       ipt_removed=$((ipt_removed + 1))
     done
     if (( ipt_removed > 0 )); then
-      tui_ok "已撤销 iptables 规则 $PORT/tcp（$ipt_removed 条）"
+      tui_ok "已撤销 iptables 规则 $port/tcp（$ipt_removed 条）"
     else
-      tui_warn "未找到 iptables 规则 $PORT/tcp（可能本来就没有）。"
+      tui_warn "未找到 iptables 规则 $port/tcp（可能本来就没有）。"
     fi
-  elif have_cmd nft; then
-    nft list table inet filter >/dev/null 2>&1 && {
-      local_rule=$(nft list chain inet filter input 2>/dev/null | grep -n "tcp dport $PORT" | head -1 | cut -d: -f1)
-      [[ -n "$local_rule" ]] && nft delete rule inet filter input handle "$local_rule" 2>/dev/null || true
-    }
-    tui_ok "已尝试撤销 nftables 规则 $PORT/tcp"
+    return 0
   fi
+
+  if have_cmd nft; then
+    # ⚠️ nft 的 handle 是【规则自身的编号】，不是它在清单里的行号：
+    #    原来用 `grep -n ... | head -1 | cut -d: -f1` 取的是行号 →
+    #    `nft delete rule ... handle <行号>` 必然删错或删不到。
+    #    正确做法：用 `nft -a list chain` 打出带 handle 的清单，再取 handle。
+    local nft_out='' nft_handle=''
+    nft_out=$(nft -a list chain inet filter input 2>/dev/null || printf '')
+    nft_handle=$(printf '%s\n' "$nft_out" | awk -v p="$port" '
+      index($0, "tcp dport " p) { for (i = 1; i <= NF; i++) if ($i == "handle") { print $(i+1); exit } }')
+    if [[ -n "$nft_handle" ]]; then
+      if nft delete rule inet filter input handle "$nft_handle" 2>/dev/null; then
+        tui_ok "已撤销 nftables 规则 $port/tcp（handle $nft_handle）"
+      else
+        tui_warn "nftables 规则 $port/tcp 撤销失败（handle $nft_handle）。"
+      fi
+    else
+      tui_warn "未找到 nftables 规则 $port/tcp（可能本来就没有）。"
+    fi
+    return 0
+  fi
+
+  tui_warn "未检测到 ufw / iptables / nftables，防火墙规则未改动。"
+  return 0
+}
+
+remove_tuning() {
+  tui_section "移除网络调优"
+  # 必须与 enable_bbr 用【同一个】路径变量：默认一致，但环境变量覆盖后不能漏删。
+  local conf="${VLESS_REALITY_SYSCTL_CONF:-/etc/sysctl.d/99-vless-reality-bbr.conf}"
+  rm -f "$conf"
+  # sysctl 没有「按文件撤销」的接口，只能 --system 重载 —— 它会连带重载
+  # /etc/sysctl.conf 里的其它设置（一般无害）。
+  sysctl --system >/dev/null 2>&1 || true
+  tui_ok "已移除 sysctl 调优文件：$conf"
+  return 0
+}
+
+clean_state() {
+  tui_section "清理状态"
+  if [[ $PURGE -eq 1 ]]; then
+    rm -f "$STATE_FILE"
+    tui_ok "已删除状态文件：$STATE_FILE"
+    # 状态目录【保留】：rmdir 不在运行时白名单里，而且目录里可能还有
+    # 用户自己放的东西 → 擅自删目录比留一个空目录更危险。
+    tui_tip "状态目录 $STATE_DIR 已保留（如需删除请手工处理）。"
+  else
+    tui_ok "保留状态文件：$STATE_FILE（如需删除请加 --purge）"
+  fi
+  return 0
+}
+
+main() {
+  parse_args "$@"
+  tui_init
+  require_root || exit 1
+  tui_banner "卸载工具" "VLESS + REALITY"
+
+  # ⚠️ 这是全项目唯一会【删除用户配置、撤销防火墙规则】的脚本 →
+  #    必须让用户确认（--yes / -y 可跳过，用于无人值守）。
+  if [[ $ASSUME_YES -eq 0 ]]; then
+    local state_row="保留（如需删除请加 --purge）"
+    [[ $PURGE -eq 1 ]] && state_row="一并删除"
+    tui_panel "即将执行的卸载动作" \
+      "停止并禁用|xray 服务" \
+      "备份并删除|$XRAY_CONFIG" \
+      "撤销防火墙规则|监听端口" \
+      "移除网络调优|sysctl 配置" \
+      "状态文件|$state_row"
+    tui_confirm "确认执行卸载？" "n" || { tui_info "已取消"; exit 0; }
+  fi
+
+  stop_service
+  # 备份失败必须【中止】整个卸载：配置没备份成功就不能删原文件。
+  backup_and_remove_config || exit 1
+  revoke_firewall
+  remove_tuning
+  clean_state
+
+  tui_warn "Xray 内核二进制与 systemd unit 未删除，内核仍位于 $XRAY_BIN。"
+  tui_tip "如需彻底清理可手动执行：rm -f $XRAY_BIN && rm -f /etc/systemd/system/xray.service"
+
+  tui_section "结果"
+  tui_ok "卸载完成。客户端导出目录保留于 $OUT_DIR"
+  exit 0
+}
+
+# ── 只有【直接执行】时才跑主流程 ────────────────────────────
+# 被 source 时（单元测试要 source 本文件来测各个函数）绝不执行 main。
+# 两个条件缺一不可：
+#   ① BASH_SOURCE[0] == $0 → 只有直接执行本文件时成立；
+#   ② 环境变量开关 → 给测试一个显式的显式开关。
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]] && [[ "${UNINSTALL_SH_NO_MAIN:-0}" != "1" ]]; then
+  main "$@"
 fi
-
-tui_section "移除网络调优"
-rm -f /etc/sysctl.d/99-vless-reality-bbr.conf
-sysctl --system >/dev/null 2>&1 || true
-tui_ok "已移除 sysctl 调优文件"
-
-tui_section "清理状态"
-if [[ $PURGE -eq 1 ]]; then
-  rm -f "$STATE_FILE"
-  tui_ok "已删除状态文件：$STATE_FILE"
-else
-  tui_ok "保留状态文件：$STATE_FILE（如需删除请加 --purge）"
-fi
-
-tui_warn "Xray 内核二进制未删除，仍位于 $XRAY_BIN。"
-tui_tip "如需彻底清理可手动执行：rm -f $XRAY_BIN"
-
-tui_section "结果"
-tui_ok "卸载完成。客户端导出目录保留于 $OUT_DIR"
-exit 0
 ```
 
 **Step 4: 运行测试确认通过**
@@ -7167,9 +7647,207 @@ bash test/unit.sh
 **Step 5: 提交**
 
 ```bash
-git add uninstall.sh test/unit.sh
+git add uninstall.sh test/unit.sh test/lib.sh install.sh lib/deploy.sh
+# ⚠️ 必须显式设置可执行位：仓库的 core.fileMode=false，
+#    新克隆的仓库里 .sh 全是 100644 → uninstall.sh 不可执行 → 卸载入口是死的。
+#    （install.sh 与 menu_uninstall 另有一道 `-f` 判定 + `exec bash` 兜底，
+#      不依赖这个执行位；但仓库里的脚本【应该】是可执行的。）
+git update-index --chmod=+x uninstall.sh
 git commit -m "feat(uninstall): 停止服务、备份配置、撤销防火墙规则与状态清理"
 ```
+
+#### 修订轮 1 的逐项发现与处置
+
+> 本节由**控制器**在 Task 11 派发前预扫（静态核对 + bash 语义实测 + 沙箱实证）之后写入。
+> 本节列的全是**计划缺陷**，责任方是控制器；Task 11 的代码块本身还没被实施过。
+>
+> 预扫对象：计划 `## Task 11` 段的 Step 1（测试）与 Step 3（实现）代码块。
+> 沙箱底座 = `git archive HEAD` 整棵树（**Task 10 的实施提交** `c83a11b`）
+> + Task 11 的两个新代码块 + 两处定点修订。
+
+| # | 级别 | 发现 | 处置 |
+|---|---|---|---|
+| **T11-1** | **Critical** | **`local ipt_removed=0` 写在【函数外】→ 赋值根本没有发生 → `(( ipt_removed > 0 ))` 在 `set -u` 下报 unbound variable → 卸载脚本在 iptables 分支【中途死亡】（rc=127）。** 此时**服务已停、配置已删**，但防火墙规则没撤、状态没清、也没给用户任何提示 —— 用户看到的是一个「卸载到一半炸了」的现场。<br>**实测证据**：<br>① `bash -c 'local z=0; echo "z=${z:-UNSET}"'` → `bash: local: can only be used in a function` + `z=UNSET`（**赋值没有发生**）<br>② `bash -c 'set -u; unset v; (( v > 0 )); '` → `bash: v: unbound variable`，**rc=127** | Step 3 把它改成**函数内的普通局部变量**；Step 1 补一条断言（iptables 分支能正常走完并返回 0），并用变异 **C6** 把这个缺陷形态原样复现 |
+| T11-2 | ~~非缺陷~~ | **「`ufw status \| grep -q` 会因 SIGPIPE 误判」这条怀疑被实测推翻。** `ufw status` 的输出只有几行，一次 write 就进了管道缓冲，producer 先写完退出 → grep -q 命中即退也不会让它收到 SIGPIPE → 管道 rc=0、条件判定为真、**ufw 分支正常进入**。<br>→ **不登记为缺陷。**（但仍改成「先收进变量再匹配」，与本仓库 `open_firewall` 的既定约定一致 —— 那是**风格**问题，不是 bug） | Step 3 顺手改成先收进变量；**不算缺陷，不进验收标准** |
+| **T11-3** | **Important** | **`nft delete rule inet filter input handle "$local_rule"` 里的 `local_rule` 是【行号】不是 nft 的 handle。** 计划用 `grep -n "tcp dport $PORT" \| head -1 \| cut -d: -f1` 取行号 → nft 的 `handle` 是**规则自身的编号**（要用 `nft -a list chain ...` 才能看到）→ 删除会失败或删错规则。另外 `\| head -1` 又是一个**提前退出的管道**（SIGPIPE 风险）。 | Step 3 改用 `nft -a list chain inet filter input` 抓匹配规则里的 `handle N`，再 `nft delete rule inet filter input handle N`；Step 1 补正反两条断言（用的是 handle 7 / 真的按 handle 删），并用变异 **C5** 复现「拿行号冒充 handle」 |
+| **T11-4** | **Important** | **Step 1 只有 4 条断言，只测了参数解析。** 整个卸载流程（停服务 / 备份 / 删配置 / 撤防火墙 / purge / root 检查）**一条断言都没有** —— 而这是全项目**最危险**的脚本（它会删东西）。与 T9-1、T10-1 同款缺陷 | Step 1 重写：4 → **67 条**（源码 68 个 `assert_*` 调用点，其中 1 个在 `mktemp -d` 失败分支的 `else` 里、正常路径不执行）断言，覆盖 8 个函数的全部分支；**全部 mock**（`systemctl` `ufw` `iptables` `nft` `sysctl` `tui_confirm` `tui_panel` `tui_banner` `tui_init` 全部假实现），**一次网络请求都不发、一次防火墙命令都不执行、一次真服务都不停**；`cp` / `rm` / `mkdir` **不 mock** —— 它们的操作目标全在临时目录里，用真命令跑还能验证「文件真的被删了」而不只是「调用了 rm」 |
+| **T11-5** | **Important** | **`uninstall.sh` 不可被 source → 测试在非 root 机器上根本走不到主流程。** `if [[ ${EUID:-$(id -u)} -ne 0 ]]` 在测试机（非 root）上直接 `exit 1`；而 `EUID` 是 bash **只读**变量，**无法注入**。 | Step 3 改成 `main` 函数 + `BASH_SOURCE[0] == $0` 双条件守卫（与 `install.sh` 同一套，Task 8 已定此约定）→ 测试可 source 后逐个函数测；Step 1 补「非 root 时给出明确提示」等 4 条**源码级**断言（`EUID` 是只读变量，「非 root 时返回非零」这条断言在��机与 Debian 上结果相反，写进单元测试就会让条数随平台漂移） |
+| **T11-6** | **Important** | **`[[ -x "$ROOT_DIR/uninstall.sh" ]]` 的可执行位问题 → 卸载入口是死的。** 实测仓库里**所有** `.sh` 都是 **100644**（`core.fileMode=false`）→ **新克隆的仓库里 `uninstall.sh` 不可执行** → `install.sh --uninstall` 与 `menu_uninstall` 都会判定「当前目录没有 uninstall.sh」→ **用户永远卸载不了**。<br>（`menu_uninstall` 那处在 Task 10 的 Step 3 块里 → 属于**跨任务**的定点修订） | 三处一起改：<br>(a) 作为**定点修订 P1**（`install.sh`）与 **P2**（`lib/deploy.sh` 的 `menu_uninstall`）：`-x` 判定改 `-f`，`exec "$ROOT_DIR/uninstall.sh"` 改 `exec bash "$ROOT_DIR/uninstall.sh"`（**不依赖执行位**）；<br>(b) Task 11 提交时 `git update-index --chmod=+x uninstall.sh` → 提交模式变 **100755** → 新克隆就有执行位；<br>(c) README 统一 `sudo bash install.sh`（Task 13） |
+| T11-7 | Minor | **`rm -f /etc/sysctl.d/99-vless-reality-bbr.conf` 硬编码路径**，而 `enable_bbr` 用的是 `${VLESS_REALITY_SYSCTL_CONF:-/etc/sysctl.d/99-vless-reality-bbr.conf}`。默认一致 ✓，但环境变量覆盖后会**漏删** | Step 3 用同一个变量 |
+| T11-8 | Minor | **`sysctl --system` 会重载 `/etc/sysctl.conf` 里的【全部】设置**，而我们只想撤销自己那一条 | 保留（重载自己的文件必须靠它），但在注释里写明「会连带重载 /etc/sysctl.conf 里的其它设置，通常无害」 |
+| T11-9 | Minor | **systemd unit 文件不会被删除。** `setup_systemd` 不自己写 unit（靠 Xray 安装脚本装），uninstall.sh 只 `systemctl disable --now xray` → **unit 文件残留**。计划只声明了「内核二进制未删除」，**没提 unit** | Step 3 的提示改成「Xray 内核二进制与 systemd unit 未删除」，并给出 `systemctl disable` + 手工删 unit 的指引 |
+| T11-10 | Minor | **`--purge` 只删 `$STATE_FILE`，不删 `$STATE_DIR`**（`/etc/vless-reality`）→ 目录残留。计划原本打算「目录变空就 `rmdir`」—— 但 **`rmdir` 不在运行时白名单里** | Step 3 改成**保留状态目录并明确告知**（「状态目录已保留（如需删除请手工处理）」）—— 目录里可能有用户自己放的东西，擅自删目录比留一个空目录更危险 |
+| T11-11 | Minor | 备份文件名用 `date +%Y%m%d%H%M%S` → **同一秒内两次卸载会覆盖备份** | Step 3 备份名加 PID：`config.json.$(date +%Y%m%d%H%M%S).$$` |
+| T11-12 | Minor | `usage` 写 `sudo ./uninstall.sh` —— 与 T11-6 同源的执行位问题 | Step 3 统一写 `sudo bash uninstall.sh`；文件头注释里说明为什么不能用 `./uninstall.sh` |
+| T11-13 | Minor | 计划里**没有「卸载前确认」**这一步 —— 这是唯一会删用户配置与防火墙规则的脚本 | Step 3 加一步 `tui_confirm`（默认 `n`），并支持 `--yes` / `-y` 跳过；Step 1 补断言 |
+| **T11-14** | **Critical** | **断言库里没有 `assert_not_contains`。** Task 11 的新 Step 1 需要它来证明「某些危险动作【没有】发生」（备份失败时绝不删原配置、用户取消时绝不碰服务与文件）—— 而 `test/lib.sh` 只有 `assert_eq` / `assert_contains` / `assert_status` / `assert_true` / `assert_false` / `assert_succeeds` / `assert_fails`。只断言「包含」区分不了「**根本没做**」与「做了但输出被吞了」 | Step 1 新增**第一块**：给 `test/lib.sh` 末尾追加 `assert_not_contains`（Task 11 的 **Files** 相应补上 `test/lib.sh`） |
+| **T11-15** | **Important** | **mock 的「调用记录」不能走 stdout。** 实现里有几处刻意丢弃外部命令的输出（`systemctl disable --now xray >/dev/null 2>&1`、`ufw delete allow ... >/dev/null 2>&1`）—— 那正是这些命令「成功了但没话说」的正常表现。用 stdout 当记录通道会有两个问题：①「命令被调用过」与「命令自己的输出」混在一起；② 凡是实现里带了 `>/dev/null` 的，记录被吞掉 → 断言「命令被调用过」根本无从观察。 | Step 1 的 mock 集合把调用记录写到**日志文件**（`$T11_LOG`），与「给用户看的提示」（`$out`）分成两条互不干扰的通道；断言「命令被调用过」查日志，断言「提示写对了」查输出 |
+| **T11-16** | **Important** | **测试必须自己造出被测代码依赖的前置文件。** 被测代码用 `[[ -f "$XRAY_CONFIG" ]]` 判断「配置在不在」、用 `[[ -f "$STATE_FILE" ]]` 判断「有没有部署过」—— 文件不存在就直接跳过整段逻辑 → 备份分支与防火墙分支**一条都走不到**，而断言只看输出文本 → 会得到一堆「**看起来像实现有 bug、其实根本没测到**」的红 | Step 1 的 `t11_load` 在临时目录里造出 `$XRAY_CONFIG` / `$STATE_FILE`（内容含 `PORT='443'`）/ `$VLESS_REALITY_SYSCTL_CONF`，并把 `STATE_DIR` / `STATE_FILE` / `XRAY_CONFIG` / `OUT_DIR` 全部**导出**到临时路径 |
+| **T11-17** | **Important** | **`eval "$(t11_load)"` 是【子 shell】→ 被测函数与 mock 全部丢失。** `$(...)` 会在子 shell 里执行 `t11_load`，里面 `source` 进来的 `uninstall.sh` 函数与 `eval` 出来的 mock 全部随子 shell 一起消失 → 每次调用都是 `command not found`（rc=127），而断言大多只看输出文本 → 又是「看似失败、实则没测到」 | Step 1 **直接调用** `t11_load`（不套命令替换），并在注释里写明为什么 |
+| **T11-18** | **Important** | **卸载脚本会 `rm` 真实的系统路径。** `remove_tuning` 删的是 `/etc/sysctl.d/99-vless-reality-bbr.conf` —— 测试若照真路径跑，**会真的删掉开发机上的那个文件** | Step 1 的 `t11_load` 导出 `VLESS_REALITY_SYSCTL_CONF` 指向临时目录，Step 3 用同一个变量（与 `enable_bbr` 一致，见 T11-7）→ 测试既不会碰真文件，又验证了「路径变量与 `enable_bbr` 是同一个」 |
+| **T11-19** | Minor | **Task 10 的验收标准第 6 条写「**24 条变异**」，但它自己逐条列出来的只有 23 条**（A1–A8 = 8 + B1–B3 = 3 + C1–C6 = 6 + D1–D4 = 4 + E1–E2 = 2 = 23）；控制器的 `mut_t10r1.py` 里也正好 **23 个** `mut()` 调用 → 「24」是**计数笔误**。**由实施者如实报告**（它按逐条列举为准，23 条全部实现并全部命中，并明确指出「若确实存在第 24 条变异，它在简报里没有任何描述」） | 本轮顺手改正：Task 10 验收标准第 6 条与「变异判据修正」小节里的「24 条」都改成 **23 条**。⚠️ 只改 Task 10 段 —— Task 7 段里也有一处「**24 条变异**」，那是**历史陈述**（第一版预演 24 条、修订后 32 条），**一个字都不能碰** |
+
+#### 修订轮 1 的定点修订（对 Task 8 / Task 10 产物的精确文本替换）
+
+这两处改的是**别的任务产出的文件**（`install.sh` 是 Task 8 的、`lib/deploy.sh` 里的 `menu_uninstall` 是 Task 10 的）。
+**除此之外，`install.sh` 与 `lib/deploy.sh` 一字不动。**
+
+> 下面四个代码块用 `text` 围栏而不是 `bash` —— 它们是**函数内部的片段**，
+> 单独 `bash -n` 必然报语法错。用 `text` 围栏可以让计划的语法自检脚本跳过它们，
+> 同时**原样**展示要替换的文本。
+
+**P1 —— `install.sh` 的 `--uninstall` 分支：不看执行位**
+
+- 改前：
+
+```text
+    if [[ -x "$ROOT_DIR/uninstall.sh" ]]; then
+      exec "$ROOT_DIR/uninstall.sh"
+    fi
+```
+
+- 改后：
+
+```text
+    # 用 -f 判定而不是 -x：仓库里所有 .sh 的提交模式都是 100644（core.fileMode=false），
+    # 新克隆的仓库里 uninstall.sh 【不可执行】→ -x 永远判成「没有」→ 卸载入口是死的。
+    # 用 `exec bash` 显式执行 → 完全不依赖执行位。
+    if [[ -f "$ROOT_DIR/uninstall.sh" ]]; then
+      exec bash "$ROOT_DIR/uninstall.sh"
+    fi
+```
+
+**P2 —— `lib/deploy.sh` 的 `menu_uninstall`：不看执行位**
+
+- 改前：
+
+```text
+  if [[ ! -x "$ROOT_DIR/uninstall.sh" ]]; then
+    tui_warn "当前目录没有 uninstall.sh（单文件分发版不含卸载脚本）。"
+    tui_tip "请手动执行：systemctl disable --now xray && rm -f $XRAY_CONFIG"
+    return 1
+  fi
+  exec "$ROOT_DIR/uninstall.sh"
+```
+
+- 改后：
+
+```text
+  # 用 -f 判定而不是 -x：仓库里所有 .sh 的提交模式都是 100644（core.fileMode=false），
+  # 新克隆的仓库里 uninstall.sh 【不可执行】→ -x 永远判成「没有」→ 卸载入口是死的。
+  # 用 `exec bash` 显式执行 → 完全不依赖执行位。
+  if [[ ! -f "$ROOT_DIR/uninstall.sh" ]]; then
+    tui_warn "当前目录没有 uninstall.sh（单文件分发版不含卸载脚本）。"
+    tui_tip "请手动执行：systemctl disable --now xray && rm -f $XRAY_CONFIG"
+    return 1
+  fi
+  exec bash "$ROOT_DIR/uninstall.sh"
+```
+
+> ⚠️ **两处替换的命中次数必须【恰好各 1 次】** —— 命中 0 次说明文本对不上，
+> 命中 ≥2 次说明改错了地方。控制器与实施者都要自己核。
+>
+> ⚠️ **代价（与 Task 10 的 P1 / P2 同款）**：改了之后，
+> `install.sh` 不再与计划的 Task 8 Step 3 块逐字节一致、
+> `lib/deploy.sh` 不再与计划的 Task 10 Step 3 块逐字节一致 ——
+> 因此本任务把这两处写成**可机械核对的精确文本替换**，验收标准里逐条点名，
+> 控制器复核时逐条核对。
+
+
+#### 修订轮 1 的验收标准
+
+1. `uninstall.sh` 的内容与下面 **Step 3 代码块逐字节一致**（新建文件）。
+2. `test/lib.sh` 末尾追加的内容与上面 **Step 1 第一块逐字节一致**；
+   `test/unit.sh` 里 Task 11 的插入段与上面 **Step 1 第二块逐字节一致**
+   （追加在 `test_summary` **之前**）。
+3. `install.sh` 的**定点修订 P1** 与上面 P1 的**改后**文本逐字一致；
+   `lib/deploy.sh` 的**定点修订 P2** 与上面 P2 的**改后**文本逐字一致；
+   **除这两处外，Task 8 / Task 10 的 Step 3 块一字未动**。
+   两处替换的**命中次数必须恰好各 1 次**（命中 0 = 文本对不上；命中 ≥2 = 改错地方）。
+4. `uninstall.sh` 的提交模式是 **100755**：`git ls-files -s uninstall.sh` 必须显示 `100755`。
+5. `bash test/unit.sh` 全部通过、退出码 0。
+6. 断言总数必须恒定，且**连跑 4 次条数相同**。
+   ⚠️ **平台差是【三个数】**（构成见 Global Constraints）：
+   本机（Windows + MSYS）**690**、Debian **以 root 运行** **695**、
+   Debian **以非 root 运行** **697**（= GitHub Actions runner 的身份）。
+   （底座 **623** + Task 11 修订轮 1 的 **67**）
+   报告里必须写明「哪个平台 **+ 以什么身份运行**」。
+   ⚠️ Task 11 本轮**没有**新增任何平台相关断言（无 `stat -c '%a'` 的 A 类、
+   无 `chmod 000` + `! -r` 的 B 类）→ 三个数与底座**同增同减**（各 +67）。
+   ⚠️ **「调用点」与「执行数」是两个数**：本轮 Task 11 段源码里有 **68** 个
+   `assert_*` 调用点，其中 **1 个**在 `mktemp -d` 失败分支的 `else` 里
+   （正常路径不执行）→ **实际执行 67 条**。Task 10 段是同一个形态
+   （79 个调用点 / 78 条执行）。报告里必须写清用的是哪个口径。
+7. 红灯证据（**26 条变异**，每条都要贴出**变红的断言原文**）：
+   - A1 把未知参数的退出码从 1 改成 0
+     → 「uninstall 未知参数以非零码退出」必须变红；
+   - A2 去掉 `UNINSTALL_SH_NO_MAIN` 开关
+     → 「uninstall.sh 有「被 source 时不跑 main」的开关」必须变红；
+   - A3 把 root 提示语改掉
+     → 「uninstall.sh 在非 root 时给出明确提示」必须变红；
+   - A4 把 `--help` 的退出码从 0 改成 1
+     → 「uninstall --help 退出码为 0」必须变红；
+   - B1 备份失败不再中止（继续删原配置）
+     → 「备份失败时原配置文件仍在（绝没有被删）」必须变红；
+   - B2 备份目录建不出来不再中止
+     → 「备份目录建不出来时原配置文件仍在」必须变红；
+   - B3 删原配置失败不再报错
+     → 「backup_and_remove_config 在删除原配置失败时返回非零」必须变红；
+   - B4 把 `backup_and_remove_config` 整个退化成空操作
+     → 「备份成功时备份文件真的生成了」必须变红；
+   - C1 ufw 分支不真的删规则
+     → 「revoke_firewall 真的调用了 ufw delete allow」必须变红；
+   - C2 整个 ufw 分支被跳过
+     → 「revoke_firewall 如实报告撤销了 ufw 规则」必须变红；
+   - C3 iptables 分支不数条数
+     → 「revoke_firewall 如实报告撤销的条数」必须变红；
+   - C4 iptables 一条都没有却谎报「已撤销」
+     → 「没有 iptables 规则时如实说明未找到」必须变红；
+   - C5 nft 用**行号**冒充 handle
+     → 「revoke_firewall 用 nft 的 handle（不是行号）删除规则」必须变红；
+   - C6 把 `local ipt_removed=0` 挪到**函数外**（原样复现 T11-1）
+     → 「revoke_firewall 在 iptables 分支正常返回 0」必须变红；
+   - D1 `remove_tuning` 不删调优文件
+     → 「remove_tuning 真的删掉了 sysctl 调优文件」必须变红；
+   - D2 `remove_tuning` 不重载 sysctl
+     → 「remove_tuning 重载了 sysctl」必须变红；
+   - D3 `--purge` 不删状态文件
+     → 「clean_state 在 --purge 下真的删掉了状态文件」必须变红；
+   - D4 不加 `--purge` 也删状态文件
+     → 「不加 --purge 时状态文件仍在」必须变红；
+   - E1 用户取消后仍然继续卸载
+     → 「用户取消时不停止服务」必须变红；
+   - E2 根本不询问就卸载
+     → 「用户取消时给出明确提示」必须变红；
+   - E3 `main` 不停服务
+     → 「main 停用了 xray 服务」必须变红；
+   - E4 `main` 不打印卸载完成
+     → 「main 结束时打印卸载完成」必须变红；
+   - F1 定点修订 P1 失效：`install.sh` 改回 `-x` 判定
+     → 「install.sh 不再用 -x 判定 uninstall.sh」必须变红；
+   - F2 定点修订 P1 失效：`install.sh` 改回 `exec` 裸执行
+     → 「install.sh 用 bash 显式执行 uninstall.sh（不依赖执行位）」必须变红；
+   - F3 定点修订 P2 失效：`menu_uninstall` 改回 `-x` 判定
+     → 「menu_uninstall 不再用 -x 判定 uninstall.sh」必须变红；
+   - F4 定点修订 P2 失效：`menu_uninstall` 改回 `exec` 裸执行
+     → 「menu_uninstall 用 bash 显式执行 uninstall.sh（不依赖执行位）」必须变红。
+8. ⚠️ **变异矩阵的纪律**：
+   - 变异串必须与被测文件的**实际文本逐字一致**，**命中次数 != 1 直接报错**（不静默跳过）；
+   - 每条变异跑出来的**断言总数必须仍等于基线**（证明探针健康，不是「0 条红是因为套件提前挂了」）；
+   - 变红的断言**原文**必须与上面点名的**逐字对上**；
+   - 变异只在**沙箱副本**里做，**仓库工作区全程不被变异**。
+9. 未验证项必须**如实报告**，不得当作已验证：
+   - **Debian 真机 / root 身份**：`EUID` 是 bash 只读特殊变量，本机无法注入 root
+     → `require_root` 的 root 分支只能做**源码级静态断言**，本机跑不到；
+   - **真实的 `ufw` / `iptables` / `nft` 行为**全部被 mock；
+   - **`nft` 的 handle 语义**：本机没有 `nft`，**无法实测** handle 与行号的区别
+     → 只能验证「代码取的是 handle 而不是行号」；
+   - **真实 systemd**（`systemctl disable --now xray`）与**真实备份/删除**在临时目录里跑过，
+     但**真实 `/etc`、真实 `/usr/local/etc/xray/config.json`** 未碰；
+   - **真 TTY 下的 `tui_confirm` 交互**未验证（测试里是 mock）。
+10. 本轮**没有**引入任何新的第三方依赖；`uninstall.sh` 用到的外部命令
+    （`cat` `mkdir` `cp` `rm` `date` `id` `ufw` `iptables` `nft` `systemctl` `sysctl` `awk` `dirname`）
+    **全部在运行时白名单内**。
 
 ---
 
