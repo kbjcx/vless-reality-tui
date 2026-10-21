@@ -3943,6 +3943,129 @@ git commit -m "feat(deploy): 内核安装、systemd、防火墙放行与 BBR 调
   - `render_client_config <outfile> <uuid> <ip> <port> <sni> <pub> <sid>` → 写文件
   - `export_client_artifacts <outdir> <uuid> <ip> <port> <sni> <pub> <sid> <remark>` → 写全部物料，返回 `0`
 
+#### 修订轮 1 的逐项发现与处置
+
+> 本节由**控制器**在 Task 7 派发前预扫（沙箱实证）之后写入。
+> 本节列的全是**计划缺陷**，责任方是控制器；Task 7 的代码块本身还没被实施过。
+>
+> 沙箱底座 = `git archive 911b95a` 整棵树（**Task 6 的实施结果**，含 `test/helpers/`）
+> + Task 7 的两个代码块 → 基线 376 项断言全绿、rc=0（干净基线）。
+>
+> ⚠️ **底座必须是 Task 7 实施时的 HEAD**。控制器第一版预演误用 `c44800a`
+> （Task 5 的实施）→ 漏算 Task 6 的 49 条 → 预期条数算错成 315/319，
+> 真实应为 **376/380**。教训：**预期条数必须由「当前 HEAD 的实测」加上
+> 「本任务新增段的实测条数」得出，不能沿用上一轮的底座数字**。
+
+| # | 级别 | 发现 | 处置 |
+|---|---|---|---|
+| T7-1 | **Important** | **`render_client_config` 有真实注入面。** 它用**未加引号的 heredoc**（`cat >"$tmp" <<EOF`）渲染 JSON → 入参里的 `$(...)` / 反引号会被**真实执行**。控制器实证（P1/P2/P3）：把 `'$(echo PWNED_UUID)'` 传进 UUID、`'`echo PWNED_SNI`'` 传进 SNI、`'$(echo PWNED_PUB)'` 传进公钥 —— **三个都被真实执行**，执行结果被原样写进了 `client.json`。与 Task 5 的 T5-4 同款，但这里的入参更多（6 个） | Step 3 加**入参白名单校验**（必须**先做**）：UUID 规范形态 / 端口 1-65535 / 公钥 base64url 40-64 / ShortID 十六进制 2-16 / SNI 走 `validate_hostname` / 地址走 `is_valid_ip`。任一不合法 → `tui_err` + 返回 1 + **不落盘**。白名单让 6 个入参只可能含安全字符，从根上关死注入面 |
+| T7-2 | **Important** | **非法端口会把 JSON 直接写坏。** 控制器实证（P4）：端口传 `'443; id'` → 渲染出来的 `client.json` **不是合法 JSON** → 客户端拿到的是一份**废文件**，而且服务端没有任何提示 | 同 T7-1 的白名单（端口校验）。Step 1 补断言：非法端口必须被拒，且**不得落盘** |
+| T7-3 | **Important** | **`render_client_config` 一条断言都没有（掏空成 `return 0` → 0 条红）。** 控制器第一版探针用 `^}` 定位函数体，结果**被 heredoc 里行首的 `}` 截断** → 替换后文件语法错 → 整个测试脚本 source 失败 → 0 条红（假阴性）。改用「按函数尾部特征定位」重做后确认：掏空 `render_client_config` → **0 条红** → 真的零覆盖 | Step 1 补断言组：JSON 内容 6 条（socks 1080 / http 1081 / publicKey / serverName / fingerprint / id）+ 注入拒绝 6 条 + 不落盘 1 条 + 目录守卫 2 条 + cat 退出码与错误提示 2 条 + chmod 早于 mv 2 条 + mv 失败 2 条 + 暂存名 `.render` 1 条 |
+| T7-4 | **Important** | **`export_client_artifacts` 的失败路径大面积零覆盖**：把 `mkdir` 失败、`chmod 700` 失败、分享链接为空、`render_client_config` 失败这四处的 `\|\| { tui_err …; return 1; }` 去掉 → 全部 **0 条红**。全局约束「所有失败路径必须以非零退出码结束，且经 `tui_err` 输出」在 Task 7 **完全没有被验证** | Step 1 补断言组：每条都要同时断言**退出码非零**与**错误提示的文本** |
+| T7-5 | Minor | **`build_share_link` 的 `FLOW` / `FINGERPRINT` 全局状态零覆盖**：把 `${FLOW:-…}` / `${FINGERPRINT:-…}` 换成字面量 → **0 条红**（测试里这两个全局变量没被设过 → 走的全是默认值） | Step 1 设了自定义 FLOW/FINGERPRINT 后断言链接里出现它们 |
+| T7-6 | Minor | **`client.txt` 与 `client.json` 里写死了 flow / fp**，与 `build_share_link` 用的全局状态**可能不一致** → 用户照着 `client.txt` 显示的值排查会查错方向 | Step 3 三处统一用 `${FLOW:-xtls-rprx-vision}` / `${FINGERPRINT:-chrome}`；Step 1 补 4 条断言（client.txt 的 flow / fp、client.json 的 flow / fp 四者必须一致） |
+| T7-7 | Minor | **`export_client_artifacts` 的 qrencode 分支零覆盖**：把整个分支删掉 → **0 条红**（既测不到「缺少 qrencode 时明确告知」，也测不到「有 qrencode 时真的生成文件」） | Step 1 补 5 条：缺 qrencode → 仍然成功 + 明确告知；有 qrencode → 成功 + 生成 PNG + 生成终端二维码 |
+| T7-8 | Minor | `render_client_config` 的内部暂存名是 `$outfile.new`，与 `write_config_atomic` 的 `.new` **同名**（与 Task 5 的 T5-10 同款） | Step 3 改成 `$outfile.render`；Step 1 用 mock `mv` 记录参数来钉住 |
+| T7-9 | Minor | `render_client_config` 的 `cat` 的**退出码没检查** → 目标目录不存在时漏出裸的 bash 报错；且 `chmod 600` 写在 `mv` **之后** → 权限失败时文件已落位却返回非零 | Step 3 把 heredoc 包进 `if ! cat >"$tmp" <<EOF … EOF then … fi`；`chmod 600 "$tmp"` 挪到 `mv` **之前**；Step 1 各补 2 条 |
+| T7-10 | Minor | `render_client_config` 没有「目标路径是目录」的守卫 → `mv -f` 会把文件**移进目录里**，返回 0 但配置没落位（与 Task 5 的 D2 同款） | Step 3 加 `[[ -d "$outfile" ]]` 守卫；Step 1 补 2 条 |
+| T7-11 | Minor | Task 7 **没有独立的验收标准段**（Task 3/4/5/6 都有） | 补一个 |
+| T7-12 | Minor | Step 1 里的占位值（`"UUID123"` / `"PUBKEY"`）在加了白名单之后会被拒绝 | Step 1 统一换成**真值**（规范 UUID / 45 位 base64url 公钥），并把相关断言里的期望值一并改掉 |
+| T7-13 | **Important** | **`is_valid_ip` 白名单【零断言】。** 控制器变异：把 Step 3 里的 `is_valid_ip "$ip" \|\| { tui_err "服务器地址非法：$ip"; return 1; }` 删掉 → **0 条红**。原因：Step 1 只测了 UUID / SNI / 公钥 / 端口 / ShortID 五个入参的注入面，**独独漏了 IP** —— 而 IP 同样是**未加引号的 heredoc** 的一部分（`"address": "${ip}"`）→ 同样能被执行 | Step 1 补 1 条：`render_client_config` 拒绝含命令替换的 IP（`'$(echo PWNED_IP)'`）。**六个入参必须一个不落** |
+| T7-14 | Minor | **`client.txt` 的指纹（fp）字段【零断言】。** Step 3 里 `printf '指纹 (fp): %s\n\n' "${FINGERPRINT:-chrome}"` 写死了 fp，但 Step 1 只断言了 client.txt 的 **flow**、client.json 的 **flow 与 fp** —— **client.txt 的 fp 从来没被断言过** | Step 1 补 1 条：`client.txt 显示的指纹与全局状态一致`。**「三个地方显示同一个值」必须三条都断言，只测两条等于没测第三条** |
+| T7-15 | **Important** | **物料文件的写入/权限失败路径【零断言】。** Step 3 里 `client.txt` 与 `link.txt` 的写入与 `chmod 600` 各自都有 `\|\| { tui_err …; return 1; }`（四条），但 Step 1 一条都没测 → 这四条失败路径全部零覆盖。与 T7-4 同款 | Step 1 补 8 条：`client.txt` 写入失败（预置成**目录**让重定向必然失败）、`client.txt` 权限失败、`link.txt` 写入失败、`link.txt` 权限失败，各断言退出码非零 + 提示文本 |
+| T7-16 | **Important** | **`render_client_config` 的 `mv` 失败路径【零断言】。** Step 3 里 `mv -f "$tmp" "$outfile" \|\| { tui_err "无法写入客户端配置：$outfile"; … }` 没有对应的断言 | Step 1 补 2 条（mock `mv` 返回 1）：必须返回非零 + 必须给出「无法写入客户端配置」 |
+| T7-17 | **Important** | **控制器自己写的两条失败路径 mock 太宽 → 「返回非零」那条断言恒绿。** 变异实测：<br>① 把 `mkdir` 的失败分支去掉 → 红的**不是**「在目录创建失败时返回非零」，而是「在目录创建失败时**给出明确提示**」—— 因为 mock 的 `mkdir() { return 1; }` 让目录**根本没建出来** → 后面 `chmod 700` 也失败 → 函数照样返回非零；<br>② 把 `chmod 700` 的失败分支去掉 → 同样只有「给出明确提示」变红 —— 因为 mock 的 `chmod() { return 1; }` 让 `render_client_config` 内部的 `chmod 600` 也失败 → 提前从别的分支返回非零 | Step 1 改用**精确到参数**的 mock：① `mkdir() { command mkdir "$@"; return 1; }` —— 目录**真的建出来**但返回失败码 → 只有 mkdir 这一条路径能导致非零；② `chmod() { if [[ "$1" == "700" ]]; then return 1; fi; command chmod "$@"; }` —— 只让**目录的 700** 失败，文件级的 600 正常。**教训：mock 必须精确到「只有这一条路径能决定退出码」，否则断言的判别力落空**（本项目已在 T6-10 栽过一次同款） |
+| T7-18 | Minor | **预演底座用错 → 预期条数算错。** 控制器第一版预演用 `git archive c44800a`（Task 5 的实施）→ 基线 315 项 → 验收标准写成「本机 315 / Debian·CI 319」。但 Task 6 的实施已把 49 条断言落进 `test/unit.sh` → **真实基线是 309** | 全部改用 `911b95a` 重做预演：基线 **376** 项全绿（309 + Task 7 新增 67）。验收标准的预期条数改为 **本机 376 / Debian·CI 380**（差 4 条 = Task 3/4 的权限位断言在 MSYS 上被跳过） |
+
+> **控制器的自我记账**：本轮第一版预演的 **24 条变异**里有 **3 条**没打中点名的断言，
+> 全部是**测试侧**的问题（不是实现侧）：
+> ① **B6 恒真** → 暴露了 T7-13（IP 白名单零断言）；
+> ② **D1/D2 打错断言** → 暴露了 T7-17（mock 太宽）；
+> ③ **B8 的变异模式本身写错**（把 `if ! cat` 改成 `cat` 后 heredoc 的
+> `then`/`fi` 结构对不上 → 整个文件语法错 → 40 条红但**没有一条是点名的**）。
+> 教训与 Task 7 预扫第一版一样：**变异模式写错时，「红了几条」是误导信号** ——
+> 必须核对「点名的断言是否【逐字】出现在变红列表里」。
+> 修法：变异矩阵的每个用例都必须声明 `expect`（点名的断言原文），
+> 打完必须报告「命中 / 未命中」，未命中即视为**变异没生效**而不是「断言恒真」。
+>
+> **修订后的 32 条变异实测结果（控制器在 `911b95a` 底座上跑的完整矩阵）**：
+> 基线 376 项全绿 rc=0 → **32 条变异全部 ✔ 命中点名的断言**，
+> **0 条恒真、0 条未命中** → 还原后 rc=0 红=0。
+> 覆盖：3 条「函数整体掏空」（分别 32 / 51 / 26 条红）、
+> 12 条白名单与落位、6 条 flow/fp 一致性、11 条 export 失败路径与二维码。
+
+
+#### 修订轮 1 的验收标准
+
+1. `lib/client.sh` 的内容与下面 **Step 3 代码块逐字节一致**。
+2. `test/unit.sh` 里 Task 7 的插入段与下面 **Step 1 代码块逐字节一致**
+   （追加在 `test_summary` **之前**；`source "$ROOT/lib/client.sh"` 放在顶部 source 区域）。
+3. `bash test/unit.sh` 全部通过、退出码 0。
+4. 断言总数必须恒定，且**连跑 4 次条数相同**。
+   平台差异：本机（Windows + MSYS）与 Debian/CI 的条数差 **4 条** ——
+   4 条权限相关行为断言在 MSYS 上被自动跳过（`chmod` 是模拟的）。
+   报告里必须写明是哪个平台的数字。
+   **预期条数**：本机 **376**、Debian/CI **380**
+   （底座 309 + Task 7 修订轮 1 的 67）。
+5. 红灯证据（**至少这 25 条**，每条都要贴出**变红的断言原文**）：
+   - 删掉 `render_client_config` 的 **UUID** 白名单
+     → 「render_client_config 拒绝含命令替换的 UUID」必须变红；
+   - 删掉 **端口** 白名单
+     → 「render_client_config 拒绝非法端口」必须变红；
+   - 删掉 **公钥** 白名单
+     → 「render_client_config 拒绝含命令替换的公钥」必须变红；
+   - 删掉 **ShortID** 白名单
+     → 「render_client_config 拒绝含命令替换的 ShortID」必须变红；
+   - 删掉 **SNI** 白名单
+     → 「render_client_config 拒绝含命令替换的 SNI」必须变红；
+   - 删掉 **IP** 白名单
+     → 「render_client_config 拒绝含命令替换的 IP」必须变红；
+   - 删掉 `render_client_config` 的 `[[ -d "$outfile" ]]` 守卫
+     → 「render_client_config 在目标路径是目录时返回非零」必须变红；
+   - 把 `render_client_config` 里 `cat` 的退出码检查去掉
+     → 「render_client_config 在目标目录不存在时给出自己的错误提示（而不是裸的 bash 报错）」必须变红；
+   - 把 `render_client_config` 里 `chmod 600 "$tmp"` 挪到 `mv` 之后
+     → 「render_client_config 在 chmod 失败时不得落位（chmod 必须早于 mv）」必须变红；
+   - 把 `render_client_config` 的暂存名 `.render` 改回 `.new`
+     → 「render_client_config 的暂存名必须是 .render（不得与 write_config_atomic 的 .new 撞名）」必须变红；
+   - 把 `render_client_config` 里 `mv` 的失败分支去掉
+     → 「render_client_config 在 mv 失败时返回非零」必须变红；
+   - 把 `build_share_link` 的 `${FLOW:-…}` 换成字面量
+     → 「build_share_link 使用全局 FLOW 而不是写死」必须变红；
+   - 把 `build_share_link` 的 `${FINGERPRINT:-…}` 换成字面量
+     → 「build_share_link 使用全局 FINGERPRINT 而不是写死」必须变红；
+   - 把 `client.json` 里的 flow 换成字面量
+     → 「client.json 的流控与全局状态一致」必须变红；
+   - 把 `client.json` 里的 fp 换成字面量
+     → 「client.json 的指纹与全局状态一致」必须变红；
+   - 把 `client.txt` 里的 flow 换成字面量
+     → 「client.txt 显示的流控与全局状态一致」必须变红；
+   - 把 `client.txt` 里的 fp 换成字面量
+     → 「client.txt 显示的指纹与全局状态一致」必须变红；
+   - 把 `export_client_artifacts` 的 `mkdir` 失败分支去掉
+     → 「export_client_artifacts 在目录创建失败时返回非零」必须变红；
+   - 把 `export_client_artifacts` 的 `chmod 700` 失败分支去掉
+     → 「export_client_artifacts 在目录权限设置失败时返回非零」必须变红；
+   - 把 `export_client_artifacts` 的「分享链接为空」检查去掉
+     → 「export_client_artifacts 在分享链接为空时返回非零」必须变红；
+   - 把 `export_client_artifacts` 里 `render_client_config … || return 1` 的 `|| return 1` 去掉
+     → 「export_client_artifacts 在客户端配置渲染失败时返回非零」必须变红；
+   - 把 `export_client_artifacts` 里 `client.txt` 的写入失败分支去掉
+     → 「export_client_artifacts 在客户端信息文件写入失败时返回非零」必须变红；
+   - 把 `export_client_artifacts` 里 `client.txt` 的 chmod 失败分支去掉
+     → 「export_client_artifacts 在客户端信息文件权限设置失败时返回非零」必须变红；
+   - 把 `export_client_artifacts` 里 `link.txt` 的写入失败分支去掉
+     → 「export_client_artifacts 在分享链接文件写入失败时返回非零」必须变红；
+   - 把 `export_client_artifacts` 里 `link.txt` 的 chmod 失败分支去掉
+     → 「export_client_artifacts 在分享链接文件权限设置失败时返回非零」必须变红；
+   - 把 `export_client_artifacts` 的整个 qrencode 分支删掉
+     → 「export_client_artifacts 在没有 qrencode 时明确告知」必须变红。
+   ⚠️ **点名的断言必须与预演结果里【实际变红的那一条】逐字对上**，不能只看「红了几条」。
+   ⚠️ 「正向断言（期望码 0）」在把函数换成 `return 0` 时**不会变红** ——
+   真正变红的是它的**反向断言**（本项目已栽过 F4-16 / T5-12 / T6-19 / T6-21 / T6-22 **五次**）。
+6. `lib/tui.sh`、`test/lib.sh`、`lib/core.sh`、`lib/deploy.sh`、Task 5 段、Task 6 段 **一字未动**。
+7. 计划文件实施者一个字都不许改。
+
 **Step 1: 写失败的测试**
 
 追加到 `test/unit.sh`（`source "$ROOT/lib/client.sh"` 一行放在**顶部 source 区域**）：
@@ -3950,24 +4073,50 @@ git commit -m "feat(deploy): 内核安装、systemd、防火墙放行与 BBR 调
 ```bash
 test_case "分享链接与客户端配置"
 
-link=$(build_share_link "UUID123" "1.2.3.4" "443" "www.microsoft.com" "PUBKEY" "a1b2c3d4" "我的节点")
-assert_contains "$link" "vless://UUID123@1.2.3.4:443" "链接含协议与地址"
+# 有效的入参（必须能通过 render_client_config 的白名单校验）：
+#   UUID 规范形态 / 端口 1-65535 / 公钥 base64url 40-64 / ShortID 十六进制 2-16 /
+#   SNI 合法主机名 / IP 合法。
+# 原来的用例用的是 "UUID123" / "PUBKEY" 这类占位串 —— 加了白名单之后它们会被拒绝，
+# 所以这里统一换成【真值】。
+T7_UUID='11111111-2222-3333-4444-555555555555'
+T7_IP='1.2.3.4'
+T7_PORT='443'
+T7_SNI='www.microsoft.com'
+T7_PUB='PRIVKEY0123456789abcdefghijklmnopqrstuvwxyzABCDE'
+T7_SID='a1b2c3d4'
+T7_REMARK='我的节点'
+
+link=$(build_share_link "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" "$T7_REMARK")
+assert_contains "$link" "vless://$T7_UUID@$T7_IP:$T7_PORT" "链接含协议与地址"
 assert_contains "$link" "encryption=none" "链接含 encryption"
 assert_contains "$link" "flow=xtls-rprx-vision" "链接含 flow"
 assert_contains "$link" "security=reality" "链接含 security=reality"
-assert_contains "$link" "sni=www.microsoft.com" "链接含 sni"
+assert_contains "$link" "sni=$T7_SNI" "链接含 sni"
 assert_contains "$link" "fp=chrome" "链接含指纹"
-assert_contains "$link" "pbk=PUBKEY" "链接含公钥 pbk"
-assert_contains "$link" "sid=a1b2c3d4" "链接含 shortId"
+assert_contains "$link" "pbk=$T7_PUB" "链接含公钥 pbk"
+assert_contains "$link" "sid=$T7_SID" "链接含 shortId"
 assert_contains "$link" "type=tcp" "链接含传输协议"
 assert_contains "$link" "%E6%88%91%E7%9A%84%E8%8A%82%E7%82%B9" "备注被 URL 编码"
 
-# 同上：mktemp 失败时路径为空会写出 ".new" 污染仓库 → 必须守卫。
+# IPv6 地址在分享链接里必须加方括号，否则客户端导入即废。
+link6=$(build_share_link "$T7_UUID" "2001:db8::1" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" "v6")
+assert_contains "$link6" "@[2001:db8::1]:$T7_PORT" "IPv6 地址在分享链接里加了方括号"
+
+# ── FLOW / FINGERPRINT 是【全局状态】，不能被写死 ──────────────
+# 变异实测：把 ${FLOW:-…} / ${FINGERPRINT:-…} 换成字面量 → 0 条红。
+_saved_flow="${FLOW:-}"; _saved_fp="${FINGERPRINT:-}"
+FLOW='xtls-rprx-vision-alt'; FINGERPRINT='firefox'
+linkg=$(build_share_link "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" "$T7_REMARK")
+assert_contains "$linkg" "flow=xtls-rprx-vision-alt" "build_share_link 使用全局 FLOW 而不是写死"
+assert_contains "$linkg" "fp=firefox" "build_share_link 使用全局 FINGERPRINT 而不是写死"
+FLOW="$_saved_flow"; FINGERPRINT="$_saved_fp"
+
+# 同上：mktemp 失败时路径为空会写出 ".render" 污染仓库 → 必须守卫。
 ccfg=$(mktemp)
 if [[ -z "$ccfg" ]]; then
   assert_eq "mktemp 能创建临时文件" "失败（mktemp 返回空路径）" "客户端渲染用例前提：mktemp 必须可用"
 else
-render_client_config "$ccfg" "UUID123" "1.2.3.4" "443" "www.microsoft.com" "PUBKEY" "a1b2c3d4" >/dev/null
+render_client_config "$ccfg" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" >/dev/null
 # 判活用【功能可用】而不是 have_cmd（见 Task 5 处的同一条说明）。
 if python3 -c 'import json' >/dev/null 2>&1; then
   assert_status 0 "$(python3 -c "import json,sys;json.load(open(sys.argv[1]));print(0)" "$ccfg" 2>/dev/null || echo 1)" "客户端配置是合法 JSON"
@@ -3978,25 +4127,166 @@ else
 fi
 assert_contains "$(cat "$ccfg")" '"port": 1080' "客户端含 socks 入站 1080"
 assert_contains "$(cat "$ccfg")" '"port": 1081' "客户端含 http 入站 1081"
-assert_contains "$(cat "$ccfg")" '"publicKey": "PUBKEY"' "客户端含公钥"
-assert_contains "$(cat "$ccfg")" '"serverName": "www.microsoft.com"' "客户端含 serverName"
+assert_contains "$(cat "$ccfg")" '"publicKey": "'"$T7_PUB"'"' "客户端含公钥"
+assert_contains "$(cat "$ccfg")" '"serverName": "'"$T7_SNI"'"' "客户端含 serverName"
 assert_contains "$(cat "$ccfg")" '"fingerprint": "chrome"' "客户端含 fingerprint"
-rm -f "$ccfg"
+assert_contains "$(cat "$ccfg")" '"id": "'"$T7_UUID"'"' "客户端含 UUID"
+
+# ── 注入面：未加引号的 heredoc 会【执行】入参里的 $(...) / 反引号 ──────────────
+# 控制器实证：把 '$(echo PWNED_UUID)' 传进 UUID、'`echo PWNED_SNI`' 传进 SNI、
+# '$(echo PWNED_PUB)' 传进公钥 —— 三个都被【真实执行】，执行结果被写进了 client.json。
+# 非法端口（"443; id"）还会把 JSON 【直接写坏】→ 客户端拿到的是废文件。
+# 处置：函数自身加白名单校验（Step 3），入参不合法时返回 1 且【不落盘】。
+rc=0
+render_client_config "$ccfg.inj.uuid" '$(echo PWNED_UUID)' "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" >/dev/null 2>&1 || rc=$?
+assert_status 1 "$rc" "render_client_config 拒绝含命令替换的 UUID"
+rc=0
+render_client_config "$ccfg.inj.sni" "$T7_UUID" "$T7_IP" "$T7_PORT" 'x$(echo PWNED_SNI).com' "$T7_PUB" "$T7_SID" >/dev/null 2>&1 || rc=$?
+assert_status 1 "$rc" "render_client_config 拒绝含命令替换的 SNI"
+rc=0
+render_client_config "$ccfg.inj.pub" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" '$(echo PWNED_PUB)' "$T7_SID" >/dev/null 2>&1 || rc=$?
+assert_status 1 "$rc" "render_client_config 拒绝含命令替换的公钥"
+rc=0
+render_client_config "$ccfg.inj.port" "$T7_UUID" "$T7_IP" '443; id' "$T7_SNI" "$T7_PUB" "$T7_SID" >/dev/null 2>&1 || rc=$?
+assert_status 1 "$rc" "render_client_config 拒绝非法端口"
+rc=0
+render_client_config "$ccfg.inj.sid" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" 'zz; id' >/dev/null 2>&1 || rc=$?
+assert_status 1 "$rc" "render_client_config 拒绝含命令替换的 ShortID"
+# IP 也是【未加引号的 heredoc】的一部分 → 同样能被执行 → 必须也走白名单。
+rc=0
+render_client_config "$ccfg.inj.ip" "$T7_UUID" '$(echo PWNED_IP)' "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" >/dev/null 2>&1 || rc=$?
+assert_status 1 "$rc" "render_client_config 拒绝含命令替换的 IP"
+# 拒绝时【不得落盘】：否则半截/被污染的配置会留在磁盘上。
+if [[ -e "$ccfg.inj.uuid" || -e "$ccfg.inj.port" || -e "$ccfg.inj.ip" ]]; then leaked=1; else leaked=0; fi
+assert_eq "0" "$leaked" "render_client_config 拒绝非法入参时不得落盘"
+
+# ── 目标路径是【已存在的目录】时必须报错（mv 会把文件移进目录里）──────────────
+mkdir -p "$ccfg.dir"
+out=$(render_client_config "$ccfg.dir" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" 2>&1); rc=$?
+assert_status 1 "$rc" "render_client_config 在目标路径是目录时返回非零"
+assert_contains "$out" "目录" "render_client_config 在目标路径是目录时给出明确提示"
+
+# ── 目标目录不存在时必须给出【我们自己的】提示（而不是裸的 bash 报错）────────────
+out=$(render_client_config "$ccfg.d/no-such-dir/client.json" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" 2>&1); rc=$?
+assert_status 1 "$rc" "render_client_config 在目标目录不存在时返回非零"
+assert_contains "$out" "无法写入配置暂存文件" "render_client_config 在目标目录不存在时给出自己的错误提示（而不是裸的 bash 报错）"
+
+# ── chmod 必须【早于】mv ──────────────
+# 权限设置失败时文件已经落位 → 函数返回非零但磁盘上多了一份权限不对的配置。
+out=$( ( chmod() { return 1; }; render_client_config "$ccfg.perm" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" 2>&1 ) ); rc=$?
+assert_status 1 "$rc" "render_client_config 在 chmod 失败时返回非零"
+if [[ -e "$ccfg.perm" ]]; then landed=1; else landed=0; fi
+assert_eq "0" "$landed" "render_client_config 在 chmod 失败时不得落位（chmod 必须早于 mv）"
+
+# ── mv 失败必须报错（不得静默成功）──────────────
+out=$( ( mv() { return 1; }; render_client_config "$ccfg.mvf" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" 2>&1 ) ); rc=$?
+assert_status 1 "$rc" "render_client_config 在 mv 失败时返回非零"
+assert_contains "$out" "无法写入客户端配置" "render_client_config 在 mv 失败时给出明确提示"
+
+# ── 内部暂存名必须是 .render（不得与 write_config_atomic 的 .new 撞名）────────────
+mv_log="$ccfg.mvlog"
+: > "$mv_log"
+out=$( ( mv() { printf '%s\n' "$*" >> "$mv_log"; command mv "$@"; }
+         render_client_config "$ccfg.mv" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" 2>&1 ) ); rc=$?
+assert_status 0 "$rc" "render_client_config 渲染到指定路径成功"
+assert_eq "1" "$(grep -Fc "$ccfg.mv.render" "$mv_log" 2>/dev/null || printf 0)" \
+  "render_client_config 的暂存名必须是 .render（不得与 write_config_atomic 的 .new 撞名）"
+
+rm -f "$ccfg" "$ccfg.inj.uuid" "$ccfg.inj.sni" "$ccfg.inj.pub" "$ccfg.inj.port" "$ccfg.inj.sid" \
+      "$ccfg.inj.ip" "$ccfg.perm" "$ccfg.mv" "$ccfg.mvlog" "$ccfg.mvf"
+rm -rf "$ccfg.dir"
 fi
 
 test_case "客户端物料导出"
 
-# export_client_artifacts 此前【完全没有测试】—— 而它正是产出分享链接的函数。
+# export_client_artifacts 此前【几乎没有测试】—— 而它正是产出分享链接的函数。
 exp_dir=$(mktemp -d 2>/dev/null)
 if [[ -n "$exp_dir" ]]; then
-  out=$( export_client_artifacts "$exp_dir" "UUID123" "1.2.3.4" "443" "www.microsoft.com" "PUBKEY" "a1b2c3d4" "我的节点" 2>&1 ); rc=$?
+  out=$( export_client_artifacts "$exp_dir" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" "$T7_REMARK" 2>&1 ); rc=$?
   assert_status 0 "$rc" "export_client_artifacts 成功返回 0"
-  assert_contains "$(cat "$exp_dir/link.txt" 2>/dev/null)" "vless://UUID123@1.2.3.4:443" "link.txt 含分享链接"
-  assert_contains "$(cat "$exp_dir/client.txt" 2>/dev/null)" "UUID: UUID123" "client.txt 含 UUID"
+  assert_contains "$(cat "$exp_dir/link.txt" 2>/dev/null)" "vless://$T7_UUID@$T7_IP:$T7_PORT" "link.txt 含分享链接"
+  assert_contains "$(cat "$exp_dir/client.txt" 2>/dev/null)" "UUID: $T7_UUID" "client.txt 含 UUID"
   # 备注不出现在 client.txt 的明文字段里（只作为分享链接的 fragment，URL 编码后出现）
   assert_contains "$(cat "$exp_dir/client.txt" 2>/dev/null)" "%E6%88%91%E7%9A%84%E8%8A%82%E7%82%B9" "client.txt 的分享链接里备注被 URL 编码"
   if [[ -s "$exp_dir/client.json" ]]; then jf=1; else jf=0; fi
   assert_eq "1" "$jf" "client.json 已生成且非空"
+
+  # ── client.txt 里显示的 flow / fp 必须与实际配置一致 ──────────────
+  # 原来这里写死了 "xtls-rprx-vision" / "chrome" → 与 build_share_link 用的全局状态
+  # 可能不一致 → 用户照着显示的值排查会查错方向。
+  _saved_flow="${FLOW:-}"; _saved_fp="${FINGERPRINT:-}"
+  FLOW='xtls-rprx-vision-alt'; FINGERPRINT='firefox'
+  out=$( export_client_artifacts "$exp_dir/g" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" "$T7_REMARK" 2>&1 ); rc=$?
+  assert_status 0 "$rc" "export_client_artifacts 在自定义 flow/fp 时成功"
+  assert_contains "$(cat "$exp_dir/g/client.txt" 2>/dev/null)" "流控 (flow): xtls-rprx-vision-alt" "client.txt 显示的流控与全局状态一致"
+  assert_contains "$(cat "$exp_dir/g/client.txt" 2>/dev/null)" "指纹 (fp): firefox" "client.txt 显示的指纹与全局状态一致"
+  assert_contains "$(cat "$exp_dir/g/client.json" 2>/dev/null)" '"flow": "xtls-rprx-vision-alt"' "client.json 的流控与全局状态一致"
+  assert_contains "$(cat "$exp_dir/g/client.json" 2>/dev/null)" '"fingerprint": "firefox"' "client.json 的指纹与全局状态一致"
+  FLOW="$_saved_flow"; FINGERPRINT="$_saved_fp"
+
+  # ── 二维码：缺 qrencode 时明确告知；有 qrencode 时真的生成文件 ──────────────
+  out=$( ( have_cmd() { case "$1" in qrencode) return 1 ;; *) return 0 ;; esac; }
+           export_client_artifacts "$exp_dir/noqr" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" "$T7_REMARK" 2>&1 ) ); rc=$?
+  assert_status 0 "$rc" "export_client_artifacts 在没有 qrencode 时仍然成功"
+  assert_contains "$out" "未安装 qrencode" "export_client_artifacts 在没有 qrencode 时明确告知"
+  out=$( ( have_cmd() { case "$1" in qrencode) return 0 ;; *) return 0 ;; esac; }
+           qrencode() { local prev='' a; for a in "$@"; do
+                          if [[ "$prev" == "-o" ]]; then printf 'QR' > "$a"; fi
+                          prev="$a"; done; return 0; }
+           export_client_artifacts "$exp_dir/qr" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" "$T7_REMARK" 2>&1 ) ); rc=$?
+  assert_status 0 "$rc" "export_client_artifacts 在有 qrencode 时成功"
+  if [[ -s "$exp_dir/qr/qrcode.png" ]]; then q1=1; else q1=0; fi
+  assert_eq "1" "$q1" "export_client_artifacts 在有 qrencode 时生成 PNG 二维码"
+  if [[ -s "$exp_dir/qr/qrcode.txt" ]]; then q2=1; else q2=0; fi
+  assert_eq "1" "$q2" "export_client_artifacts 在有 qrencode 时生成终端二维码"
+
+  # ── 四条失败路径：每一条都必须返回非零并给出自己的提示 ──────────────
+  # 全局约束：所有失败路径必须以非零退出码结束，且经 tui_err 输出。
+  #
+  # ⚠️ mock 的写法很关键（控制器实测踩过坑）：
+  #   · mkdir 的 mock 必须【真的把目录建出来】再返回失败 —— 否则目录不存在 →
+  #     后面 chmod 也会失败 → 函数照样返回非零 → 「返回非零」那条断言恒绿，
+  #     真正变红的只有「给出明确提示」那条（判别力落空）。
+  #   · chmod 的 mock 必须【只对 700 失败】—— 否则 render_client_config 内部的
+  #     chmod 600 也会失败 → 提前从别的分支返回非零 → 同样把「返回非零」那条
+  #     断言变成恒绿。
+  out=$( ( mkdir() { command mkdir "$@"; return 1; }
+           export_client_artifacts "$exp_dir/mk" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" "$T7_REMARK" 2>&1 ) ); rc=$?
+  assert_status 1 "$rc" "export_client_artifacts 在目录创建失败时返回非零"
+  assert_contains "$out" "无法创建客户端导出目录" "export_client_artifacts 在目录创建失败时给出明确提示"
+  out=$( ( chmod() { if [[ "$1" == "700" ]]; then return 1; fi; command chmod "$@"; }
+           export_client_artifacts "$exp_dir/cm" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" "$T7_REMARK" 2>&1 ) ); rc=$?
+  assert_status 1 "$rc" "export_client_artifacts 在目录权限设置失败时返回非零"
+  assert_contains "$out" "无法设置客户端导出目录权限" "export_client_artifacts 在目录权限设置失败时给出明确提示"
+  out=$( ( build_share_link() { printf ''; }
+           export_client_artifacts "$exp_dir/lk" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" "$T7_REMARK" 2>&1 ) ); rc=$?
+  assert_status 1 "$rc" "export_client_artifacts 在分享链接为空时返回非零"
+  assert_contains "$out" "分享链接生成为空" "export_client_artifacts 在分享链接为空时给出明确提示"
+  out=$( ( render_client_config() { return 1; }
+           export_client_artifacts "$exp_dir/rc" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" "$T7_REMARK" 2>&1 ) ); rc=$?
+  assert_status 1 "$rc" "export_client_artifacts 在客户端配置渲染失败时返回非零"
+
+  # ── 物料文件的写入/权限失败路径同样必须报错（不得静默成功）──────────────
+  # 让 client.txt 先是一个【目录】→ 重定向必然失败。
+  mkdir -p "$exp_dir/fw/client.txt"
+  out=$( export_client_artifacts "$exp_dir/fw" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" "$T7_REMARK" 2>&1 ); rc=$?
+  assert_status 1 "$rc" "export_client_artifacts 在客户端信息文件写入失败时返回非零"
+  assert_contains "$out" "无法写入客户端信息文件" "export_client_artifacts 在客户端信息文件写入失败时给出明确提示"
+  # chmod 只对 client.txt 失败 → 其余 chmod 正常 → 退出码只由这一条路径决定。
+  out=$( ( chmod() { case "$2" in "$exp_dir/cmt/client.txt") return 1 ;; esac; command chmod "$@"; }
+           export_client_artifacts "$exp_dir/cmt" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" "$T7_REMARK" 2>&1 ) ); rc=$?
+  assert_status 1 "$rc" "export_client_artifacts 在客户端信息文件权限设置失败时返回非零"
+  assert_contains "$out" "无法设置客户端信息文件权限" "export_client_artifacts 在客户端信息文件权限设置失败时给出明确提示"
+  # 让 link.txt 先是一个【目录】→ 重定向必然失败。
+  mkdir -p "$exp_dir/fw2/link.txt"
+  out=$( export_client_artifacts "$exp_dir/fw2" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" "$T7_REMARK" 2>&1 ); rc=$?
+  assert_status 1 "$rc" "export_client_artifacts 在分享链接文件写入失败时返回非零"
+  assert_contains "$out" "无法写入分享链接文件" "export_client_artifacts 在分享链接文件写入失败时给出明确提示"
+  out=$( ( chmod() { case "$2" in "$exp_dir/cml/link.txt") return 1 ;; esac; command chmod "$@"; }
+           export_client_artifacts "$exp_dir/cml" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" "$T7_REMARK" 2>&1 ) ); rc=$?
+  assert_status 1 "$rc" "export_client_artifacts 在分享链接文件权限设置失败时返回非零"
+  assert_contains "$out" "无法设置分享链接文件权限" "export_client_artifacts 在分享链接文件权限设置失败时给出明确提示"
+
   # 权限位：只在 chmod 真的生效的文件系统上断言（MSYS 模拟 chmod，会自动跳过）
   exp_probe="$exp_dir/.probe"
   : >"$exp_probe"
@@ -4011,10 +4301,6 @@ else
     "export_client_artifacts 用例前提：mktemp -d 必须能创建唯一临时目录"
 fi
 rm -rf "$exp_dir"
-
-# IPv6 地址在分享链接里必须加方括号，否则客户端导入即废。
-link6=$(build_share_link "UUID123" "2001:db8::1" "443" "www.microsoft.com" "PUBKEY" "a1b2c3d4" "v6")
-assert_contains "$link6" "@[2001:db8::1]:443" "IPv6 地址在分享链接里加了方括号"
 ```
 
 **Step 2: 运行测试确认失败**
@@ -4051,8 +4337,32 @@ build_share_link() {
 
 render_client_config() {
   local outfile="$1" uuid="$2" ip="$3" port="$4" sni="$5" pub="$6" sid="$7"
-  local tmp="$outfile.new"
-  cat >"$tmp" <<EOF
+  # ── 入参白名单校验（必须【先做】）────────────────────────────
+  # 本函数用【未加引号的 heredoc】渲染 JSON → 入参里的 $(...) / 反引号会被
+  # 【真实执行】。控制器实证：把 '$(echo PWNED_UUID)' 传进 UUID、
+  # '`echo PWNED_SNI`' 传进 SNI、'$(echo PWNED_PUB)' 传进公钥
+  # —— 三个都被【真实执行】，执行结果被原样写进了 client.json。
+  # 而且非法端口（"443; id"）会把 JSON 【直接写坏】→ 客户端拿到的是废文件。
+  # 白名单让 6 个入参只可能含有安全字符，从根上关死注入面。
+  [[ "$uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] \
+    || { tui_err "UUID 格式非法：$uuid"; return 1; }
+  [[ "$port" =~ ^[0-9]{1,5}$ ]] && [[ "$port" -ge 1 && "$port" -le 65535 ]] \
+    || { tui_err "端口非法：$port"; return 1; }
+  [[ "$pub" =~ ^[A-Za-z0-9_-]{40,64}$ ]] \
+    || { tui_err "REALITY 公钥格式非法（只允许 base64url 字符，长度 40-64）"; return 1; }
+  [[ "$sid" =~ ^[0-9a-fA-F]{2,16}$ ]] \
+    || { tui_err "ShortID 格式非法（只允许十六进制，长度 2-16）：$sid"; return 1; }
+  validate_hostname "$sni" || { tui_err "SNI 主机名非法：$sni"; return 1; }
+  is_valid_ip "$ip" || { tui_err "服务器地址非法：$ip"; return 1; }
+  # 目标路径如果是【已存在的目录】：`mv -f "$tmp" "$outfile"` 会把文件移进目录里
+  # → mv 返回 0（看起来成功）但配置根本没落到 outfile → 调用方以为渲染成功。
+  [[ -d "$outfile" ]] && { tui_err "目标路径是目录，不能作为配置文件：$outfile"; return 1; }
+  # 内部暂存名用 ".render" 后缀，与 write_config_atomic 的 ".new" 区分开，
+  # 避免两者在同一条路径上撞名。
+  local tmp="$outfile.render"
+  # cat 的退出码必须检查：目标目录不存在时，重定向失败会漏出原始 bash 报错，
+  # 用户看到的是「No such file or directory」而不是我们自己的提示。
+  if ! cat >"$tmp" <<EOF
 {
   "log": {
     "loglevel": "warning"
@@ -4088,7 +4398,7 @@ render_client_config() {
               {
                 "id": "${uuid}",
                 "encryption": "none",
-                "flow": "xtls-rprx-vision",
+                "flow": "${FLOW:-xtls-rprx-vision}",
                 "level": 0
               }
             ]
@@ -4099,7 +4409,7 @@ render_client_config() {
         "network": "tcp",
         "security": "reality",
         "realitySettings": {
-          "fingerprint": "chrome",
+          "fingerprint": "${FINGERPRINT:-chrome}",
           "serverName": "${sni}",
           "publicKey": "${pub}",
           "shortId": "${sid}",
@@ -4132,8 +4442,15 @@ render_client_config() {
   }
 }
 EOF
+  then
+    tui_err "无法写入配置暂存文件：$tmp"
+    rm -f "$tmp"
+    return 1
+  fi
+  # 含 UUID 与公钥 → 600。必须在 mv 之前设好：
+  # 否则「权限设置失败」时文件已经落位，函数却返回非零。
+  chmod 600 "$tmp" || { tui_err "无法设置暂存文件权限：$tmp"; rm -f "$tmp"; return 1; }
   mv -f "$tmp" "$outfile" || { tui_err "无法写入客户端配置：$outfile"; rm -f "$tmp"; return 1; }
-  chmod 600 "$outfile" || { tui_err "无法设置客户端配置权限：$outfile"; return 1; }
 }
 
 export_client_artifacts() {
@@ -4158,8 +4475,10 @@ export_client_artifacts() {
     printf 'SNI: %s\n' "$sni"
     printf '公钥 (pbk): %s\n' "$pub"
     printf 'ShortID (sid): %s\n' "$sid"
-    printf '流控 (flow): xtls-rprx-vision\n'
-    printf '指纹 (fp): chrome\n\n'
+    # 流控与指纹必须与分享链接、client.json 用的是【同一个】全局状态 ——
+    # 写死就等于让这里显示的值与实际配置对不上（用户会照着显示的值去排查）。
+    printf '流控 (flow): %s\n' "${FLOW:-xtls-rprx-vision}"
+    printf '指纹 (fp): %s\n\n' "${FINGERPRINT:-chrome}"
     printf '分享链接:\n%s\n\n' "$link"
     printf '导入方式: v2rayN / v2rayNG / Clash Verge / Shadowrocket / Hiddify 均可直接粘贴该链接。\n'
   } >"$outdir/client.txt" || { tui_err "无法写入客户端信息文件：$outdir/client.txt"; return 1; }
