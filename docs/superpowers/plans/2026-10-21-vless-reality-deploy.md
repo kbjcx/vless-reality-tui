@@ -3347,7 +3347,13 @@ git commit -m "feat(deploy): 密钥解析跨版本兼容与服务端配置渲染
    本机与 Debian/CI 的条数差**只剩**那 4 条权限断言。
 5. 红灯证据（至少这六条，每条都要贴出**变红的断言原文**）：
    - 把 `install_xray` 整个换成 `install_xray() { return 0; }`
-     → 「install_xray 在已安装时返回 0」等必须变红；
+     → 「install_xray 在已安装时**给出提示**」必须变红
+     （⚠️ **不是**「install_xray 在已安装时返回 0」那条 —— 那是【正向断言】
+      （期望码 0）→ 函数被换成 `return 0` 后退出码**仍然是 0** → 那条恒绿。
+      控制器在 Task 6 实施后独立复现：掏空 `install_xray` → 实际变红的是
+      「在已安装时给出提示」「在下载安装脚本失败时返回非零」「下载失败时给出明确提示」
+      「成功时提示安装完成」「在 mktemp 失败时返回非零」「在 mktemp 失败时给出明确提示」
+      共 6 条，**「在已安装时返回 0」不在其中**）；
    - 把 `xray_version` 整个换成 `xray_version() { return 0; }`
      → 「xray_version 输出 xray 的版本串」必须变红；
    - 把 `setup_systemd` 整个换成 `setup_systemd() { return 0; }`
