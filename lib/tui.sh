@@ -261,3 +261,258 @@ tui_kv() {
   (( kw < 14 )) && kw=14
   printf '  %s%s%s %s\n' "$C_GRAY" "$(tui_pad "$k" $kw)" "$C_RESET" "$v"
 }
+
+# ═══════════════════════════════════════════════════════════════
+# 交互层（Task 2）
+#
+# 约定：
+#   * 菜单类函数返回【0-based 索引】，用户取消返回 255。
+#   * stdout 语义：凡是把「用户输入的值」交给调用方的函数
+#     （tui_input / tui_input_secret），stdout 只承载该值，提示语走 stderr——
+#     这样 val=$(tui_input "端口" "443") 拿到的才是干净的值。
+#     tui_confirm / tui_menu 的 stdout 是给人看的，不承载值，提示留在 stdout。
+#   * 非 TTY（nohup / CI / curl | bash）一律降级为编号列表，绝不挂死。
+#   * 本段外部命令仅限：tui_run 用 mktemp/sed/rm 捕获命令输出，
+#     spinner 用 sleep（lib/tui.sh 硬约束的唯一例外）。
+# ═══════════════════════════════════════════════════════════════
+
+# 带 spinner 的命令执行。签名固定为 tui_run <消息> <命令> [参数...]：
+# lib/core.sh 的 apt_update_once / ensure_packages 按此形状调用，签名不符
+# 会导致依赖静默不装而部署继续。
+# 返回被调命令的退出码；失败时打印捕获到的输出。
+tui_run() {
+  local msg="$1"; shift
+  local tmp rc=0
+
+  tmp=$(mktemp 2>/dev/null || printf '/tmp/.tui.%s' "$$")
+
+  if [[ $TUI_TTY -eq 0 ]]; then
+    # 非 TTY 不画 spinner，但仍然捕获输出：失败时必须让用户看到原因，
+    # 否则「依赖没装上」会退化成静默故障。
+    printf '  %s%s%s %s ... ' "$C_ACCENT" "$I_ARROW" "$C_RESET" "$msg"
+    "$@" >"$tmp" 2>&1
+    rc=$?
+    if [[ $rc -eq 0 ]]; then
+      printf '%s%s%s\n' "$C_OK" "$I_OK" "$C_RESET"
+    else
+      printf '%s%s%s\n' "$C_ERR" "$I_ERR" "$C_RESET"
+      [[ -s "$tmp" ]] && sed -e 's/^/      /' "$tmp"
+    fi
+    rm -f "$tmp" 2>/dev/null || true
+    return $rc
+  fi
+
+  "$@" >"$tmp" 2>&1 &
+  local pid=$! i=0
+  # spinner 帧必须逐【字符】取：用数组而不是 ${str:i:1}——后者在 C locale 下
+  # 是按字节切，会把 3 字节的盲文点阵字符切成半个（服务器上 LANG 常未设置）。
+  local -a frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+  while kill -0 "$pid" 2>/dev/null; do
+    printf '\r  %s%s%s %s%s%s' "$C_ACCENT" "${frames[$((i % 10))]}" "$C_RESET" "$C_GRAY" "$msg" "$C_RESET"
+    i=$((i + 1)); sleep 0.08
+  done
+  wait "$pid" || rc=$?
+
+  if [[ $rc -eq 0 ]]; then
+    printf '\r  %s%s%s %s%s%s%s\n' "$C_OK" "$I_OK" "$C_RESET" "$C_GRAY" "$msg" "$C_RESET"
+  else
+    printf '\r  %s%s%s %s%s%s%s\n' "$C_ERR" "$I_ERR" "$C_RESET" "$C_GRAY" "$msg" "$C_RESET"
+    [[ -s "$tmp" ]] && sed -e 's/^/      /' "$tmp"
+  fi
+  rm -f "$tmp" 2>/dev/null || true
+  return $rc
+}
+
+# 确认：返回 0=是 / 1=否。第二个参数是默认值（y|n），默认 y。
+tui_confirm() {
+  local prompt="$1" default="${2:-y}" ans hint
+  if [[ "$default" == "y" || "$default" == "Y" ]]; then hint="Y/n"; else hint="y/N"; fi
+  if [[ $TUI_TTY -eq 0 ]]; then
+    printf '  %s%s%s %s [%s]: ' "$C_ACCENT" "$I_ARROW" "$C_RESET" "$prompt" "$hint"
+    # 用 `|| true` 而不是 `|| ans=''`：read 遇到没有换行符结尾的末行时
+    # 返回 1，但变量里已经存着有效内容——`|| ans=''` 会把它抹掉。
+    IFS= read -r ans || true
+    ans=${ans%$'\r'}
+    [[ -z "$ans" ]] && ans="$default"
+    [[ "${ans,,}" == y* ]]
+    return
+  fi
+  printf '  %s%s%s %s %s[%s]%s ' "$C_ACCENT" "$I_ARROW" "$C_RESET" "$prompt" "$C_GRAY" "$hint" "$C_RESET"
+  IFS= read -rsn1 ans || true
+  # 终端回车可能是 CR，也可能被 read 当作行分隔符吞掉（此时 ans 为空）；
+  # 两种情况都表示「直接回车」→ 落到默认值，而不是被判成「否」。
+  ans=${ans//$'\r'/}
+  ans=${ans//$'\n'/}
+  printf '\n'
+  [[ -z "$ans" ]] && ans="$default"
+  [[ "${ans,,}" == y* ]]
+}
+
+# 单行输入：stdout 输出用户输入（空输入回落默认值），提示语走 stderr。
+tui_input() {
+  local prompt="$1" def="${2:-}" hint="${3:-}" ans
+  if [[ $TUI_TTY -eq 0 ]]; then
+    if [[ -n "$hint" ]]; then
+      printf '  %s%s%s %s (%s): ' "$C_ACCENT" "$I_ARROW" "$C_RESET" "$prompt" "$hint" >&2
+    else
+      printf '  %s%s%s %s: ' "$C_ACCENT" "$I_ARROW" "$C_RESET" "$prompt" >&2
+    fi
+    IFS= read -r ans || true
+    ans=${ans%$'\r'}
+    [[ -z "$ans" ]] && ans="$def"
+    printf '%s' "$ans"; return
+  fi
+  if [[ -n "$hint" ]]; then
+    printf '  %s%s%s %s %s(%s)%s ' "$C_ACCENT" "$I_ARROW" "$C_RESET" "$prompt" "$C_GRAY" "$hint" "$C_RESET" >&2
+  else
+    printf '  %s%s%s %s ' "$C_ACCENT" "$I_ARROW" "$C_RESET" "$prompt" >&2
+  fi
+  IFS= read -r ans || true
+  ans=${ans%$'\r'}
+  [[ -z "$ans" ]] && ans="$def"
+  printf '%s' "$ans"
+}
+
+# 秘密输入：同 tui_input，但 TTY 下不回显。
+tui_input_secret() {
+  local prompt="$1" def="${2:-}" ans
+  if [[ $TUI_TTY -eq 0 ]]; then
+    printf '  %s%s%s %s: ' "$C_ACCENT" "$I_ARROW" "$C_RESET" "$prompt" >&2
+    IFS= read -r ans || true
+    ans=${ans%$'\r'}
+    [[ -z "$ans" ]] && ans="$def"
+    printf '%s' "$ans"; return
+  fi
+  printf '  %s%s%s %s ' "$C_ACCENT" "$I_ARROW" "$C_RESET" "$prompt" >&2
+  IFS= read -rs ans || true
+  ans=${ans%$'\r'}
+  printf '\n'
+  [[ -z "$ans" ]] && ans="$def"
+  printf '%s' "$ans"
+}
+
+# 菜单：stdout 打印选中项；返回 0-based 索引，用户取消返回 255。
+tui_menu() {
+  local title="$1"; shift
+  local -a items=("$@")
+  local n=${#items[@]}
+  local idx=${TUI_MENU_DEFAULT_INDEX:-0} buf=''
+
+  (( n == 0 )) && return 255
+  (( idx < 0 || idx >= n )) && idx=0
+
+  if [[ $TUI_TTY -eq 0 ]]; then
+    local i
+    tui_section "$title"
+    for ((i = 0; i < n; i++)); do
+      printf '     %s%2d%s) %s\n' "$C_GRAY" "$((i + 1))" "$C_RESET" "${items[$i]}"
+    done
+    local sel=''
+    printf '  %s请输入序号 [1-%d]: %s' "$C_ACCENT" "$n" "$C_RESET"
+    IFS= read -r sel || true
+    sel=${sel%$'\r'}
+    [[ -z "$sel" ]] && return 255
+    [[ "$sel" =~ ^[0-9]+$ ]] || return 255
+    # 用 10# 前缀：裸算术会把 "08" 当八进制，直接报「value too great for base」。
+    (( 10#$sel >= 1 && 10#$sel <= n )) || return 255
+    printf '%s\n' "${items[$((10#$sel - 1))]}"
+    return $((10#$sel - 1))
+  fi
+
+  tui_section "$title"
+  local key seq
+  while true; do
+    local i
+    for ((i = 0; i < n; i++)); do
+      if (( i == idx )); then
+        printf '     %s%s %s%s%s\n' "$C_ACCENT$C_BOLD" "$I_ARROW" "$C_RESET$C_BOLD" "${items[$i]}" "$C_RESET"
+      else
+        printf '       %s%s%s\n' "$C_GRAY" "${items[$i]}" "$C_RESET"
+      fi
+    done
+    if [[ -n "$buf" ]]; then
+      printf '     %s编号: %s_%s  %s↑↓ 移动 · Enter 确认 · q 取消%s\n' \
+        "$C_GRAY" "$C_ACCENT$C_BOLD" "$buf" "$C_RESET" "$C_GRAY" "$C_RESET"
+    else
+      printf '     %s↑↓ 移动 · 数字直选 · Enter 确认 · q 取消%s\n' "$C_GRAY" "$C_RESET"
+    fi
+
+    key=''
+    IFS= read -rsn1 key || true
+    # read -n1 碰到回车时返回的是【空串】（状态 0），不是 "\n"；
+    # 终端也可能送 CR。三种情况都表示「用户按了回车」→ 统一成 "\n"，
+    # 否则 Enter 会变成一个按下去没反应的死键。
+    [[ -z "$key" ]] && key=$'\n'
+    key=${key//$'\r'/$'\n'}
+
+    if [[ $key == $'\e' ]]; then
+      seq=''
+      # ESC 已被上一条 read 吃掉，这里只剩 "[A" / "[B"；-n3 + 超时是为了
+      # 兼容更长的序列（如 "[1~"），代价是每个方向键会多等 0.2s。
+      IFS= read -rsn3 -t 0.2 seq || true
+      case "$seq" in
+        '[A') idx=$(( (idx - 1 + n) % n )); buf='' ;;
+        '[B') idx=$(( (idx + 1) % n )); buf='' ;;
+      esac
+    elif [[ $key == $'\n' || $key == $'\r' ]]; then
+      if [[ -n "$buf" ]]; then
+        local d=$((10#$buf - 1))
+        if (( d >= 0 && d < n )); then
+          printf '\033[%dA\033[J' "$((n + 1))"
+          printf '   %s%s%s %s\n' "$C_OK" "$I_OK" "$C_RESET" "${items[$d]}"
+          return $d
+        fi
+        buf=''
+        printf '\033[%dA\033[J' "$((n + 1))"
+        continue
+      fi
+      printf '\033[%dA\033[J' "$((n + 1))"
+      printf '   %s%s%s %s\n' "$C_OK" "$I_OK" "$C_RESET" "${items[$idx]}"
+      return $idx
+    elif [[ $key == 'q' || $key == 'Q' ]]; then
+      printf '\033[%dA\033[J' "$((n + 1))"
+      printf '   %s已取消%s\n' "$C_GRAY" "$C_RESET"
+      return 255
+    elif [[ $key =~ ^[0-9]$ ]]; then
+      buf+="$key"
+      if (( 10#$buf >= 1 && 10#$buf <= n )); then
+        local more=''
+        IFS= read -rsn1 -t 0.35 more || more=''
+        if [[ -z "$more" ]]; then
+          local d=$((10#$buf - 1))
+          printf '\033[%dA\033[J' "$((n + 1))"
+          printf '   %s%s%s %s\n' "$C_OK" "$I_OK" "$C_RESET" "${items[$d]}"
+          return $d
+        fi
+        buf+="$more"
+      fi
+    fi
+    printf '\033[%dA\033[J' "$((n + 1))"
+  done
+}
+
+# 带默认项的菜单：默认高亮 default_item（找不到则默认第一项）。
+tui_select() {
+  local title="$1" def="$2"; shift 2
+  local -a items=("$@")
+  local i d=0
+  # 空列表直接返回：bash 4.2/4.3 在 set -u 下展开空数组 ${items[@]} 会报
+  # 「unbound variable」。
+  (( ${#items[@]} == 0 )) && return 255
+  for ((i = 0; i < ${#items[@]}; i++)); do
+    if [[ "${items[$i]}" == "$def" ]]; then d=$i; break; fi
+  done
+  TUI_MENU_DEFAULT_INDEX=$d
+  tui_menu "$title" "${items[@]}"
+  local r=$?
+  TUI_MENU_DEFAULT_INDEX=0
+  return $r
+}
+
+# 等待回车：非 TTY 下直接返回，不得阻塞。
+tui_pause() {
+  [[ $TUI_TTY -eq 1 ]] || return 0
+  printf '\n  %s按 Enter 键继续...%s' "$C_GRAY" "$C_RESET"
+  IFS= read -r _ || true
+  printf '\n'
+}
