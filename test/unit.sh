@@ -21,4 +21,33 @@ assert_eq "-----"      "$(tui_repeat '-' 5)"   "重复字符"
 
 assert_eq "hello" "$(tui_strip $'\033[32mhello\033[0m')" "剥离 ANSI 序列"
 
+test_case "TUI 框线几何"
+
+# 框线必须合得拢：每一个非空行的显示宽度都等于 TUI_WIDTH
+assert_box_widths() {
+  local label="$1" text="$2" bad=0 line
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    [[ "$(tui_dwidth "$line")" == "$TUI_WIDTH" ]] || bad=1
+  done <<<"$text"
+  assert_eq "0" "$bad" "$label 每行显示宽度均为 TUI_WIDTH"
+}
+
+TUI_WIDTH=80
+assert_box_widths "banner" "$(tui_banner '标题' '副标题')"
+assert_box_widths "box"    "$(tui_box '框标题'; tui_box_line '内容行'; tui_box_end)"
+assert_box_widths "panel"  "$(tui_panel '面板' '键|值' '更长的键|更长的值内容')"
+
+# 带 ANSI 的字符串按纯文本宽度计算（否则对带色文本补白会错位）
+assert_eq "4" "$(tui_dwidth $'\033[32m中文\033[0m')" "tui_dwidth 忽略 ANSI 序列"
+
+test_case "TUI Unicode 降级"
+
+# TUI_ASCII=1 时必须降级为 ASCII 制表符
+assert_eq "ok" "$( ( export TUI_ASCII=1; tui_init; [[ "$B_H" == '-' && "$B_V" == '|' ]] && echo ok || echo bad ) )" \
+  "TUI_ASCII=1 时降级为 ASCII 制表符"
+# 显式 TUI_UNICODE=1 时必须保留 Unicode
+assert_eq "ok" "$( ( export TUI_UNICODE=1; tui_init; [[ "$B_H" == '─' ]] && echo ok || echo bad ) )" \
+  "TUI_UNICODE=1 时保留 Unicode 制表符"
+
 test_summary

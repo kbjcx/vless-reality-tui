@@ -45,10 +45,11 @@ assert_status() {
 assert_true()  { if [[ "$1" == "0" ]]; then assert_eq 0 0 "${2:-为真}"; else assert_eq 0 1 "${2:-为真}"; fi; }
 assert_false() { if [[ "$1" == "0" ]]; then assert_eq 0 1 "${2:-为假}"; else assert_eq 0 0 "${2:-为假}"; fi; }
 
-# 以【退出码】断言：直接把命令作为参数传入。
-# 布尔型函数（返回 0/1 退出码而非打印值）必须用这两个，否则会误判。
-assert_succeeds() { local m="${2:-命令应以 0 退出}"; if "$@" >/dev/null 2>&1; then assert_eq 0 0 "$m"; else assert_eq 0 1 "$m"; fi; }
-assert_fails()    { local m="${2:-命令应以非 0 退出}"; if "$@" >/dev/null 2>&1; then assert_eq 0 1 "$m"; else assert_eq 0 0 "$m"; fi; }
+# 以【退出码】断言：用法为 assert_succeeds "描述" <命令> [参数...]
+# 描述必须是【第一个】参数——若放在末尾，"$@" 会把描述一起当作命令参数执行，
+# 被测命令会收到多余的参数，导致测试「因错误的原因通过或失败」。
+assert_succeeds() { local m="$1"; shift; if "$@" >/dev/null 2>&1; then assert_eq 0 0 "$m"; else assert_eq 0 1 "$m"; fi; }
+assert_fails()    { local m="$1"; shift; if "$@" >/dev/null 2>&1; then assert_eq 0 1 "$m"; else assert_eq 0 0 "$m"; fi; }
 
 test_summary() {
   printf '\n  ────────────────────────────────\n'
