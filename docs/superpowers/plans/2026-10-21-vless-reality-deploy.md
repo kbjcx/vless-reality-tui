@@ -42,6 +42,23 @@
   失败被彻底吞掉 → CI 绿灯放行红灯。
   （Task 4 修订轮 1 首次组装沙箱时正是踩了这个坑：追加在末尾后
   摘要显示 155 项、实际执行了 184 项。）
+- **条件块里的断言必须配一条 else 侧的「已跳过 / 前提不成立」说明断言**，
+  使**断言总数与机器、网络、依赖是否可用无关**。只写 `if 条件; then 断言...; fi`
+  会在条件不成立时**静默少算**断言 → 条数漂移 → CI 里写死条数必然 flake。
+  正确写法：条件成立时跑真正的断言；条件不成立时**不断言失败**，
+  而是登记一条 `assert_eq "说明文字" "说明文字" "某某已跳过（原因）：……"` 把条数补回来。
+  全计划扫描结果（Task 4 修订轮 2 时点）：共 **57 条断言**落在条件块内。
+  其中**没有** else 侧说明、会让条数漂移的有：Task 4 的 TLS 1.3（1 条）与
+  apt update 守卫（1 条）、Task 5 的 python3 JSON 校验（8 条）、
+  Task 7 的 python3 JSON 校验（1 条）—— 已在本轮全部补上。
+  另外**故意**随平台变化的是**权限相关行为断言**（chmod 在 MSYS 上是模拟的、
+  权限位不可达）：Task 3/4 的 4 条、Task 7 的 3 条等 —— 这类属于
+  「本平台无法验证」而不是缺陷，因此**不补** else 说明；
+  代价是断言条数**分平台不同** → 每个任务的验收标准与报告都必须
+  **写明是哪个平台的数字**。
+  （本条规则**不写代码示例**是有意的：全局约束里放 ```bash 围栏会被
+  「全计划 bash 块语法检查」当成一个代码块，而片段不是合法 bash → 误报语法错。
+  正确写法的实例见 Task 4 的 Step 1 代码块与「修订轮 2」小节。）
 - 变量命名：全局状态用大写（`PORT` `UUID` `SNI` `PRIVATE_KEY` `PUBLIC_KEY` `SHORT_ID` `SERVER_IP` `REMARK`），函数局部用小写下划线
 - 函数返回约定：成功 `0`，失败非 `0`；菜单类函数返回 **0-based 索引**，取消返回 `255`
 
@@ -1932,6 +1949,7 @@ for _ in $(seq 1 2000); do
 done
 mock_port_in_use "$big_ss" 59999; rc=$?
 assert_true "$rc" "port_in_use 在输出量很大时仍能正确判定端口已占用（不得因 SIGPIPE 误判为空闲）"
+
 # port_occupant 的解析同样用 mock 构造确定场景
 out=$( ( have_cmd() { case "$1" in ss) return 0 ;; *) return 1 ;; esac; }
             ss() { printf '%b' "${SS_HDR}LISTEN 0 128 0.0.0.0:59999 0.0.0.0:* users:((nginx,pid=1,fd=2))\n"; }
@@ -1950,41 +1968,101 @@ assert_succeeds "is_valid_ip 接受合法 IPv4" is_valid_ip 1.2.3.4
 assert_succeeds "is_valid_ip 接受 0 号段（0.0.0.0 是合法写法）" is_valid_ip 0.0.0.0
 assert_succeeds "is_valid_ip 接受 255 号段" is_valid_ip 255.255.255.255
 assert_succeeds "is_valid_ip 接受 IPv6 形态" is_valid_ip "2001:db8::1"
+assert_succeeds "is_valid_ip 接受完整写法的 IPv6" is_valid_ip "2001:0db8:0000:0000:0000:0000:0000:0001"
 assert_fails "is_valid_ip 拒绝纯数字串（404 这类 HTTP 状态码）" is_valid_ip 404
 assert_fails "is_valid_ip 拒绝纯十六进制串（cafebabe）" is_valid_ip cafebabe
 assert_fails "is_valid_ip 拒绝五段 IPv4" is_valid_ip 1.2.3.4.5
 assert_fails "is_valid_ip 拒绝每段都大于 255 的伪 IPv4" is_valid_ip 999.999.999.999
 assert_fails "is_valid_ip 拒绝空串" is_valid_ip ""
+# IPv6 分支曾经只要求「含冒号 + 全是十六进制字符」→ "dead:beef" 这类只有两段、
+# 且没有 "::" 压缩写法的串会被误收。收紧后必须钉住。
+assert_fails "is_valid_ip 拒绝只有两段且无 :: 的伪 IPv6（dead:beef）" is_valid_ip "dead:beef"
+assert_fails "is_valid_ip 拒绝只有两段且无 :: 的伪 IPv6（cafe:babe）" is_valid_ip "cafe:babe"
 
-# detect_public_ip：必须 mock 掉 curl 才能得到确定性结果（真实网络不可依赖）。
-out=$( ( curl() { printf '404'; }; detect_public_ip ) 2>/dev/null ); rc=$?
+# ── detect_public_ip：必须 mock 掉 curl 才能得到确定性结果（真实网络不可依赖）──
+# 注意：mock 的响应体【必须带尾随换行】！真实的 IP 服务（ipify / ifconfig.me /
+# icanhazip / ipinfo）返回的都是 "1.2.3.4\n"。bash 的 =~ 锚点【不匹配】尾随换行，
+# 而实现里靠 `tr -d '[:space:]'` 剥掉它 —— 如果那条 tr 被当成「冗余」删掉，
+# 探测在【任何真实网络下】都会失败（返回空），而用无换行的 mock 去测【测不出来】。
+out=$( ( curl() { printf '404\n'; }; detect_public_ip ) 2>/dev/null ); rc=$?
 assert_status 1 "$rc" "detect_public_ip 面对非 IP 响应体（HTTP 状态码 404）必须返回非零"
 assert_eq "" "$out" "detect_public_ip 面对非 IP 响应体时不得输出任何内容"
-out=$( ( curl() { printf '1.2.3.4'; }; detect_public_ip ) 2>/dev/null ); rc=$?
+out=$( ( curl() { printf '1.2.3.4\n'; }; detect_public_ip ) 2>/dev/null ); rc=$?
 assert_status 0 "$rc" "detect_public_ip 遇到合法 IPv4 时返回 0"
 assert_eq "1.2.3.4" "$out" "detect_public_ip 输出正确的公网 IPv4"
-out=$( ( curl() { printf '2001:db8::1'; }; detect_public_ip ) 2>/dev/null ); rc=$?
+out=$( ( curl() { printf '2001:db8::1\n'; }; detect_public_ip ) 2>/dev/null ); rc=$?
 assert_status 0 "$rc" "detect_public_ip 遇到 IPv6 时返回 0"
 assert_eq "2001:db8::1" "$out" "detect_public_ip 输出正确的 IPv6"
+out=$( ( curl() { printf '  1.2.3.4  \n'; }; detect_public_ip ) 2>/dev/null ); rc=$?
+assert_eq "1.2.3.4" "$out" "detect_public_ip 会剥掉响应里的空白与换行（真实 IP 服务都带尾随换行）"
 
-# 延迟解析：必须用 mock 的 curl，不能依赖「某个域名一定不可达」——
-# 实测本机环境里 invalid.invalid.nonexistent 会被解析并连上，curl 报出 4ms
-# → 断言「返回 ?」会随机变红。mock 掉 curl 才能得到确定性结果。
-out=$( ( curl() { return 7; }; target_latency_ms 'x.example' ) 2>/dev/null )
-assert_eq "?" "$out" "curl 失败时 target_latency_ms 返回 ?"
-out=$( ( curl() { printf '0.000000'; }; target_latency_ms 'x.example' ) 2>/dev/null )
-assert_eq "?" "$out" "curl 报告 0 连接时间时 target_latency_ms 返回 ?"
-out=$( ( curl() { printf '0.250000'; }; target_latency_ms 'x.example' ) 2>/dev/null )
-assert_eq "250" "$out" "curl 报告 0.25 秒时 target_latency_ms 换算成 250 毫秒"
+# ── detect_local_ip：ip 命令与 hostname 两条路径都要覆盖 ──────────
+out=$( ( ip() { printf '1.2.3.4 via 10.0.0.1 dev eth0 src 192.168.1.10 uid 0\n'; }
+         hostname() { return 1; }
+         detect_local_ip ) 2>/dev/null ); rc=$?
+assert_eq "192.168.1.10" "$out" "detect_local_ip 从 ip route 的 src 字段取到本机地址"
+out=$( ( ip() { return 1; }
+         hostname() { printf '10.0.0.7\n'; }
+         detect_local_ip ) 2>/dev/null ); rc=$?
+assert_eq "10.0.0.7" "$out" "detect_local_ip 在 ip 不可用时回退到 hostname -I"
+out=$( ( ip() { return 1; }; hostname() { return 1; }; detect_local_ip ) 2>/dev/null ); rc=$?
+assert_status 1 "$rc" "detect_local_ip 在 ip 与 hostname 都不可用时必须返回非零（不得 rc=0 却输出空串）"
+# 注意：tui_err 写的是【stdout】（本项目的 TUI 输出统一走 stdout，不是 stderr），
+# 所以失败时 stdout 上会出现错误提示 —— 这里断言的是「有明确提示、且没有输出任何地址」。
+assert_contains "$out" "无法探测本机地址" "detect_local_ip 失败时给出明确错误（且不输出任何地址）"
 
-# （原「不可达目标返回 ?」这条断言已移除：它依赖「某个域名一定不可达」的环境假设 ——
-#   实测本机环境里 invalid.invalid.nonexistent 会被解析并连上，curl 报出 4ms →
-#   断言随机变红。确定性版本见上面的 mock curl 三条断言。）
+# ── random_free_port：输出必须是 20000-39999 的整数 ──────────────
+out=$( ( port_in_use() { return 1; }; random_free_port ) 2>/dev/null ); rc=$?
+assert_status 0 "$rc" "random_free_port 返回 0"
+[[ "$out" =~ ^[0-9]+$ ]] && (( 10#$out >= 20000 && 10#$out <= 39999 )); assert_true "$?" \
+  "random_free_port 输出落在 20000-39999 区间"
 
-# 真实目标：至少一个候选站点应支持 TLS1.3（网络不可用时跳过断言，不算失败）
+# ── ensure_packages：依赖缺失且 apt update 失败时必须中止，不得继续装 ──────
+# 用文件记录 apt-get install 是否被调用：赋值给变量的调用在子 shell 里发生，
+# 外层看不到 → 只能用文件跨子 shell 传递。
+called_file="$(mktemp 2>/dev/null)"
+if [[ -n "$called_file" ]]; then
+  out=$( ( have_cmd() { return 1; }
+           apt_update_once() { return 1; }
+           tui_run() { : >"$called_file"; return 0; }
+           ensure_packages curl ) 2>/dev/null ); rc=$?
+  assert_status 1 "$rc" "ensure_packages 在 apt update 失败时必须返回非零"
+  if [[ -s "$called_file" ]]; then called=1; else called=0; fi
+  assert_eq "0" "$called" "ensure_packages 在 apt update 失败时不得继续调用 apt-get install"
+  rm -f "$called_file"
+else
+  assert_eq "mktemp 能创建临时文件" "失败（mktemp 返回空路径）" \
+    "ensure_packages 用例前提：mktemp 必须能创建临时文件"
+fi
+
+# ── service_run_user：systemd unit 的运行用户与回退 ──────────────
+out=$( ( systemctl() { printf 'xray\n'; }; service_run_user ) 2>/dev/null )
+assert_eq "xray" "$out" "service_run_user 读出 systemd unit 的运行用户"
+out=$( ( systemctl() { return 1; }; service_run_user ) 2>/dev/null )
+assert_eq "root" "$out" "service_run_user 在 systemctl 不可用时回退到 root"
+
+# ── target_supports_tls13 的解析逻辑：mock 掉 openssl 得到确定性结果 ──────────
+# 该函数此前【一条确定性断言都没有】—— 只在真实网络下被测，网络一抖就整条被跳过；
+# 更糟的是它【测的是环境而不是实现】：把函数整个换成 `return 0` 也测不出来。
+out=$( ( have_cmd() { case "$1" in openssl) return 0 ;; *) return 1 ;; esac; }
+         timeout() { shift; "$@"; }
+         openssl() { printf 'Protocol  : TLSv1.3\nCipher    : TLS_AES_128_GCM_SHA256\n'; }
+         target_supports_tls13 'x.example' ) 2>/dev/null ); rc=$?
+assert_true "$rc" "target_supports_tls13 识别出 TLS 1.3 的握手输出"
+out=$( ( have_cmd() { case "$1" in openssl) return 0 ;; *) return 1 ;; esac; }
+         timeout() { shift; "$@"; }
+         openssl() { printf 'Protocol  : TLSv1.2\nCipher    : ECDHE-RSA-AES128-GCM-SHA256\n'; }
+         target_supports_tls13 'x.example' ) 2>/dev/null ); rc=$?
+assert_false "$rc" "target_supports_tls13 识别出非 TLS 1.3 的握手输出"
+# 真实目标：至少一个候选站点应支持 TLS1.3。
+# 网络不可用时【登记一条说明】而不是静默跳过 —— 否则断言条数会在 183/184 之间
+# 振荡（实测 6 次里 2 次是 183），CI 里写死条数必然 flake。
 if have_cmd openssl && curl -fsS --max-time 5 -o /dev/null https://www.microsoft.com 2>/dev/null; then
   target_supports_tls13 www.microsoft.com; rc=$?
   assert_true "$rc" "www.microsoft.com 支持 TLS 1.3"
+else
+  assert_eq "网络不可用" "网络不可用" \
+    "真实 TLS1.3 探测已跳过（网络不可用）：解析逻辑已由上面的 mock 用例覆盖"
 fi
 
 # 【替换】下面这两行是 Task 3 加进 test/unit.sh 的断言（原样照抄，用来定位），
@@ -1998,9 +2076,14 @@ assert_eq "" "$offenders" "core.sh 不含属于 install.sh 的越权函数（req
 # apt update 失败必须中止：否则依赖装不上，调用方却以为装好了。
 # 用 mock 覆盖 tui_run 让它失败（子 shell 内覆盖，不污染测试进程）。
 # 若本机已存在标记文件则跳过（此时函数会提前返回 0，用例前提不成立）。
+# 注意：真实 Debian 上跑过一次 apt update 后标记文件就在了 → 这条断言会消失。
+# 所以 else 侧必须登记一条说明，把条数补回来（见全局约束）。
 if [[ ! -f /var/lib/vless-reality/apt-updated ]]; then
   ( tui_run() { return 1; }; apt_update_once >/dev/null 2>&1 ); rc=$?
   assert_false "$rc" "apt update 失败时 apt_update_once 必须返回非零"
+else
+  assert_eq "标记文件已存在" "标记文件已存在" \
+    "apt update 失败用例已跳过（本机已存在 /var/lib/vless-reality/apt-updated，用例前提不成立）"
 fi
 ```
 
@@ -2034,9 +2117,14 @@ is_valid_ip() {
     done
     return 0
   fi
-  # IPv6：必须含 ':'（否则 "404" 这类纯数字/纯十六进制串会被误收），
-  # 且只允许十六进制字符与冒号。
-  if [[ "$ip" == *:* ]] && [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]]; then
+  # IPv6：必须含 ':'（否则 "404" 这类纯数字/纯十六进制串会被误收）。
+  # 还必须是像样的 IPv6 形态：含 "::" 压缩写法，或至少 3 段十六进制组 ——
+  # 否则 "dead:beef" / "cafe:babe" 这类只有两段的串会被误收成 IP。
+  if [[ "$ip" == *"::"* ]]; then
+    [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]] && return 0
+    return 1
+  fi
+  if [[ "$ip" =~ ^([0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4}$ ]]; then
     return 0
   fi
   return 1
@@ -2044,15 +2132,22 @@ is_valid_ip() {
 
 detect_public_ip() {
   local ip u
+  # 候选源说明：
+  #   · 故意【不】用 https://myip.ipip.net —— 它返回中文正文
+  #     （「当前 IP：1.2.3.4 来自于：中国」），is_valid_ip 永远不可能接受 →
+  #     该源【永远失败】，而且排在最后，只在前面全失败时才白等一次超时。
+  #   · --max-time 取 5 秒：4 个源最坏合计 20 秒（旧的 5 源 × 8 秒 = 40 秒，
+  #     在无网环境下预检会静默卡住近一分钟）。
   local urls=(
     'https://api.ipify.org'
     'https://ifconfig.me/ip'
     'https://icanhazip.com'
     'https://ipinfo.io/ip'
-    'https://myip.ipip.net'
   )
   for u in "${urls[@]}"; do
-    ip=$(curl -fsS --max-time 8 "$u" 2>/dev/null | tr -d '[:space:]')
+    # tr -d '[:space:]' 是【承重逻辑】：真实 IP 服务返回的正文都带尾随 "\n"，
+    # 而 bash 的 =~ 锚点不匹配尾随换行 → 不剥掉就一定判不出 IP。
+    ip=$(curl -fsS --max-time 5 "$u" 2>/dev/null | tr -d '[:space:]')
     if is_valid_ip "$ip"; then
       printf '%s' "$ip"; return 0
     fi
@@ -2064,6 +2159,12 @@ detect_local_ip() {
   local ip
   ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
   [[ -z "$ip" ]] && ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+  # 两个来源都没给出地址 → 必须返回非零：rc=0 却输出空串会让调用方
+  # 分不清「探测到了空地址」和「探测成功」。
+  if [[ -z "$ip" ]]; then
+    tui_err "无法探测本机地址（ip 与 hostname 都不可用）"
+    return 1
+  fi
   printf '%s' "$ip"
 }
 
@@ -2225,6 +2326,78 @@ git commit -m "feat(core): 网络探测——公网 IP、端口占用、TLS1.3 �
 | P4 | 旧 IP 判定的正误表 | `"404"` / `"403"` / `"200"` / `"302"` / `"12345"` / `"cafebabe"` **全部被判为 IP**；`"1.2.3.4"` / `"::1"` 判对 |
 | P5 | 旧写法 vs 修好后写法，在 2 行与 120 行输出下的判定 | 旧写法在 120 行时结论正确（靠运气），修好后**永远**正确 |
 
+#### 修订轮 2 的逐项发现与处置
+
+> 本节由**控制器**在 Task 4 实施完成（提交 `e2759ae`）、独立复评之后写入。
+> 计划 = 真相：上面 Step 1 / Step 3 两个代码块是修订后的**权威终版**，
+> 实施者必须逐字照抄。
+> 复评结论：**PASS（限定范围）** —— 实施本身忠实且正确，**0 条实施阻塞项**；
+> 本节列的都是**计划缺陷**，责任方是控制器。
+
+| # | 级别 | 发现 | 处置 |
+|---|---|---|---|
+| F4-7 | **Important** | 修订轮 1 的验收标准第 6 条第 2 小项**写错了**：它写「把 `is_valid_ip` 的 IPv6 分支去掉 → `detect_public_ip 面对非 IP 响应体（HTTP 状态码 404）必须返回非零` 必须变红」。**这是假的** —— 去掉一个分支只会让判定**更严格**（少收一类地址），「404」照样被拒，那条断言**仍然是绿的**。实测（控制器与复评各自独立做）：去掉 IPv6 分支 → 3 条 IPv6 断言变红、「404」断言仍绿；要让「404」断言变红，必须把 `detect_public_ip` 换回旧的宽松正则 → 4 条变红 | 改正验收标准第 6 条第 2 小项。**责任方是计划，不是实施** —— Step 1 / Step 3 的代码块本身没问题 |
+| F4-8 | **Important** | TLS 1.3 那条断言有两个问题：① 网络守卫 `curl -fsS --max-time 5 https://www.microsoft.com` 失败时**整条静默跳过** → 条数在 **183/184** 之间振荡（实施者实测 6 次里 2 次是 183，控制器与复评各复现一次）→ CI 里写死条数必然 flake；② 它**测的是环境而不是实现** —— 复评的 M10 把 `target_supports_tls13` 整个换成 `return 0`，**0 条变红** | ① mock 掉 `have_cmd` / `timeout` / `openssl` 补**两条确定性断言**（正反两向）；② 真实网络那条的 else 分支**登记一条「已跳过」说明** → 条数恒定且有判别力 |
+| F4-9 | **Minor** | `apt update` 那条断言的守卫 `if [[ ! -f /var/lib/vless-reality/apt-updated ]]` —— 真实 Debian 上跑过一次 apt update 后标记文件就在了 → 这条断言**整条消失** → 条数随机器状态变 | else 分支登记一条「已跳过（用例前提不成立）」说明 |
+| F4-10 | **Important** | 控制器全计划扫描发现：**57 条断言**落在条件块内，其中若干条**没有 else 侧说明** → 断言总数随机器 / 网络 / 依赖是否可用而漂移。这不只影响 Task 4：Task 5（python3 JSON 校验 8 条）、Task 7（python3 JSON 校验 1 条）同样中招 | ① 已在**全局约束**里立规矩：条件块里的断言必须配 else 侧说明断言；② 本轮把 Task 5 / Task 7 的两处 python3 守卫一并补上。**故意**随平台变化的只有权限相关行为断言（chmod 在 MSYS 上是模拟的）—— 这类属于「本平台无法验证」而非缺陷，不补 else 说明，代价是条数分平台不同，报告必须写明平台 |
+| F4-11 | **Important** | `detect_public_ip` 里的 `tr -d '[:space:]'` 是**承重逻辑却零测试覆盖**：复评的 M14 删掉它 → **0 条变红、184 全绿**。但真实 IP 服务（ipify / ifconfig.me / icanhazip / ipinfo）返回的正文都带尾随 `\n`，而 bash 的 `=~` 锚点**不匹配**尾随换行 → 删掉 `tr` 就会在**任何真实网络下**探测失败 → 工具静默退化成内网 IP → 分享链接里的主机名是内网地址 → 客户端连不上，**而断言全绿**。根因：原 mock 全用 `printf '1.2.3.4'`（**无尾随空白**），`tr` 从未被真正约束 | mock 改成**带尾随换行**的形态（`printf '1.2.3.4\n'` 等），并加一条「带前后空白」的断言把 `tr` 的行为钉死。此时删掉 `tr` → 「detect_public_ip 输出正确的公网 IPv4」变红 |
+| F4-12 | **Minor** | 计划 Interfaces 声明交付 11 个函数，Step 1 只测了 7 个。**完全没有断言**的有 `detect_local_ip`、`random_free_port`、`ensure_packages`、`service_run_user` —— 而它们恰好就是返回码语义异常的那几个（空输出 rc=0、未校验的硬编码兜底、恒返回 0）。**一旦回归，没有任何断言会红** | 补 4 组 mock 断言（各 2 条）：`detect_local_ip` 的 ip 路径 / hostname 回退 / 两者都失败时必须返回非零；`random_free_port` 的输出区间；`ensure_packages` 在 apt update 失败时必须中止且**不得**继续调用 apt-get install（用文件跨子 shell 记录调用）；`service_run_user` 的读取与 root 回退 |
+| F4-13 | **Minor** | `detect_public_ip` 最坏耗时 **40 秒**（5 源 × `--max-time 8`）且**毫无输出**地卡住 —— Task 8 的预检是同步调用，TUI 看起来像死机。而且 `https://myip.ipip.net` 返回中文正文（「当前 IP：1.2.3.4 来自于：中国」）→ `is_valid_ip` 永远不可能接受 → **该源永远失败**，且排在最后，只在前面全失败时才白等一次超时 | 删掉这个死源，`--max-time` 从 8 降到 5 → 最坏 20 秒 |
+| F4-14 | **Minor** | `is_valid_ip` 的 IPv6 分支只要求「含冒号 + 全是十六进制字符」→ `dead:beef` / `cafe:babe` 这类**只有两段、且没有 `::` 压缩写法**的串会被误收。复评的 M16（把该分支放宽成「只要求含冒号」）→ **0 条变红**，说明这条约束没有被任何断言钉住 | IPv6 分支收紧为：含 `::` 压缩写法，或至少 3 段十六进制组；并补两条「拒绝 dead:beef / cafe:babe」+ 一条「接受完整写法的 IPv6」的断言 |
+
+#### 复评指出的、**本轮不改**的实现细节（观察，代价低）
+
+| 变异 | 后果 | 为什么不改 |
+|---|---|---|
+| 删 `awk 'NR>1{print $4}'` 的 `NR>1`（不再跳表头） | 无害 —— 表头第 4 字段是 `Local`，永远匹配不上 `[:.]port$` | 无实际后果，不值得为它加断言 |
+| 删掉 `netstat` 回退分支 | 无害（Debian 12 默认有 `ss`） | 同上 |
+| `: > /var/lib/vless-reality/apt-updated` 改成 `:` | 标记文件不再生成 → 每次都重跑 apt update（慢但不出错） | 已在 Task 6 修订项里一并处理 |
+
+#### 实施者报出的返回码语义问题（控制器已独立验证）
+
+| 问题 | 控制器的独立判断 | 处置 |
+|---|---|---|
+| `port_in_use` 分不清「探测失败」与「端口空闲」（两者都 rc=1） | **不是静默成功**：探测失败 → 向导以为端口空闲 → 部署走到 systemd 阶段 xray 绑不上 → `setup_systemd` 会 `tui_err "xray 服务未能启动，最近日志如下："` 并输出 `journalctl -u xray -n 30`（含 xray 原始的 address already in use）→ `do_deploy` 中止 → 失败是**响亮**的，只是用户要先走完装内核 / 生成密钥 / 写配置才失败，且首句错误是「systemd 配置失败」而非真正原因 | 记为 **Task 9 修订项**（Minor）：向导在端口探测不可用时提示「无法确认端口是否空闲」 |
+| `random_free_port` 的硬编码兜底 44321 没有校验 | 40 次随机全占用的概率极低；兜底端口未验证 → 可能又是占用 | 记为 **Task 9 修订项**（Minor）：兜底端口也要过一次 `port_in_use` |
+| `apt_update_once` 没检查 `mkdir -p` 与 `: >` | 失败 → 标记文件没建 → 下次重跑 apt update（幂等、无害），但**原始 bash 报错直接漏到 stderr**、用户看不到明确提示 | 记为 **Task 6 修订项** |
+| `port_occupant` 恒返回 0 | 描述由 stdout 承载，接口设计如此；调用方 `occ=$(port_occupant "$PORT")` 只用于拼提示语 → 行为正确 | 不改 |
+
+#### 复评指出的「全局约束字面张力」（留给 Task 9 / Task 12 收口）
+
+全局约束写的是「所有失败路径必须以非零退出码结束，且经 `tui_err` 输出」，
+但本任务几个**探测类**函数的契约与之不完全一致：
+`detect_public_ip`（rc=1 但不经过 `tui_err`）、`port_occupant`（恒 rc=0）。
+探测函数的「探测失败」本身往往是合法答案（例如「这个目标不支持 TLS 1.3」）
+→ 不是缺陷，而是**契约分层**问题。
+→ 记为 **Task 9 / Task 12 的收口项**：把「探测类函数」与「部署流程类函数」的
+失败语义在计划里明确分层，别让后来的实施者自己猜。
+
+#### 修订轮 2 的验收标准
+
+1. `lib/core.sh` 的 Task 4 段与上面 **Step 3 代码块逐字节一致**（本轮**改** `lib/core.sh`：
+   IPv6 收紧、删死源、`--max-time` 5、`detect_local_ip` 失败返回非零）。
+2. `test/unit.sh` 里 Task 4 的插入段必须被**替换**成修订后的 Step 1 代码块
+   （**不是**追加 —— 追加会让两套用例并存、条数翻倍）。
+3. `bash test/unit.sh` 全部通过、退出码 0。
+   断言总数 **197**（本机 = Windows + MSYS）／**201**（Debian / CI，以非 root 运行）。
+   报告里必须写明是哪个平台的数字。
+4. **条数必须恒定**：网络抖动、python3 是否可用、apt 标记文件是否存在，
+   都**不得**改变摘要里的条数。连跑 4 次，条数必须每次都是 197。
+   （新块里有 5 条断言位于「条件不成立」的那一侧，但它们与条件成立那一侧
+   是【1 换 1】的配对 → 无论走哪边，总数都不变。）
+5. `lib/tui.sh`、`test/lib.sh` **一字未动**。
+6. 红灯证据（至少这四条）：
+   - 删掉 `detect_public_ip` 里的 `tr -d '[:space:]'` → 「detect_public_ip 输出正确的
+     公网 IPv4」必须变红；
+   - 把 `target_supports_tls13` 里的 grep 模式改坏 → 「target_supports_tls13
+     识别出 TLS 1.3 的握手输出」必须变红；
+   - 把 `detect_local_ip` 的「失败返回非零」改回「rc=0 + 空输出」→
+     「detect_local_ip 在 ip 与 hostname 都不可用时必须返回非零」必须变红；
+   - 把 `ensure_packages` 的 `apt_update_once || return 1` 改成 `apt_update_once || true` →
+     「ensure_packages 在 apt update 失败时必须返回非零」与
+     「…不得继续调用 apt-get install」两条必须变红。
+7. **计划文件实施者一个字都不许改** —— 计划修订是控制器的职责。
+
 #### 修订轮 1 的验收标准
 
 1. `lib/core.sh` 末尾追加的网络探测部分与上面 **Step 3 代码块逐字节一致**。
@@ -2234,18 +2407,28 @@ git commit -m "feat(core): 网络探测——公网 IP、端口占用、TLS1.3 �
    它们必须被 Task 4 的收窄版**替换掉**（删掉旧的这两行），不是并存。
 3. 新用例必须插在 `test/unit.sh` 的 `test_summary` **之前**（`test_summary` 保持最后一行）。
 4. `bash test/unit.sh` 全部通过、退出码 0。
-   断言总数由 156 变为 **184**（156 − 1 条被替换的旧断言 + 29 条新断言 = 184）。
-   **184 是「本机实测值」**（Windows + MSYS）：那 4 条权限相关行为断言在本机被自动跳过，
-   在 Debian / CI（以非 root 运行）上会真正执行，届时总数为 **188**。
+   断言总数由 156 变为 **197**（基线 155 + 新块本机实际执行 42 条 = 197）。
+   **197 是「本机实测值」**（Windows + MSYS）：那 4 条权限相关行为断言在本机被自动跳过，
+   在 Debian / CI（以非 root 运行）上会真正执行，届时总数为 **201**。
    报告里要写明是哪个平台的数字。
+   **条数必须恒定**：网络抖动、python3 是否可用、apt 标记文件是否存在，
+   都**不得**改变摘要里的条数（见修订轮 2 的 F4-8）。
 5. `lib/tui.sh`、`test/lib.sh` **一字未动**。
 6. 红灯证据（至少给出这四条）：
    - 把 `port_in_use` 改回 `... \| awk \| grep -q` → **F4-1 的静态断言必须变红**
      （这是权威判据）；大输出那条**辅助**断言**可能**变红（时序相关），
      必须如实报告实际结果，不许把「可能」写成「一定」；
-   - 把 `is_valid_ip` 的 IPv6 分支去掉（等于让 `detect_public_ip` 回到旧的
-     `^[0-9a-fA-F:]+$` 判定）→ `detect_public_ip 面对非 IP 响应体（HTTP 状态码 404）必须返回非零`
-     必须变红；
+   - 把 `is_valid_ip` 的 IPv6 分支去掉 → **3 条 IPv6 断言**必须变红
+     （`is_valid_ip 接受 IPv6 形态`、`detect_public_ip 遇到 IPv6 时返回 0`、
+     `detect_public_ip 输出正确的 IPv6`）；
+     **注意**：「detect_public_ip 面对非 IP 响应体（HTTP 状态码 404）必须返回非零」
+     在这个变异下**仍然是绿的** —— 去掉一个分支只会让判定【更严格】。
+     要让那条断言变红，必须把 `detect_public_ip` 换回旧的宽松正则
+     （`if [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]]`），此时会红 4 条；
+   - 删掉 `detect_public_ip` 里的 `tr -d '[:space:]'` → 「detect_public_ip 输出正确的
+     公网 IPv4」必须变红（真实 IP 服务都带尾随换行，而 bash 的 =~ 不匹配尾随换行）；
+   - 把 `target_supports_tls13` 里的 grep 模式改坏 → 「target_supports_tls13
+     识别出 TLS 1.3 的握手输出」必须变红；
    - 把 `is_valid_ip` 的 IPv4 段数检查去掉 → `is_valid_ip 拒绝五段 IPv4` 必须变红；
    - 把 `is_valid_ip` 的 `10#$o > 255` 去掉 → `is_valid_ip 拒绝每段都大于 255 的伪 IPv4`
      必须变红。
@@ -2315,6 +2498,11 @@ if python3 -c 'import json' >/dev/null 2>&1; then
   assert_contains "$(cat "$cfg")" '"privateKey": "PRIVKEY"' "配置含私钥"
   assert_contains "$(cat "$cfg")" '"shortIds": [' "配置含 shortIds"
   assert_eq 0 "$(grep -c 'geoip' "$cfg")" "配置不引用 geoip（避免 geoip.dat 依赖）"
+else
+  # python3 不可用不是缺陷（它只是校验 JSON 合法性的手段），此处【不断言失败】，
+  # 只登记一条说明以保持断言条数恒定（见全局约束）。
+  assert_eq "python3 功能不可用" "python3 功能不可用" \
+    "python3 功能探测未通过：JSON 合法性校验已跳过（条数保持恒定）"
 fi
 rm -f "$cfg"
 fi
@@ -2881,6 +3069,10 @@ render_client_config "$ccfg" "UUID123" "1.2.3.4" "443" "www.microsoft.com" "PUBK
 # 判活用【功能可用】而不是 have_cmd（见 Task 5 处的同一条说明）。
 if python3 -c 'import json' >/dev/null 2>&1; then
   assert_status 0 "$(python3 -c "import json,sys;json.load(open(sys.argv[1]));print(0)" "$ccfg" 2>/dev/null || echo 1)" "客户端配置是合法 JSON"
+else
+  # 同 Task 5：python3 不可用不是缺陷，只登记一条说明以保持条数恒定。
+  assert_eq "python3 功能不可用" "python3 功能不可用" \
+    "python3 功能探测未通过：客户端 JSON 合法性校验已跳过（条数保持恒定）"
 fi
 assert_contains "$(cat "$ccfg")" '"port": 1080' "客户端含 socks 入站 1080"
 assert_contains "$(cat "$ccfg")" '"port": 1081' "客户端含 http 入站 1081"
