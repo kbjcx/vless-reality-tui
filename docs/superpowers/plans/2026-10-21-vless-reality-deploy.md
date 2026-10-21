@@ -7965,11 +7965,24 @@ test_case "Task 12：CI 与按键超时（定点修订）"
 assert_true "$([[ -f "$ROOT/.github/workflows/ci.yml" ]] && echo 0 || echo 1)" "CI 配置文件存在"
 cic=$(cat "$ROOT/.github/workflows/ci.yml" 2>/dev/null)
 assert_contains "$cic" "bash build.sh" "CI 校验 dist 与源码同步"
-assert_contains "$cic" "git diff --exit-code" "CI 用 git diff 判定产物是否脱节"
-assert_contains "$cic" "shellcheck" "CI 跑 ShellCheck"
-scrc=$(cat "$ROOT/.shellcheckrc" 2>/dev/null)
-assert_contains "$scrc" "SC1090" "shellcheck 豁免运行时 source（SC1090）"
-assert_contains "$scrc" "SC1091" "shellcheck 豁免找不到被 source 的文件（SC1091）"
+# ⚠️ 下面四条判据必须看【结构】，不能只查「字符串是否出现」—— 否则【恒真】：
+#    * "git diff --exit-code"：把校验的路径改掉之后它【还在】→
+#      「字符串还在」的判据抓不住「校验目标被改错」；
+#    * "shellcheck"：CI 里出现【两次】（安装 + 执行）→ 删掉安装那一步后，
+#      执行那行还在 → 照样抓不住；
+#    * .shellcheckrc 的【注释行】里就写着 "SC1090/SC1091" →
+#      删掉 disable 行之后整文件里依然有 "SC1090" → 照样抓不住。
+#    → 改成数【结构性出现次数】，必须恰好 1 个。
+assert_eq "1" "$(grep -c 'git diff --exit-code' "$ROOT/.github/workflows/ci.yml" 2>/dev/null || true)" \
+  "CI 用 git diff 判定产物是否脱节"
+assert_eq "1" "$(grep -cE '^[[:space:]]*- name: ShellCheck$' "$ROOT/.github/workflows/ci.yml" 2>/dev/null || true)" \
+  "CI 跑 ShellCheck"
+# shellcheck 的豁免要看【disable= 行】，不能看整文件：
+# .shellcheckrc 的注释里就写着 SC1090/SC1091 → 整文件查找恒真。
+assert_eq "1" "$(grep -cE '^disable=.*SC1090' "$ROOT/.shellcheckrc" 2>/dev/null || true)" \
+  "shellcheck 豁免运行时 source（SC1090）"
+assert_eq "1" "$(grep -cE '^disable=.*SC1091' "$ROOT/.shellcheckrc" 2>/dev/null || true)" \
+  "shellcheck 豁免找不到被 source 的文件（SC1091）"
 
 # lib/tui.sh 的两个按键超时必须【可被环境变量覆盖】：
 # 默认的 0.2 / 0.35 秒是【墙钟截止点】，机器繁忙时会把方向键读丢、
@@ -7978,9 +7991,15 @@ assert_contains "$scrc" "SC1091" "shellcheck 豁免找不到被 source 的文件
 tuic=$(cat "$ROOT/lib/tui.sh")
 assert_contains "$tuic" '${TUI_KEY_TIMEOUT:-' "lib/tui.sh 的方向键超时可被环境变量覆盖"
 assert_contains "$tuic" '${TUI_DIGIT_TIMEOUT:-' "lib/tui.sh 的数字键超时可被环境变量覆盖"
+# ⚠️ 判据必须是「值确实被放大了」，不能只看「出现了这个名字」——
+#    `export TUI_KEY_TIMEOUT=0.2` 里也有 TUI_KEY_TIMEOUT → 名字判据【恒真】。
+#    → 解析出导出的值，要求它【严格大于默认值】（0.2 / 0.35）；
+#      解析不到（文件缺失 / 写法变了）→ 按 0 处理 → 判红。
 mh=$(cat "$ROOT/test/helpers/menu_tty.sh")
-assert_contains "$mh" "TUI_KEY_TIMEOUT" "菜单测试 helper 放大了方向键超时"
-assert_contains "$mh" "TUI_DIGIT_TIMEOUT" "菜单测试 helper 放大了数字键超时"
+kto=$(sed -n 's/^export TUI_KEY_TIMEOUT=//p' "$ROOT/test/helpers/menu_tty.sh" | tr -d '[:space:]')
+dto=$(sed -n 's/^export TUI_DIGIT_TIMEOUT=//p' "$ROOT/test/helpers/menu_tty.sh" | tr -d '[:space:]')
+assert_true "$(awk -v v="${kto:-0}" 'BEGIN{print (v+0>0.2)?0:1}')" "菜单测试 helper 放大了方向键超时"
+assert_true "$(awk -v v="${dto:-0}" 'BEGIN{print (v+0>0.35)?0:1}')" "菜单测试 helper 放大了数字键超时"
 ```
 
 **Step 2: 运行测试确认失败**
@@ -8344,14 +8363,32 @@ export TUI_DIGIT_TIMEOUT=2
 ```
 
 
-#### 修订轮 1 的验收标准
+#### 修订轮 2 的逐项发现与处置（变异矩阵暴露的 5 条「恒真断言」）
 
-1. `build.sh` 的内容与下面 **Step 3 代码块逐字节一致**（新建文件）。
+> 本节由**控制器**在修订轮 1 落盘后、**变异矩阵实跑**时写入。
+> 触发点：修订轮 1 的 20 条变异里，**A15 / A16 / A17 / A18 / A19 五条打不出红灯**
+> —— 断言**恒真**，什么也证明不了。
+> 根因是同一个：**判据写成「整文件字面量查找」，被注释行或同文件其它位置的同名 token 骗过。**
+
+| # | 级别 | 发现 | 处置 |
+|---|---|---|---|
+| **T12-16** | **Important** | **5 条断言的判据是「整文件字面量查找」→ 全部恒真。** 逐条实测：<br>① **A15 / A16**（helper 的两个超时）：判据是 `assert_contains "$mh" "TUI_KEY_TIMEOUT"` → 变异把值改成 `export TUI_KEY_TIMEOUT=0.2` 后，**名字照样在** → 断言照样绿 → **恒真**；<br>② **A17**（`.shellcheckrc` 的 SC1090）：判据是 `assert_contains "$scrc" "SC1090"` → 而 `.shellcheckrc` 的**注释行**里就写着 `# SC1090/SC1091：…` → 删掉 `disable=` 行之后整文件里**依然有** `SC1090` → **恒真**；<br>③ **A18**（CI 的 shellcheck）：判据是 `assert_contains "$cic" "shellcheck"` → CI 里 `shellcheck` 出现**两次**（`apt-get install … shellcheck` 与 `xargs … shellcheck --severity=warning`）→ 变异删掉安装那一步后**执行那行还在** → **恒真**；<br>④ **A19**（CI 的 git diff）：判据是 `assert_contains "$cic" "git diff --exit-code"` → 变异只把校验的**路径**改掉，`git diff --exit-code` **还在** → **恒真** | Step 1 的判据全部改成**结构级**：<br>① helper 的两个超时 → 解析出导出的**数值**，要求**严格大于默认值**（0.2 / 0.35），解析不到按 0 处理（判红）；<br>② `.shellcheckrc` → 改判 **`disable=` 行**（`grep -cE '^disable=.*SC1090'` 必须为 1）；<br>③ CI 的 shellcheck → 改数 **ShellCheck【步骤】**的个数（`grep -cE '^[[:space:]]*- name: ShellCheck$'` 必须为 1），并把 A18 的变异改成**删掉整个步骤**；<br>④ CI 的 git diff → 改数 `git diff --exit-code` 的**出现次数**（必须为 1），并把 A19 的变异改成**删掉整个 dist 同步校验块** |
+| **T12-17** | Minor | **变异覆盖有缺口**：修订轮 1 的 20 条变异里，`assert_contains "$cic" "bash build.sh"`、`assert_contains "$scrc" "SC1091"` 两条断言**没有任何变异打它们** → 它们的判别力**未被验证** | 补 **A21 / A22** 两条变异（A21 改坏 CI 的 `bash build.sh`；A22 从 `.shellcheckrc` 去掉 SC1091）→ 变异清单由 **20 条**增到 **22 条** |
+
+> **断言条数不变**：修订轮 2 只改判据的**实现**，不改断言的**条数**
+> → 仍是 **28** 条 → 平台三值仍是 **718 / 723 / 725**。
+
+#### 修订轮 2 的验收标准
+
+> 本节**取代**修订轮 1 的验收标准（变异清单由 20 条扩到 22 条，5 条判据改写）。
+> 其余各条与修订轮 1 一致。
+
+1. `build.sh` 的内容与上面 **Step 3 代码块逐字节一致**（新建文件）。
 2. `test/unit.sh` 里 Task 12 的插入段与上面 **Step 1 代码块逐字节一致**
    （追加在 `test_summary` **之前**）。
 3. **五处定点修订**（P1 / P2 / P3 / P4 / P5）与上面写的**改后**文本逐字一致；
    每处的**旧文本在改后文件里必须命中 0 次**、**新文本命中 1 次**。
-   **除这五处外，Task 8 / Task 2 / Task 2 的 Step 3 块一字未动**
+   **除这五处外，Task 8 / Task 2 的 Step 3 块一字未动**
    （`install.sh` 与 `lib/tui.sh` 因此不再与计划里对应任务的块逐字节一致 ——
    补偿方式就是这五条可机械核对的精确文本替换）。
 4. `build.sh` / `dist/install.sh` / `install.sh` 的提交模式是 **100755**：
@@ -8374,7 +8411,7 @@ export TUI_DIGIT_TIMEOUT=2
    - `dist/install.sh` 里 `^set -uo pipefail$` **恰好 1 条**；
    - `bash -n dist/install.sh` 退出码 0，且 `bash dist/install.sh --help` 退出码 0、
      输出含「用法」。
-8. 红灯证据（**20 条变异**，每条都要贴出**变红的断言原文**）：
+8. 红灯证据（**22 条变异**，每条都要贴出**变红的断言原文**）：
    - A1 把 build.sh 的 `VERSION` 提取改回 `| head -1`
      → 「build.sh 不用提前退出的管道（head -1）」必须变红；
    - A2 去掉 build.sh 的 `chmod +x`
@@ -8404,27 +8441,38 @@ export TUI_DIGIT_TIMEOUT=2
      → 「lib/tui.sh 的方向键超时可被环境变量覆盖」必须变红；
    - A14 把 `lib/tui.sh` 的数字键超时改回 `-t 0.35`
      → 「lib/tui.sh 的数字键超时可被环境变量覆盖」必须变红；
-   - A15 去掉 `menu_tty.sh` 的 `TUI_KEY_TIMEOUT`
-     → 「菜单测试 helper 放大了方向键超时」必须变红；
-   - A16 去掉 `menu_tty.sh` 的 `TUI_DIGIT_TIMEOUT`
-     → 「菜单测试 helper 放大了数字键超时」必须变红；
-   - A17 从 `.shellcheckrc` 去掉 SC1090
-     → 「shellcheck 豁免运行时 source（SC1090）」必须变红；
-   - A18 从 CI 里去掉 shellcheck 步骤
+   - A15 把 `menu_tty.sh` 的 `export TUI_KEY_TIMEOUT=2` 改成 `=0.2`
+     → 「菜单测试 helper 放大了方向键超时」必须变红
+     （⚠️ 只改**名字**是抓不住的 —— 判据比的是**数值**是否大于默认值 0.2）；
+   - A16 把 `menu_tty.sh` 的 `export TUI_DIGIT_TIMEOUT=2` 改成 `=0.35`
+     → 「菜单测试 helper 放大了数字键超时」必须变红
+     （判据比的是**数值**是否大于默认值 0.35）；
+   - A17 从 `.shellcheckrc` 的 `disable=` 行里去掉 SC1090
+     → 「shellcheck 豁免运行时 source（SC1090）」必须变红
+     （⚠️ 注释行里就写着 `SC1090/SC1091` → 判据只认 `disable=` 行）；
+   - A18 把 CI 的**整个 ShellCheck 步骤**删掉
      → 「CI 跑 ShellCheck」必须变红；
-   - A19 从 CI 里去掉 `git diff --exit-code`
+   - A19 把 CI 的**整个 dist 同步校验块**删掉
      → 「CI 用 git diff 判定产物是否脱节」必须变红；
    - A20 让 `build.sh` 以非零码退出
-     → 「build.sh 执行成功」必须变红。
-   > ⚠️ **三条断言的判据是「代码级」的，不是字面量查找**（见 T12-12 / T12-13）：
-   > 「build.sh 不用提前退出的管道（head -1）」看的是**代码行**里有没有 `| head`
+     → 「build.sh 执行成功」必须变红；
+   - A21 把 CI 里的 `bash build.sh` 改坏
+     → 「CI 校验 dist 与源码同步」必须变红；
+   - A22 从 `.shellcheckrc` 的 `disable=` 行里去掉 SC1091
+     → 「shellcheck 豁免找不到被 source 的文件（SC1091）」必须变红。
+   > ⚠️ **五条判据是「结构级」的，不是整文件字面量查找**（见 T12-16）：
+   > 「不用 head -1」看的是**代码行**里有没有 `| head`
    > （build.sh 自己的注释里就写着 `head -1` 字面量）；
-   > 「单文件产物包含分享链接生成」看的是 **client.sh 独有**的 `render_client_config`
-   > （`build_share_link` 在 lib/deploy.sh 里也有调用点 → 区分不出来）。
+   > 「包含分享链接生成」看的是 **client.sh 独有**的 `render_client_config`
+   > （`build_share_link` 在 lib/deploy.sh 里也有调用点 → 区分不出来）；
+   > 两条 helper 超时看的是**数值**是否大于默认值（不是「名字在不在」）；
+   > 两条 shellcheck 豁免看的是 **`disable=` 行**（不是整文件 —— 注释里就写着这两个号）；
+   > 两条 CI 判据看的是**结构性出现次数**（不是「字符串在不在」）。
 9. ⚠️ **变异矩阵的纪律**：
    - 变异串必须与被测文件的**实际文本逐字一致**，**命中次数 != 1 直接报错**（不静默跳过）；
    - 每条变异跑出来的**断言总数必须仍等于基线**（证明探针健康）；
    - 变红的断言**原文**必须与上面点名的**逐字对上**；
+   - **一条变异打出 0 条红 = 该断言恒真**，必须**修判据**而不是跳过它；
    - 变异只在**沙箱副本**里做，**仓库工作区全程不被变异**。
 10. 未验证项必须**如实报告**，不得当作已验证：
     - **GitHub Actions 上 CI 到底跑不跑得过**：本机没有 runner，
