@@ -11,6 +11,8 @@ source "$ROOT/lib/tui.sh"
 source "$ROOT/lib/core.sh"
 # shellcheck source=lib/deploy.sh
 source "$ROOT/lib/deploy.sh"
+# shellcheck source=lib/client.sh
+source "$ROOT/lib/client.sh"
 
 test_case "TUI 文本宽度与补白"
 
@@ -1401,4 +1403,234 @@ assert_contains "$out" "放行端口 8443/tcp (nftables)" "open_firewall 的 nft
 if [[ "$out" == *"未检测到 ufw"* ]]; then bailed=1; else bailed=0; fi
 assert_eq "0" "$bailed" "open_firewall 不得退化成『未检测到防火墙』（nftables 分支）"
 
+test_case "分享链接与客户端配置"
+
+# 有效的入参（必须能通过 render_client_config 的白名单校验）：
+#   UUID 规范形态 / 端口 1-65535 / 公钥 base64url 40-64 / ShortID 十六进制 2-16 /
+#   SNI 合法主机名 / IP 合法。
+# 原来的用例用的是 "UUID123" / "PUBKEY" 这类占位串 —— 加了白名单之后它们会被拒绝，
+# 所以这里统一换成【真值】。
+T7_UUID='11111111-2222-3333-4444-555555555555'
+T7_IP='1.2.3.4'
+T7_PORT='443'
+T7_SNI='www.microsoft.com'
+T7_PUB='PRIVKEY0123456789abcdefghijklmnopqrstuvwxyzABCDE'
+T7_SID='a1b2c3d4'
+T7_REMARK='我的节点'
+
+link=$(build_share_link "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" "$T7_REMARK")
+assert_contains "$link" "vless://$T7_UUID@$T7_IP:$T7_PORT" "链接含协议与地址"
+assert_contains "$link" "encryption=none" "链接含 encryption"
+assert_contains "$link" "flow=xtls-rprx-vision" "链接含 flow"
+assert_contains "$link" "security=reality" "链接含 security=reality"
+assert_contains "$link" "sni=$T7_SNI" "链接含 sni"
+assert_contains "$link" "fp=chrome" "链接含指纹"
+assert_contains "$link" "pbk=$T7_PUB" "链接含公钥 pbk"
+assert_contains "$link" "sid=$T7_SID" "链接含 shortId"
+assert_contains "$link" "type=tcp" "链接含传输协议"
+assert_contains "$link" "%E6%88%91%E7%9A%84%E8%8A%82%E7%82%B9" "备注被 URL 编码"
+
+# IPv6 地址在分享链接里必须加方括号，否则客户端导入即废。
+link6=$(build_share_link "$T7_UUID" "2001:db8::1" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" "v6")
+assert_contains "$link6" "@[2001:db8::1]:$T7_PORT" "IPv6 地址在分享链接里加了方括号"
+
+# ── FLOW / FINGERPRINT 是【全局状态】，不能被写死 ──────────────
+# 变异实测：把 ${FLOW:-…} / ${FINGERPRINT:-…} 换成字面量 → 0 条红。
+_saved_flow="${FLOW:-}"; _saved_fp="${FINGERPRINT:-}"
+FLOW='xtls-rprx-vision-alt'; FINGERPRINT='firefox'
+linkg=$(build_share_link "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" "$T7_REMARK")
+assert_contains "$linkg" "flow=xtls-rprx-vision-alt" "build_share_link 使用全局 FLOW 而不是写死"
+assert_contains "$linkg" "fp=firefox" "build_share_link 使用全局 FINGERPRINT 而不是写死"
+FLOW="$_saved_flow"; FINGERPRINT="$_saved_fp"
+
+# 同上：mktemp 失败时路径为空会写出 ".render" 污染仓库 → 必须守卫。
+ccfg=$(mktemp)
+if [[ -z "$ccfg" ]]; then
+  assert_eq "mktemp 能创建临时文件" "失败（mktemp 返回空路径）" "客户端渲染用例前提：mktemp 必须可用"
+else
+render_client_config "$ccfg" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" >/dev/null
+# 判活用【功能可用】而不是 have_cmd（见 Task 5 处的同一条说明）。
+if python3 -c 'import json' >/dev/null 2>&1; then
+  assert_status 0 "$(python3 -c "import json,sys;json.load(open(sys.argv[1]));print(0)" "$ccfg" 2>/dev/null || echo 1)" "客户端配置是合法 JSON"
+else
+  # 同 Task 5：python3 不可用不是缺陷，只登记一条说明以保持条数恒定。
+  assert_eq "python3 功能不可用" "python3 功能不可用" \
+    "python3 功能探测未通过：客户端 JSON 合法性校验已跳过（条数保持恒定）"
+fi
+assert_contains "$(cat "$ccfg")" '"port": 1080' "客户端含 socks 入站 1080"
+assert_contains "$(cat "$ccfg")" '"port": 1081' "客户端含 http 入站 1081"
+assert_contains "$(cat "$ccfg")" '"publicKey": "'"$T7_PUB"'"' "客户端含公钥"
+assert_contains "$(cat "$ccfg")" '"serverName": "'"$T7_SNI"'"' "客户端含 serverName"
+assert_contains "$(cat "$ccfg")" '"fingerprint": "chrome"' "客户端含 fingerprint"
+assert_contains "$(cat "$ccfg")" '"id": "'"$T7_UUID"'"' "客户端含 UUID"
+
+# ── 注入面：未加引号的 heredoc 会【执行】入参里的 $(...) / 反引号 ──────────────
+# 控制器实证：把 '$(echo PWNED_UUID)' 传进 UUID、'`echo PWNED_SNI`' 传进 SNI、
+# '$(echo PWNED_PUB)' 传进公钥 —— 三个都被【真实执行】，执行结果被写进了 client.json。
+# 非法端口（"443; id"）还会把 JSON 【直接写坏】→ 客户端拿到的是废文件。
+# 处置：函数自身加白名单校验（Step 3），入参不合法时返回 1 且【不落盘】。
+rc=0
+render_client_config "$ccfg.inj.uuid" '$(echo PWNED_UUID)' "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" >/dev/null 2>&1 || rc=$?
+assert_status 1 "$rc" "render_client_config 拒绝含命令替换的 UUID"
+rc=0
+render_client_config "$ccfg.inj.sni" "$T7_UUID" "$T7_IP" "$T7_PORT" 'x$(echo PWNED_SNI).com' "$T7_PUB" "$T7_SID" >/dev/null 2>&1 || rc=$?
+assert_status 1 "$rc" "render_client_config 拒绝含命令替换的 SNI"
+rc=0
+render_client_config "$ccfg.inj.pub" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" '$(echo PWNED_PUB)' "$T7_SID" >/dev/null 2>&1 || rc=$?
+assert_status 1 "$rc" "render_client_config 拒绝含命令替换的公钥"
+rc=0
+render_client_config "$ccfg.inj.port" "$T7_UUID" "$T7_IP" '443; id' "$T7_SNI" "$T7_PUB" "$T7_SID" >/dev/null 2>&1 || rc=$?
+assert_status 1 "$rc" "render_client_config 拒绝非法端口"
+rc=0
+render_client_config "$ccfg.inj.sid" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" 'zz; id' >/dev/null 2>&1 || rc=$?
+assert_status 1 "$rc" "render_client_config 拒绝含命令替换的 ShortID"
+# IP 也是【未加引号的 heredoc】的一部分 → 同样能被执行 → 必须也走白名单。
+rc=0
+render_client_config "$ccfg.inj.ip" "$T7_UUID" '$(echo PWNED_IP)' "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" >/dev/null 2>&1 || rc=$?
+assert_status 1 "$rc" "render_client_config 拒绝含命令替换的 IP"
+# 拒绝时【不得落盘】：否则半截/被污染的配置会留在磁盘上。
+if [[ -e "$ccfg.inj.uuid" || -e "$ccfg.inj.port" || -e "$ccfg.inj.ip" ]]; then leaked=1; else leaked=0; fi
+assert_eq "0" "$leaked" "render_client_config 拒绝非法入参时不得落盘"
+
+# ── 目标路径是【已存在的目录】时必须报错（mv 会把文件移进目录里）──────────────
+mkdir -p "$ccfg.dir"
+out=$(render_client_config "$ccfg.dir" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" 2>&1); rc=$?
+assert_status 1 "$rc" "render_client_config 在目标路径是目录时返回非零"
+assert_contains "$out" "目录" "render_client_config 在目标路径是目录时给出明确提示"
+
+# ── 目标目录不存在时必须给出【我们自己的】提示（而不是裸的 bash 报错）────────────
+out=$(render_client_config "$ccfg.d/no-such-dir/client.json" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" 2>&1); rc=$?
+assert_status 1 "$rc" "render_client_config 在目标目录不存在时返回非零"
+assert_contains "$out" "无法写入配置暂存文件" "render_client_config 在目标目录不存在时给出自己的错误提示（而不是裸的 bash 报错）"
+
+# ── chmod 必须【早于】mv ──────────────
+# 权限设置失败时文件已经落位 → 函数返回非零但磁盘上多了一份权限不对的配置。
+out=$( ( chmod() { return 1; }; render_client_config "$ccfg.perm" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" 2>&1 ) ); rc=$?
+assert_status 1 "$rc" "render_client_config 在 chmod 失败时返回非零"
+if [[ -e "$ccfg.perm" ]]; then landed=1; else landed=0; fi
+assert_eq "0" "$landed" "render_client_config 在 chmod 失败时不得落位（chmod 必须早于 mv）"
+
+# ── mv 失败必须报错（不得静默成功）──────────────
+out=$( ( mv() { return 1; }; render_client_config "$ccfg.mvf" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" 2>&1 ) ); rc=$?
+assert_status 1 "$rc" "render_client_config 在 mv 失败时返回非零"
+assert_contains "$out" "无法写入客户端配置" "render_client_config 在 mv 失败时给出明确提示"
+
+# ── 内部暂存名必须是 .render（不得与 write_config_atomic 的 .new 撞名）────────────
+mv_log="$ccfg.mvlog"
+: > "$mv_log"
+out=$( ( mv() { printf '%s\n' "$*" >> "$mv_log"; command mv "$@"; }
+         render_client_config "$ccfg.mv" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" 2>&1 ) ); rc=$?
+assert_status 0 "$rc" "render_client_config 渲染到指定路径成功"
+assert_eq "1" "$(grep -Fc "$ccfg.mv.render" "$mv_log" 2>/dev/null || printf 0)" \
+  "render_client_config 的暂存名必须是 .render（不得与 write_config_atomic 的 .new 撞名）"
+
+rm -f "$ccfg" "$ccfg.inj.uuid" "$ccfg.inj.sni" "$ccfg.inj.pub" "$ccfg.inj.port" "$ccfg.inj.sid" \
+      "$ccfg.inj.ip" "$ccfg.perm" "$ccfg.mv" "$ccfg.mvlog" "$ccfg.mvf"
+rm -rf "$ccfg.dir"
+fi
+
+test_case "客户端物料导出"
+
+# export_client_artifacts 此前【几乎没有测试】—— 而它正是产出分享链接的函数。
+exp_dir=$(mktemp -d 2>/dev/null)
+if [[ -n "$exp_dir" ]]; then
+  out=$( export_client_artifacts "$exp_dir" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" "$T7_REMARK" 2>&1 ); rc=$?
+  assert_status 0 "$rc" "export_client_artifacts 成功返回 0"
+  assert_contains "$(cat "$exp_dir/link.txt" 2>/dev/null)" "vless://$T7_UUID@$T7_IP:$T7_PORT" "link.txt 含分享链接"
+  assert_contains "$(cat "$exp_dir/client.txt" 2>/dev/null)" "UUID: $T7_UUID" "client.txt 含 UUID"
+  # 备注不出现在 client.txt 的明文字段里（只作为分享链接的 fragment，URL 编码后出现）
+  assert_contains "$(cat "$exp_dir/client.txt" 2>/dev/null)" "%E6%88%91%E7%9A%84%E8%8A%82%E7%82%B9" "client.txt 的分享链接里备注被 URL 编码"
+  if [[ -s "$exp_dir/client.json" ]]; then jf=1; else jf=0; fi
+  assert_eq "1" "$jf" "client.json 已生成且非空"
+
+  # ── client.txt 里显示的 flow / fp 必须与实际配置一致 ──────────────
+  # 原来这里写死了 "xtls-rprx-vision" / "chrome" → 与 build_share_link 用的全局状态
+  # 可能不一致 → 用户照着显示的值排查会查错方向。
+  _saved_flow="${FLOW:-}"; _saved_fp="${FINGERPRINT:-}"
+  FLOW='xtls-rprx-vision-alt'; FINGERPRINT='firefox'
+  out=$( export_client_artifacts "$exp_dir/g" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" "$T7_REMARK" 2>&1 ); rc=$?
+  assert_status 0 "$rc" "export_client_artifacts 在自定义 flow/fp 时成功"
+  assert_contains "$(cat "$exp_dir/g/client.txt" 2>/dev/null)" "流控 (flow): xtls-rprx-vision-alt" "client.txt 显示的流控与全局状态一致"
+  assert_contains "$(cat "$exp_dir/g/client.txt" 2>/dev/null)" "指纹 (fp): firefox" "client.txt 显示的指纹与全局状态一致"
+  assert_contains "$(cat "$exp_dir/g/client.json" 2>/dev/null)" '"flow": "xtls-rprx-vision-alt"' "client.json 的流控与全局状态一致"
+  assert_contains "$(cat "$exp_dir/g/client.json" 2>/dev/null)" '"fingerprint": "firefox"' "client.json 的指纹与全局状态一致"
+  FLOW="$_saved_flow"; FINGERPRINT="$_saved_fp"
+
+  # ── 二维码：缺 qrencode 时明确告知；有 qrencode 时真的生成文件 ──────────────
+  out=$( ( have_cmd() { case "$1" in qrencode) return 1 ;; *) return 0 ;; esac; }
+           export_client_artifacts "$exp_dir/noqr" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" "$T7_REMARK" 2>&1 ) ); rc=$?
+  assert_status 0 "$rc" "export_client_artifacts 在没有 qrencode 时仍然成功"
+  assert_contains "$out" "未安装 qrencode" "export_client_artifacts 在没有 qrencode 时明确告知"
+  out=$( ( have_cmd() { case "$1" in qrencode) return 0 ;; *) return 0 ;; esac; }
+           qrencode() { local prev='' a; for a in "$@"; do
+                          if [[ "$prev" == "-o" ]]; then printf 'QR' > "$a"; fi
+                          prev="$a"; done; return 0; }
+           export_client_artifacts "$exp_dir/qr" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" "$T7_REMARK" 2>&1 ) ); rc=$?
+  assert_status 0 "$rc" "export_client_artifacts 在有 qrencode 时成功"
+  if [[ -s "$exp_dir/qr/qrcode.png" ]]; then q1=1; else q1=0; fi
+  assert_eq "1" "$q1" "export_client_artifacts 在有 qrencode 时生成 PNG 二维码"
+  if [[ -s "$exp_dir/qr/qrcode.txt" ]]; then q2=1; else q2=0; fi
+  assert_eq "1" "$q2" "export_client_artifacts 在有 qrencode 时生成终端二维码"
+
+  # ── 四条失败路径：每一条都必须返回非零并给出自己的提示 ──────────────
+  # 全局约束：所有失败路径必须以非零退出码结束，且经 tui_err 输出。
+  #
+  # ⚠️ mock 的写法很关键（控制器实测踩过坑）：
+  #   · mkdir 的 mock 必须【真的把目录建出来】再返回失败 —— 否则目录不存在 →
+  #     后面 chmod 也会失败 → 函数照样返回非零 → 「返回非零」那条断言恒绿，
+  #     真正变红的只有「给出明确提示」那条（判别力落空）。
+  #   · chmod 的 mock 必须【只对 700 失败】—— 否则 render_client_config 内部的
+  #     chmod 600 也会失败 → 提前从别的分支返回非零 → 同样把「返回非零」那条
+  #     断言变成恒绿。
+  out=$( ( mkdir() { command mkdir "$@"; return 1; }
+           export_client_artifacts "$exp_dir/mk" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" "$T7_REMARK" 2>&1 ) ); rc=$?
+  assert_status 1 "$rc" "export_client_artifacts 在目录创建失败时返回非零"
+  assert_contains "$out" "无法创建客户端导出目录" "export_client_artifacts 在目录创建失败时给出明确提示"
+  out=$( ( chmod() { if [[ "$1" == "700" ]]; then return 1; fi; command chmod "$@"; }
+           export_client_artifacts "$exp_dir/cm" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" "$T7_REMARK" 2>&1 ) ); rc=$?
+  assert_status 1 "$rc" "export_client_artifacts 在目录权限设置失败时返回非零"
+  assert_contains "$out" "无法设置客户端导出目录权限" "export_client_artifacts 在目录权限设置失败时给出明确提示"
+  out=$( ( build_share_link() { printf ''; }
+           export_client_artifacts "$exp_dir/lk" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" "$T7_REMARK" 2>&1 ) ); rc=$?
+  assert_status 1 "$rc" "export_client_artifacts 在分享链接为空时返回非零"
+  assert_contains "$out" "分享链接生成为空" "export_client_artifacts 在分享链接为空时给出明确提示"
+  out=$( ( render_client_config() { return 1; }
+           export_client_artifacts "$exp_dir/rc" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" "$T7_REMARK" 2>&1 ) ); rc=$?
+  assert_status 1 "$rc" "export_client_artifacts 在客户端配置渲染失败时返回非零"
+
+  # ── 物料文件的写入/权限失败路径同样必须报错（不得静默成功）──────────────
+  # 让 client.txt 先是一个【目录】→ 重定向必然失败。
+  mkdir -p "$exp_dir/fw/client.txt"
+  out=$( export_client_artifacts "$exp_dir/fw" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" "$T7_REMARK" 2>&1 ); rc=$?
+  assert_status 1 "$rc" "export_client_artifacts 在客户端信息文件写入失败时返回非零"
+  assert_contains "$out" "无法写入客户端信息文件" "export_client_artifacts 在客户端信息文件写入失败时给出明确提示"
+  # chmod 只对 client.txt 失败 → 其余 chmod 正常 → 退出码只由这一条路径决定。
+  out=$( ( chmod() { case "$2" in "$exp_dir/cmt/client.txt") return 1 ;; esac; command chmod "$@"; }
+           export_client_artifacts "$exp_dir/cmt" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" "$T7_REMARK" 2>&1 ) ); rc=$?
+  assert_status 1 "$rc" "export_client_artifacts 在客户端信息文件权限设置失败时返回非零"
+  assert_contains "$out" "无法设置客户端信息文件权限" "export_client_artifacts 在客户端信息文件权限设置失败时给出明确提示"
+  # 让 link.txt 先是一个【目录】→ 重定向必然失败。
+  mkdir -p "$exp_dir/fw2/link.txt"
+  out=$( export_client_artifacts "$exp_dir/fw2" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" "$T7_REMARK" 2>&1 ); rc=$?
+  assert_status 1 "$rc" "export_client_artifacts 在分享链接文件写入失败时返回非零"
+  assert_contains "$out" "无法写入分享链接文件" "export_client_artifacts 在分享链接文件写入失败时给出明确提示"
+  out=$( ( chmod() { case "$2" in "$exp_dir/cml/link.txt") return 1 ;; esac; command chmod "$@"; }
+           export_client_artifacts "$exp_dir/cml" "$T7_UUID" "$T7_IP" "$T7_PORT" "$T7_SNI" "$T7_PUB" "$T7_SID" "$T7_REMARK" 2>&1 ) ); rc=$?
+  assert_status 1 "$rc" "export_client_artifacts 在分享链接文件权限设置失败时返回非零"
+  assert_contains "$out" "无法设置分享链接文件权限" "export_client_artifacts 在分享链接文件权限设置失败时给出明确提示"
+
+  # 权限位：只在 chmod 真的生效的文件系统上断言（MSYS 模拟 chmod，会自动跳过）
+  exp_probe="$exp_dir/.probe"
+  : >"$exp_probe"
+  chmod 600 "$exp_probe" 2>/dev/null
+  if [[ "$(stat -c '%a' "$exp_probe" 2>/dev/null)" == "600" ]]; then
+    assert_eq "600" "$(stat -c '%a' "$exp_dir/link.txt" 2>/dev/null)" "link.txt 权限为 600"
+    assert_eq "600" "$(stat -c '%a' "$exp_dir/client.txt" 2>/dev/null)" "client.txt 权限为 600"
+    assert_eq "700" "$(stat -c '%a' "$exp_dir" 2>/dev/null)" "客户端导出目录权限为 700"
+  fi
+else
+  assert_eq "mktemp -d 能创建唯一临时目录" "失败（mktemp -d 返回空路径）" \
+    "export_client_artifacts 用例前提：mktemp -d 必须能创建唯一临时目录"
+fi
+rm -rf "$exp_dir"
 test_summary
