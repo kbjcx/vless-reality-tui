@@ -75,6 +75,17 @@ assert_contains "$err" "确认继续" "tui_confirm 提示语走 stderr"
 out=$(printf '\n' | bash "$ROOT/test/helpers/confirm.sh" y 2>/dev/null)
 assert_eq "yes" "$out" "tui_confirm 的 stdout 只有判定结果"
 
+# stdout 的【字节数】必须精确：非 TTY 分支恰好是 "yes\n"（4 字节）——
+# 多出的提示或收尾空行都会让字节数变大（命令替换会吃掉尾部换行，查不出空行）
+n=$(printf '\n' | bash "$ROOT/test/helpers/confirm.sh" y 2>/dev/null | wc -c)
+assert_eq "4" "$n" "tui_confirm 非 TTY 分支 stdout 恰好 4 字节（无提示、无多余空行）"
+
+# TTY 分支：提示与收尾换行都必须走 stderr，stdout 必须【一个字节都没有】
+n=$(printf 'y' | bash -c 'source "$1/lib/tui.sh"; tui_init; TUI_TTY=1; tui_confirm "确认继续" y' _ "$ROOT" 2>/dev/null | wc -c)
+assert_eq "0" "$n" "tui_confirm 的 TTY 分支 stdout 为 0 字节（提示与换行都走 stderr）"
+printf 'y' | bash -c 'source "$1/lib/tui.sh"; tui_init; TUI_TTY=1; tui_confirm "确认继续" y' _ "$ROOT" >/dev/null 2>&1; rc=$?
+assert_status 0 "$rc" "tui_confirm 的 TTY 分支仍返回 0=是"
+
 # 输入：空输入回落到默认值
 # 提示语走 stderr（stdout 只承载用户输入的值），这里静音以保持测试输出干净
 out=$(printf '\n' | bash "$ROOT/test/helpers/input.sh" "默认端口" "443" 2>/dev/null)
@@ -145,6 +156,14 @@ assert_status 255 "$rc" "EOF 必须取消(255)"
 out=$(printf '10\n' | bash "$ROOT/test/helpers/menu_tty.sh" "选择" "A" "B" "C")
 assert_eq "1" "$(printf '%s\n' "$out" | grep -c '编号')" "缓冲区提示行只打印一次"
 
+# I3 的复发点：格式串的 %s 个数必须与实参个数【严格相等】。
+# 运行时区分不了两种错法——实参少于占位符时 bash 补空串（看不出异常），
+# 实参多于占位符时 bash 复用格式串（打印两遍）——所以这里做静态校验。
+fmt=$(grep -o "printf '[^']*编号[^']*'" "$ROOT/lib/tui.sh" | head -1)
+nspec=$(printf '%s' "$fmt" | grep -o '%s' | wc -l)
+nargs=$(grep -A1 "printf '.*编号" "$ROOT/lib/tui.sh" | tail -1 | grep -o '"\$[A-Za-z_]' | wc -l)
+assert_eq "$nspec" "$nargs" "缓冲区提示行格式串 %s 个数（$nspec）与实参个数（$nargs）严格相等"
+
 # 方向键下移后回车 → 选中第 2 项（索引 1）
 out=$( { printf '\033[B'; sleep 0.3; printf '\n'; } | bash "$ROOT/test/helpers/menu_tty.sh" "选择" "A" "B" "C" ); rc=$?
 assert_status 1 "$rc" "方向键下移后回车选中第 2 项(索引 1)"
@@ -172,14 +191,26 @@ assert_status 255 "$rc" "直接按 q 返回 255"
 
 test_case "TUI tui_run 降级路径（临时文件不可用）"
 
-# M1：mktemp 失败 + 回落路径不可写时，命令【仍然必须被执行】——
-# 旧实现会因重定向失败而根本不跑命令，用户只看到一个无原因的 ✖
-mkdir -p "/tmp/.tui.$$" 2>/dev/null
-out=$(mktemp() { return 1; }; tui_run "回落不可用" bash -c 'echo ran-ok; exit 7' 2>&1); rc=$?
-rmdir "/tmp/.tui.$$" 2>/dev/null
+# 制造「临时文件不可用」：让 mktemp 返回一个【目录】路径，重定向必然失败。
+# 用 mktemp -d 建一个唯一目录来制造这个场景，不依赖 /tmp/.tui.$$ 这类
+# 全局路径状态（上一轮遗留同名文件时，用例前提会静默失效）。
+d=$(mktemp -d 2>/dev/null)
+mkdir -p "$d/blocked"
+out=$(mktemp() { printf '%s' "$d/blocked"; }; tui_run "回落不可用" bash -c 'echo ran-ok; exit 7' 2>&1); rc=$?
 assert_status 7 "$rc" "回落路径不可写时命令仍被执行并透传退出码"
 
-# M1：mktemp 失败但回落路径可用时，命令输出仍要被捕获
+# 探测失败不得把 shell 诊断泄漏到 stderr：失败的重定向先于 2>/dev/null 生效，
+# 必须用 { : >"$tmp"; } 2>/dev/null 把整条重定向包起来
+err=$(mktemp() { printf '%s' "$d/blocked"; }; tui_run "回落不可用" bash -c 'true' 2>&1 >/dev/null)
+case "$err" in
+  *"is a directory"*|*"Is a directory"*|*"cannot create"*|*"Permission denied"*) leaked=1 ;;
+  *) leaked=0 ;;
+esac
+assert_eq "0" "$leaked" "临时文件探测失败时不泄漏 shell 诊断到 stderr"
+rm -rf "$d"
+
+# mktemp 真失败时：命令仍被执行，且输出仍能被捕获
+rm -f "/tmp/.tui.$$" 2>/dev/null
 out=$(mktemp() { return 1; }; tui_run "回落可用" bash -c 'echo captured-ok; exit 3' 2>&1); rc=$?
 rm -f "/tmp/.tui.$$" 2>/dev/null
 assert_status 3 "$rc" "mktemp 失败时命令仍被执行并透传退出码"

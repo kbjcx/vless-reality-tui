@@ -265,12 +265,15 @@ tui_kv() {
 # ═══════════════════════════════════════════════════════════════
 # 交互层（Task 2）
 #
-# 约定：
-#   * 菜单类函数返回【0-based 索引】，用户取消返回 255。
+# 约定（下游调用方必须遵守）：
 #   * stdout 语义：凡是把「用户输入的值」交给调用方的函数
 #     （tui_input / tui_input_secret），stdout 只承载该值，提示语走 stderr——
 #     这样 val=$(tui_input "端口" "443") 拿到的才是干净的值。
-#     tui_confirm / tui_menu 的 stdout 是给人看的，不承载值，提示留在 stdout。
+#     tui_confirm 同理：提示走 stderr，它只通过【返回码】给值。
+#   * tui_menu 的【整张菜单】（选项列表 + 提示行）都打到 stdout，
+#     选中项也一并打印；但调用方必须用【返回码】取索引，不要捕获 stdout。
+#     返回码本身就是 0-based 索引：0=第一项，1..n-1=第 n 项，255=用户取消。
+#     注意 1..n-1 也是非零码，不能用 `cmd && a || b` 区分成功与取消。
 #   * 非 TTY（nohup / CI / curl | bash）一律降级为编号列表，绝不挂死。
 #   * 本段外部命令仅限：tui_run 用 mktemp/sed/rm 捕获命令输出，
 #     spinner 用 sleep（lib/tui.sh 硬约束的唯一例外）。
@@ -288,7 +291,9 @@ tui_run() {
   # 临时文件：mktemp 失败时退回一个可预测路径，该路径可能不可写或已被占用。
   # 此时必须【仍然把命令跑起来】——不能因为捕获输出失败就不执行命令，
   # 否则用户只会看到一个没有原因的失败标记。
-  if ! : >"$tmp" 2>/dev/null; then
+  # 注意：失败的重定向本身会把诊断写到 stderr，且发生在 2>/dev/null 生效之前，
+  # 所以要用 { ...; } 2>/dev/null 把整条重定向包起来，不能只挂 2>/dev/null。
+  if ! { : >"$tmp"; } 2>/dev/null; then
     tmp=''
   fi
 
@@ -360,7 +365,8 @@ tui_confirm() {
   # 两种情况都表示「直接回车」→ 落到默认值，而不是被判成「否」。
   ans=${ans//$'\r'/}
   ans=${ans//$'\n'/}
-  printf '\n'
+  # 收尾换行也走 stderr：否则 out=$(tui_confirm ...) 会多带一个空行
+  printf '\n' >&2
   [[ -z "$ans" ]] && ans="$default"
   [[ "${ans,,}" == y* ]]
 }
@@ -452,8 +458,9 @@ tui_menu() {
       # 多一个 %s 会让 bash printf 复用一次格式串，把提示行打印两遍，
       # 而重绘统一按 n+1 行回退 → 缓冲区非空时每次重绘少算一行，
       # 光标逐行下移、ESC[J 清不到上一行残留，菜单整体错位一行。
+      # 少一个 %s 则结尾的颜色重置丢失，终端会残留灰色。
       # 另外数字必须在光标【之前】：渲染成 "10_"，不是 "_10"。
-      printf '     %s编号: %s%s%s_  %s↑↓ 移动 · Enter 确认 · q 取消%s%s\n' \
+      printf '     %s编号: %s%s%s_  %s↑↓ 移动 · Enter 确认 · q 取消%s\n' \
         "$C_GRAY" "$C_ACCENT$C_BOLD" "$buf" "$C_RESET" "$C_GRAY" "$C_RESET"
     else
       printf '     %s↑↓ 移动 · 数字直选 · Enter 确认 · q 取消%s\n' "$C_GRAY" "$C_RESET"
