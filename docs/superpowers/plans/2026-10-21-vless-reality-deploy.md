@@ -18,14 +18,14 @@
 
 - 纯 bash 4.2+，**零第三方 TUI 依赖**（不装 dialog / whiptail / gum / ncurses）
 - 允许使用的外部命令仅限（**运行时 / 分发物内**，即 `dist/install.sh` 与 `lib/`）：
-  - 基础系统工具（Debian 基础系统自带，coreutils 等）：`awk` `sed` `grep` `tr` `cat` `od` `cut` `head` `sort` `seq` `sleep` `date` `uname` `hostname` `env` `timeout` `id` `sysctl`
+  - 基础系统工具（Debian 基础系统自带，coreutils 等）：`awk` `sed` `grep` `tr` `cat` `od` `cut` `head` `sort` `seq` `sleep` `date` `uname` `hostname` `env` `timeout` `id` `sysctl` `dirname`
   - 文件与权限：`mktemp` `cp` `mv` `rm` `mkdir` `chmod` `chown`
   - 网络与系统：`curl` `openssl` `systemctl` `journalctl` `ss` `ip`
   - 防火墙（三选一，缺失时只提示不改规则）：`ufw` `iptables` `nft`
   - 包管理：`apt-get`
   - 可选：`qrencode`（二维码）`python3`（仅 urlencode 回退）`netstat`（仅 `ss` 不可用时的端口探测回退）
   - 被部署的负载程序：`xray`（由官方 `install-release.sh` 安装，非系统自带，但显然是允许调用的）
-  - **CI / 开发期脚本**（不随分发物发布，可用范围更宽）：`git` `find` `xargs` `diff` `docker`
+  - **CI / 开发期脚本**（不随分发物发布，可用范围更宽）：`git` `find` `xargs` `diff` `docker` `stat` `wc`
 - `lib/tui.sh` **不得**包含任何业务判断、文件写入或系统调用（例外仅两处：`mktemp`/`sed`/`rm` 用于 `tui_run` 捕获输出，`sleep` 用于 spinner 帧间隔）
 - 状态文件 `/etc/vless-reality/deploy.env` 权限 `600`，状态目录 `700`；客户端导出目录 `/root/vless-reality/` 权限 `700`
 - 服务端配置写入流程恒为：**写临时文件 → `xray run -test` 校验 → 通过才 `mv` 原子替换**；不通过则保留旧配置并原样输出 xray 报错
@@ -1132,6 +1132,10 @@ bash test/unit.sh
 ```bash
 #!/usr/bin/env bash
 # lib/core.sh — 环境探测与通用能力
+# 本文件只放【纯函数】与【状态持久化】；网络探测类函数属于 Task 4。
+# 注意：本文件【不是自包含】的 —— assert_debian / save_state / load_state 会调用
+# lib/tui.sh 的 tui_err / tui_tip / tui_ok。按计划的「函数归属唯一」约定，
+# core.sh 不主动 source tui.sh，由 install.sh 统一按 tui → core 的顺序引入。
 
 APP_NAME='VLESS + REALITY 部署工具'
 APP_VERSION='1.0.0'
@@ -1146,11 +1150,15 @@ LOG_DIR="${LOG_DIR:-/var/log/xray}"
 
 # 全局部署状态：Task 5/7/9 赋值，Task 3 的 save_state 负责持久化。
 # 必须显式声明：install.sh 跑在 `set -u` 下，未声明又未赋值的变量一旦被引用
-# 就会触发 unbound variable。
-PORT=''; UUID=''; SNI=''; TARGET=''
-PRIVATE_KEY=''; PUBLIC_KEY=''; SHORT_ID=''
-SERVER_IP=''; REMARK=''
-MODE='native'; FLOW='xtls-rprx-vision'; FINGERPRINT='chrome'
+# 就会触发 unbound variable（实测：--menu 路径不经过 preflight → SERVER_IP 从未
+# 探测，deploy_wizard 引用 $SERVER_IP、menu_tune 引用 $PORT 都会直接崩掉，
+# 而且没有 tui_err 提示，用户只看到一句 "SERVER_IP: unbound variable"）。
+# 用 ${VAR:-默认} 而不是 VAR='' ：前者既定义了变量（set -u 安全），
+# 又【保留调用方在 source 之前预设的值】，后者会把预设值清空。
+PORT="${PORT:-}"; UUID="${UUID:-}"; SNI="${SNI:-}"; TARGET="${TARGET:-}"
+PRIVATE_KEY="${PRIVATE_KEY:-}"; PUBLIC_KEY="${PUBLIC_KEY:-}"; SHORT_ID="${SHORT_ID:-}"
+SERVER_IP="${SERVER_IP:-}"; REMARK="${REMARK:-}"
+MODE="${MODE:-native}"; FLOW="${FLOW:-xtls-rprx-vision}"; FINGERPRINT="${FINGERPRINT:-chrome}"
 
 REALITY_TARGETS=(
   'www.microsoft.com'
@@ -1174,7 +1182,9 @@ trim() {
 urlencode() {
   local s="$1"
   if have_cmd python3; then
-    python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "$s" 2>/dev/null && return 0
+    # 必须用 sys.stdout.write 而不是 print：print 会多输出一个尾换行，
+    # 而回退分支没有 —— 同一个函数的两个分支 stdout 字节不一致。
+    python3 -c 'import sys,urllib.parse;sys.stdout.write(urllib.parse.quote(sys.argv[1],safe=""))' "$s" 2>/dev/null && return 0
   fi
   # 回退实现：必须按【字节】遍历，否则多字节字符只会编码首字节。
   # local LC_ALL=C 让 ${#s} 与 ${s:i:1} 都按字节切分。
@@ -1186,8 +1196,10 @@ urlencode() {
     case "$c" in
       [a-zA-Z0-9.~_-]) out+="$c" ;;
       # ' 与 \ 的编码写死：printf '%%%02X' "'$c" 依赖 bash 对「以 ' 开头的字符常量」
-      # 的解释，这是未文档化的实现细节（实测 bash 5.3 给出 39/92，bash 4.2 无保证）。
-      # 写死后任意 bash 4.2+ 结果一致，输出与原写法逐字节相同。
+      # 的解释，这一点【未在本机文档中确认】（bash 5.3.9 实测给出 39/92，
+      # 但 help printf 只列了 %b %q %Q %(fmt)T 四个扩展，未提该形式）。
+      # 把这两个字节的数值写死后，任意 bash 4.2+ 上结果一致，
+      # 输出与原写法逐字节相同（其余字节仍走原写法）。
       "'")  out+='%27' ;;
       '\')  out+='%5C' ;;
       *) out+=$(printf '%%%02X' "'$c") ;;
@@ -1197,14 +1209,29 @@ urlencode() {
 }
 
 random_hex() {
-  local n="${1:-8}"
+  local n="${1:-8}" out=''
+  [[ "$n" =~ ^[0-9]+$ ]] || return 1
+  # 必须【先捕获输出再判断】，不能用 `openssl ... | tr ...; return 0`：
+  # 管道的退出码取自最后一个命令（tr），openssl 失败时 tr 仍返回 0 →
+  # random_hex 会【返回 0 但输出空串】→ 空 SHORT_ID 被原样写进 config.json →
+  # xray run -test 失败 → 部署中止，且报错与真实原因（取不到随机数）完全无关。
   if have_cmd openssl; then
-    # 连 CR 一起删：某些 openssl 构建输出的是 \r\n，只删 LF 会残留一个 \r，
-    # 而这个 \r 会混进 SHORT_ID / 密钥，随后被原样写进 config.json
-    # （JSON 字符串里不允许裸控制字符）→ 直接让部署失败。
-    openssl rand -hex "$n" 2>/dev/null | tr -d '\r\n'; return 0
+    out=$(openssl rand -hex "$n" 2>/dev/null) || out=''
   fi
-  od -An -tx1 -N "$n" /dev/urandom 2>/dev/null | tr -d ' \r\n'
+  if [[ ! "$out" =~ ^[0-9a-f]+$ ]]; then
+    # openssl 不可用或输出不可用 → 退回 /dev/urandom（od 是 coreutils，几乎必然存在）
+    out=$(od -An -tx1 -N "$n" /dev/urandom 2>/dev/null) || out=''
+  fi
+  # 空格与 CR 一起删：od 的输出用空格分隔；某些 openssl 构建（含本开发机的
+  # MSYS2 版本）输出的是 \r\n，只删 LF 会残留一个 \r，而这个 \r 会混进
+  # SHORT_ID / 密钥，随后被原样写进 config.json（JSON 字符串里不允许裸控制
+  # 字符）→ 直接让部署失败。Debian 自带的 openssl 只输出 \n，多删一个 \r
+  # 对其无影响。
+  out=$(printf '%s' "$out" | tr -d ' \r\n')
+  # 必须是纯小写十六进制：脏输出（错误文本、半截输出）若被原样写进 config.json，
+  # 失败点会被推迟到 xray 校验，报错与真实原因完全无关。
+  [[ -n "$out" && "$out" =~ ^[0-9a-f]+$ ]] || return 1
+  printf '%s' "$out"
 }
 
 read_file() {
@@ -1214,10 +1241,17 @@ read_file() {
 }
 
 detect_os() {
-  local os_release="${1:-/etc/os-release}" id='' ver='' arch=''
+  local os_release="${1:-/etc/os-release}" id='' ver='' arch='' pair=''
   if [[ -r "$os_release" ]]; then
-    id=$(. "$os_release"; printf '%s' "${ID:-}")
-    ver=$(. "$os_release"; printf '%s' "${VERSION_ID:-}")
+    # 只接受受信任路径：os-release 是 shell 片段，`.` 引入等价于执行代码。
+    # 本函数只用于 /etc/os-release 与测试用临时文件，不接受用户可控输入。
+    # 只 source 一次，同时取出 ID 与 VERSION_ID。
+    pair=$(. "$os_release" 2>/dev/null; printf '%s|%s' "${ID:-}" "${VERSION_ID:-}")
+    # 连 CR 一起删：CRLF 行尾的 os-release 会让 ID 变成 "debian\r" →
+    # assert_debian 误判成「不是 Debian」。Debian 自带的 os-release 是 LF，
+    # 但 /etc 里也可能存在被 CRLF 改写过的副本。
+    id=$(printf '%s' "${pair%%|*}" | tr -d '\r')
+    ver=$(printf '%s' "${pair#*|}" | tr -d '\r')
   fi
   case "$(uname -m)" in
     x86_64|amd64)  arch='amd64' ;;
@@ -1279,8 +1313,12 @@ state_quote() {
 }
 
 save_state() {
-  mkdir -p "$STATE_DIR"
-  chmod 700 "$STATE_DIR"
+  # 每一步都必须检查返回码：把「没写成功」伪装成「配置已保存」是最坏的失败模式
+  # —— 状态没落盘，但用户以为成功了 → 之后 --status 显示未部署、卸载流程拿不到
+  # 端口 → 防火墙规则被遗留。触发条件虽窄（root + 正常 /etc 时不会发生），
+  # 但磁盘满、/etc 只读、STATE_DIR 配错都会触发。
+  mkdir -p "$STATE_DIR" || { tui_err "无法创建状态目录：$STATE_DIR"; return 1; }
+  chmod 700 "$STATE_DIR" || { tui_err "无法设置状态目录权限：$STATE_DIR"; return 1; }
   local tmp="$STATE_FILE.tmp"
   {
     printf '# %s v%s 部署状态（勿手工编辑）\n' "$APP_NAME" "$APP_VERSION"
@@ -1297,16 +1335,30 @@ save_state() {
     printf 'REMARK=%s\n' "$(state_quote "${REMARK:-}")"
     printf 'FLOW=%s\n' "$(state_quote "${FLOW:-xtls-rprx-vision}")"
     printf 'FINGERPRINT=%s\n' "$(state_quote "${FINGERPRINT:-chrome}")"
-  } >"$tmp"
-  chmod 600 "$tmp"
-  mv -f "$tmp" "$STATE_FILE"
+  } >"$tmp" || { tui_err "无法写入状态临时文件：$tmp"; rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp" || { tui_err "无法设置状态文件权限：$tmp"; rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$STATE_FILE" || { tui_err "无法保存状态文件：$STATE_FILE"; rm -f "$tmp"; return 1; }
   tui_ok "配置已保存：$STATE_FILE"
 }
 
 load_state() {
   [[ -f "$STATE_FILE" ]] || return 1
+  # 状态文件是纯变量赋值，正常 source 必定【静默】。
+  # 先在子 shell 里做一次静默探测：语法错误一定有 stderr 输出，而
+  # 「文件最后一条命令返回非零」不会 —— 这样只抓真正的语法错误，
+  # 不会把合法状态文件误判成损坏。命令替换跑在子 shell，变量不会落到当前
+  # 作用域，所以探测之后还要再 source 一次。
+  local probe_err=''
+  probe_err=$( . "$STATE_FILE" 2>&1 >/dev/null ) || true
+  if [[ -n "$probe_err" ]]; then
+    tui_err "状态文件格式错误：$STATE_FILE"
+    tui_tip "${probe_err%%$'\n'*}"
+    return 1
+  fi
   # shellcheck disable=SC1090
-  . "$STATE_FILE"
+  # 这里的返回码【不作为失败判据】：状态文件最后一条命令返回非零是合法的
+  # （例如末尾是一条返回 1 的语句），真正坏掉的文件已在上面的探测里被拦下。
+  . "$STATE_FILE" || true
   return 0
 }
 
@@ -1328,15 +1380,157 @@ git add lib/core.sh test/unit.sh
 git commit -m "feat(core): 纯函数工具集与部署状态持久化"
 ```
 
-> **实施说明（Task 3 已完成，以 `lib/core.sh` 与 `test/unit.sh` 为准）**：上面的 Step 1
-> 是本任务的**最低规格**。实际实现在此基础上把用例拆成 4 组
-> （`core 纯函数` / `core SNI 主机名校验` / `core 状态持久化` / `core 常量与文件边界`），
-> 并补充到 **130 条断言全部通过**（Task 2 结束时 52 条）。实现有 3 处受控偏离：
-> `urlencode` 写死 `'`→`%27`、`\`→`%5C`（bash 的字符常量解析未文档化）；
-> `random_hex` 连 `\r` 一起删（openssl 的 `\r\n` 会把裸控制字符带进 config.json）；
-> Step 1 里 `urlencode 保留安全字符` 的期望值原为笔误（见 Step 1 上方说明）。
-> 逐条证据见 `.superpowers/sdd/2026-10-21-vless-reality-deploy/task-3-report.md`。
-> **本任务后续不再修改**；Task 4 只在 `lib/core.sh` 末尾追加网络探测函数。
+---
+
+### 修复轮 1/5（独立评审 FAIL 后追加）—— 本节是**本任务的最终真相**
+
+> 本节由控制器在独立评审（结论 **FAIL**：2 条 Important + 7 条 Minor + 7 条范围外观察）后写入。
+> **Step 3 的代码块已同步为最终权威版本**：`lib/core.sh` 必须与它**逐字节一致**。
+> Step 1 的用例是本任务的**最低规格**；下面「新增断言」是必须补齐的部分，
+> 与 Step 1 并集构成 `test/unit.sh` 里 Task 3 的全部用例。
+
+#### 逐项发现与处置
+
+| 编号 | 类别 | 处置 | 落在哪 |
+|---|---|---|---|
+| I-1 | **Important** | `lib/core.sh` 顶部常量区之后补全局状态变量声明块，用 `${VAR:-}` 形式（既 `set -u` 安全，又**保留调用方预设的值**） | Step 3 代码块 |
+| I-2 | **Important** | `save_state` 每一步都检查返回码：失败 → `tui_err` + `return 1`，绝不打印「配置已保存」 | Step 3 代码块 |
+| M-1 | Minor | `load_state` 对损坏的状态文件返回非零；用「子 shell 静默探测」区分**语法错误**与**末条命令返回非零** | Step 3 代码块 |
+| M-2 / F-16 | Minor | `random_hex` 失败必须返回非零（不能静默返回空串）；openssl 输出非法时退回 `/dev/urandom` | Step 3 代码块 |
+| M-3 | Minor（计划侧） | 运行时白名单补 `dirname`（`lib/core.sh` 的 `LIB_DIR` 在用） | Global Constraints |
+| M-4 | Minor（计划侧） | `--port` 在 `parse_args` 里就做范围校验（`10#` 前缀），不能只校验交互式输入那条路径 | Task 8 |
+| M-5 | Minor（测试强度） | ① 钉住 REALITY_TARGETS 的**全部 7 个**目标（换掉一个原先测不出来）；② 权限位补**行为断言**（`stat -c %a`），真机生效、本机自动跳过 | 新增断言 |
+| M-6 | 流程 | 简报只作**派工原件**；一切修订落在**被 git 跟踪的计划**里。本节取代原先的「实施说明」 | 本节 |
+| M-7 | Minor | `urlencode` 的 python 分支改用 `sys.stdout.write`（去掉尾换行），两分支 stdout 字节一致 | Step 3 代码块 |
+| O-1 | 范围外 → **并入本轮** | `detect_os` 去掉 os-release 里的 CR（CRLF 会让 ID 变成 `debian\r` → 误判非 Debian），并只 source 一次 | Step 3 代码块 |
+| O-2 | 范围外 | `lib/core.sh` 文件头注明「**不是自包含**的，需先 source `lib/tui.sh`」 | Step 3 代码块 |
+| O-3 | 报告事实错误 | 实施报告称「`save_state` 会剥掉 REMARK 末尾换行」是**错的**（实测往返逐字节一致）——**更正报告，不改代码**，避免后续任务去「修」一个不存在的 bug | 更正报告 |
+| O-6 | 范围外 | `detect_os` 的路径参数只接受受信任路径（os-release 是 shell 片段，`.` 引入等价于执行代码） | Step 3 代码块注释 |
+| O-7 | 范围外 → **不改** | `lib/tui.sh` 里 9 处同样的 `printf '%%%02X' "'$c"` 惯用法**保持不动**：该写法是普通字符串（双引号里的单引号），并非 bash 的「字符常量」；bash 5.x 实测逐字节正确，而 `lib/tui.sh` 是已闭环评审的产物，为理论风险重开它不划算。记为 deferred minor | 账本 |
+| F-18 | 文档 | 设计稿 4.1 的依赖图漏了 `core.sh → tui.sh` 这条边（计划正文的 File Structure 有） | 留到 Task 13 收尾补设计稿 |
+
+#### 新增断言（追加到 `test/unit.sh`）
+
+> 追加在 `test_summary` 之前，作为独立的一组。
+
+```bash
+test_case "core 修复轮 1 回归（评审发现项）"
+
+# ── I-1：全局状态变量必须显式声明 ─────────────────────────
+# install.sh 跑在 `set -u` 下；--menu 路径不经过 preflight → SERVER_IP 从未探测，
+# 未声明时 deploy_wizard 引用 $SERVER_IP 会直接崩，且没有 tui_err 提示。
+out=$(bash -c 'set -uo pipefail; source "$1"; printf "%s" "$SERVER_IP"' _ "$ROOT/lib/core.sh" 2>&1); rc=$?
+assert_status 0 "$rc" "core.sh 显式声明了全局状态变量（set -u 下引用不 unbound）"
+out=$(bash -c 'set -uo pipefail; PORT=1234; source "$1"; printf "%s" "$PORT"' _ "$ROOT/lib/core.sh" 2>&1)
+assert_eq "1234" "$out" "core.sh 的声明块保留调用方预设的全局变量（用 ${VAR:-} 而非 VAR=''）"
+
+# ── M-2 / F-16：random_hex 失败必须返回非零 ─────────────────
+# 旧写法 `openssl ... | tr ...; return 0` 的退出码取自 tr，openssl 失败时仍返回 0
+# → 输出空串 → 空 SHORT_ID 进 config.json → xray 报错与真实原因无关。
+out=$( ( have_cmd() { return 1; }; od() { return 1; }; random_hex 4 ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "random_hex 在 openssl 与 od 都不可用时返回非零"
+assert_eq "" "$out" "random_hex 失败时不输出任何内容"
+out=$( ( openssl() { printf 'NOTHEX'; }; random_hex 4 ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "openssl 输出非十六进制时退回 /dev/urandom 而不是把垃圾返回"
+assert_eq "8" "$(printf '%s' "$out" | wc -c | tr -d ' ')" "回退后输出恰好 8 个十六进制字符"
+if [[ "$out" =~ ^[0-9a-f]{8}$ ]]; then hex_ok=1; else hex_ok=0; fi
+assert_eq "1" "$hex_ok" "回退后输出是纯小写十六进制"
+
+# ── I-2：save_state 写失败必须返回非零，且不得谎报成功 ───────
+bad_dir=$(mktemp -d 2>/dev/null)
+if [[ -n "$bad_dir" ]]; then
+  : > "$bad_dir/notadir"   # 用一个普通文件占住目录名，让 mkdir -p 必然失败
+  out=$( ( STATE_DIR="$bad_dir/notadir"; STATE_FILE="$bad_dir/notadir/deploy.env"; save_state ) 2>&1 ); rc=$?
+  assert_status 1 "$rc" "save_state 在状态目录无法创建时返回非零"
+  assert_contains "$out" "无法创建状态目录" "save_state 写失败时给出明确错误"
+  if [[ "$out" == *"配置已保存"* ]]; then lied=1; else lied=0; fi
+  assert_eq "0" "$lied" "save_state 写失败时不得打印『配置已保存』"
+else
+  assert_eq "mktemp -d 能创建唯一临时目录" "失败（mktemp -d 返回空路径）" \
+    "save_state 失败路径用例前提：mktemp -d 必须能创建唯一临时目录"
+fi
+rm -rf "$bad_dir"
+
+# ── M-1：状态文件损坏时 load_state 必须返回非零 ───────────────
+bad_dir=$(mktemp -d 2>/dev/null)
+if [[ -n "$bad_dir" ]]; then
+  printf 'PORT=443\nif then fi\n' > "$bad_dir/broken.env"
+  out=$( ( STATE_FILE="$bad_dir/broken.env"; load_state ) 2>&1 ); rc=$?
+  assert_status 1 "$rc" "load_state 对语法错误的状态文件返回非零"
+  assert_contains "$out" "状态文件格式错误" "load_state 对损坏的状态文件给出明确错误"
+  printf 'PORT=443\nfalse\n' > "$bad_dir/lastfalse.env"
+  out=$( ( STATE_FILE="$bad_dir/lastfalse.env"; load_state ) 2>&1 ); rc=$?
+  assert_status 0 "$rc" "load_state 对末条命令返回非零的合法状态文件仍视为可读"
+else
+  assert_eq "mktemp -d 能创建唯一临时目录" "失败（mktemp -d 返回空路径）" \
+    "load_state 失败路径用例前提：mktemp -d 必须能创建唯一临时目录"
+fi
+rm -rf "$bad_dir"
+
+# ── M-7：urlencode 两个分支的 stdout 必须逐字节一致 ──────────
+enc_all="a b'c\\d中文"
+enc_py="$(urlencode "$enc_all")"
+enc_fb="$( ( have_cmd() { return 1; }; urlencode "$enc_all" ) )"
+assert_eq "$enc_py" "$enc_fb" "urlencode 的 python 分支与回退分支输出逐字节一致"
+assert_eq "a%20b%27c%5Cd%E4%B8%AD%E6%96%87" "$enc_py" "urlencode 编码结果正确"
+raw_enc="$(urlencode 'abc' | od -An -c | tr -d ' ')"
+assert_eq "abc" "$raw_enc" "urlencode 输出不含多余的尾换行（od 逐字节可见）"
+
+# ── O-1：detect_os 必须能处理 CRLF 行尾的 os-release ─────────
+crlf_os=$(mktemp 2>/dev/null)
+if [[ -n "$crlf_os" ]]; then
+  printf 'ID=debian\r\nVERSION_ID="12"\r\n' > "$crlf_os"
+  os_crlf="$(detect_os "$crlf_os")"
+  assert_eq "debian" "$(printf '%s' "$os_crlf" | cut -d'|' -f1)" "detect_os 去掉 CRLF os-release 里的 CR"
+  assert_eq "12" "$(printf '%s' "$os_crlf" | cut -d'|' -f2)" "detect_os 去掉 CRLF os-release 里的 CR（version）"
+else
+  assert_eq "mktemp 能创建临时文件" "失败（mktemp 返回空路径）" \
+    "detect_os CRLF 用例前提：mktemp 必须能创建临时文件"
+fi
+rm -f "$crlf_os"
+
+# ── M-5①：REALITY_TARGETS 必须钉住计划指定的全部 7 个目标 ────
+missing_targets=''
+for t in 'www.microsoft.com' 'dl.google.com' 'www.apple.com' 'one.one.one.one' 'www.cloudflare.com' 'time.akamai.com' 'addons.mozilla.org'; do
+  found=0
+  for x in ${REALITY_TARGETS[@]+"${REALITY_TARGETS[@]}"}; do
+    if [[ "$x" == "$t" ]]; then found=1; break; fi
+  done
+  if [[ $found -eq 0 ]]; then missing_targets+="$t "; fi
+done
+assert_eq "" "$missing_targets" "REALITY_TARGETS 包含计划指定的全部 7 个目标"
+
+# ── M-5②：权限位【行为断言】——只在 chmod 真的生效的文件系统上跑 ──
+# Debian 真机必然生效；本开发机（MSYS）的 chmod 是模拟的，probe_mode != 600 → 跳过。
+perm_dir=$(mktemp -d 2>/dev/null)
+if [[ -n "$perm_dir" ]]; then
+  : > "$perm_dir/probe"
+  chmod 600 "$perm_dir/probe" 2>/dev/null
+  probe_mode="$(stat -c '%a' "$perm_dir/probe" 2>/dev/null)"
+  if [[ "$probe_mode" == "600" ]]; then
+    ( STATE_DIR="$perm_dir/sd"; STATE_FILE="$perm_dir/sd/deploy.env"; save_state >/dev/null 2>&1 )
+    assert_eq "600" "$(stat -c '%a' "$perm_dir/sd/deploy.env" 2>/dev/null)" "save_state 写出的状态文件权限为 600"
+    assert_eq "700" "$(stat -c '%a' "$perm_dir/sd" 2>/dev/null)" "save_state 建出的状态目录权限为 700"
+  fi
+fi
+rm -rf "$perm_dir"
+```
+
+#### 修复轮的验收标准
+
+1. `lib/core.sh` 与本计划 Task 3 的 **Step 3 代码块逐字节一致**（`diff` 为空）。
+2. `test/unit.sh` 含上面「新增断言」的**全部**用例，且 Task 1/2 的 52 条旧断言**一行未删**。
+3. `bash test/unit.sh` 全部通过、退出码 0。
+4. `lib/tui.sh` **一字未动**（Task 1/2 已评审通过，任何改动都要重开 Task 2）。
+5. 红灯证据：把 Step 3 代码块里的 F-10 声明块 / `save_state` 错误处理 / `load_state` 错误处理
+   / `random_hex` 返回码分别改回旧写法，对应新增断言必须**逐条变红**。
+
+#### 顺带要求（不改代码，但必须做）
+
+- **更正实施报告**：实施报告称「`save_state` 会剥掉 REMARK 末尾的换行」是**错的** ——
+  命令替换只剥 `state_quote` 输出的末尾换行，而输出以 `'` 结尾，什么都没剥；
+  save→load 往返实测逐字节一致。请更正 `.superpowers/sdd/.../task-3-report.md`，
+  否则后续任务会去「修」一个不存在的 bug。
 
 ---
 
@@ -1669,7 +1863,10 @@ gen_keys() {
   UUID=$("$XRAY_BIN" uuid 2>/dev/null | tr -d '[:space:]')
   [[ -z "$UUID" ]] && { tui_err "执行 xray uuid 失败"; return 1; }
 
-  SHORT_ID=$(random_hex 4)
+  # random_hex 失败时返回非零（且输出可能为空）→ 必须检查，否则空 SHORT_ID
+  # 会被原样写进 config.json，xray 校验失败时报错与真实原因无关。
+  SHORT_ID=$(random_hex 4) || { tui_err "生成 ShortID 失败（openssl / od 不可用？）"; return 1; }
+  [[ -n "$SHORT_ID" ]] || { tui_err "生成的 ShortID 为空"; return 1; }
   tui_ok "密钥对已生成"
   tui_kv "公钥 (pbk)" "$PUBLIC_KEY"
   tui_kv "ShortID (sid)" "$SHORT_ID"
@@ -2367,7 +2564,15 @@ parse_args() {
       --status)      OPT_STATUS=1; shift ;;
       --uninstall)   OPT_UNINSTALL=1; shift ;;
       -h|--help)     usage; exit 0 ;;
-      -p|--port)     OPT_PORT="${2:-}"; [[ -n "$OPT_PORT" ]] || { tui_err "--port 缺少参数"; exit 1; }; shift 2 ;;
+      -p|--port)     OPT_PORT="${2:-}"; [[ -n "$OPT_PORT" ]] || { tui_err "--port 缺少参数"; exit 1; }
+                     # 端口范围必须在【参数解析口】就拦一次：只校验交互式输入那条路径不够，
+                     # --port 99999 会被接受并写进 config.json → 部署晚一步才因 xray 报错而中止。
+                     # 10# 前缀：用户输入 "08" 时不能被当成八进制。
+                     if ! [[ "$OPT_PORT" =~ ^[0-9]+$ ]] || (( 10#$OPT_PORT < 1 || 10#$OPT_PORT > 65535 )); then
+                       tui_err "--port 必须是 1-65535 之间的整数：$OPT_PORT"
+                       exit 1
+                     fi
+                     shift 2 ;;
       -s|--sni)      OPT_SNI="${2:-}"; [[ -n "$OPT_SNI" ]] || { tui_err "--sni 缺少参数"; exit 1; }; shift 2 ;;
       -n|--name)     OPT_NAME="${2:-}"; [[ -n "$OPT_NAME" ]] || { tui_err "--name 缺少参数"; exit 1; }; shift 2 ;;
       --uuid)        OPT_UUID="${2:-}"; [[ -n "$OPT_UUID" ]] || { tui_err "--uuid 缺少参数"; exit 1; }; shift 2 ;;
@@ -2709,6 +2914,24 @@ deploy_wizard() {
         *) tui_info "已取消部署"; return 1 ;;
       esac
     fi
+  fi
+
+  # SERVER_IP 由 preflight 负责探测，但 --menu 路径【不经过 preflight】
+  # （install.sh 的 --menu 分支只有 require_root + load_state + management_menu）。
+  # 未部署时 load_state 什么都没赋值 → SERVER_IP 未绑定：
+  #   · 引用它 → set -u 下 bash 直接退出，用户只看到 "SERVER_IP: unbound variable"；
+  #   · 即使补了全局声明，空的 SERVER_IP 也会让分享链接变成 "vless://uuid@:443?..."
+  #     → 主机名为空 → 客户端导入即废。
+  # 所以这里必须自己兜底探测一次。
+  if [[ -z "${SERVER_IP:-}" ]]; then
+    SERVER_IP=$(detect_public_ip 2>/dev/null || true)
+    [[ -n "$SERVER_IP" ]] || SERVER_IP=$(detect_local_ip 2>/dev/null || true)
+    if [[ -z "$SERVER_IP" ]]; then
+      tui_err "无法探测到本机地址，部署中止。"
+      tui_tip "可在 NAT 后的服务器上手工指定地址，或检查出网是否正常。"
+      return 1
+    fi
+    tui_warn "未能自动探测到公网地址，已回退使用本机地址：$SERVER_IP"
   fi
 
   # 伪装目标
