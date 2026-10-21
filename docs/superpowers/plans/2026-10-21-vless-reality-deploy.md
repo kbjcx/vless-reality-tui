@@ -23,7 +23,7 @@
   - 网络与系统：`curl` `openssl` `systemctl` `journalctl` `ss` `ip`
   - 防火墙（三选一，缺失时只提示不改规则）：`ufw` `iptables` `nft`
   - 包管理：`apt-get`
-  - 可选：`qrencode`（二维码）`python3`（仅 urlencode 回退）
+  - 可选：`qrencode`（二维码）`python3`（仅 urlencode 回退）`netstat`（仅 `ss` 不可用时的端口探测回退）
   - 被部署的负载程序：`xray`（由官方 `install-release.sh` 安装，非系统自带，但显然是允许调用的）
   - **CI / 开发期脚本**（不随分发物发布，可用范围更宽）：`git` `find` `xargs` `diff` `docker`
 - `lib/tui.sh` **不得**包含任何业务判断、文件写入或系统调用（例外仅两处：`mktemp`/`sed`/`rm` 用于 `tui_run` 捕获输出，`sleep` 用于 spinner 帧间隔）
@@ -1310,16 +1310,29 @@ git commit -m "feat(core): 纯函数工具集与部署状态持久化"
 ```bash
 test_case "core 网络探测（用可控输入验证解析逻辑）"
 
-# 端口判定：用一个必然空闲的高位端口
-assert_false "$(port_in_use 59999)" "高位端口 59999 判定为空闲"
-assert_false "$(port_occupant 59999)" "空闲端口无占用进程"
+# 端口判定：用一个必然空闲的高位端口。
+# 注意：port_in_use / target_supports_tls13 的结果在【退出码】上，
+# 不能写成 assert_false "$(port_in_use 59999)" —— $( ) 捕获的是 stdout（空串），
+# 退出码被丢掉，断言会恒真通过（测不出任何东西）。
+port_in_use 59999; rc=$?
+assert_false "$rc" "高位端口 59999 判定为空闲"
+assert_eq "" "$(port_occupant 59999)" "空闲端口无占用进程"
 
 # 延迟解析：传入一个必然超时的域名，应返回 '?'
-assert_eq "?" "$(target_latency_ms 'invalid.invalid.nonexistent' 2>/dev/null || printf '?')" "不可达目标返回 ?"
+assert_eq "?" "$(target_latency_ms 'invalid.invalid.nonexistent' 2>/dev/null)" "不可达目标返回 ?"
 
 # 真实目标：至少一个候选站点应支持 TLS1.3（网络不可用时跳过断言，不算失败）
 if have_cmd openssl && curl -fsS --max-time 5 -o /dev/null https://www.microsoft.com 2>/dev/null; then
-  assert_true "$(target_supports_tls13 www.microsoft.com)" "www.microsoft.com 支持 TLS 1.3"
+  target_supports_tls13 www.microsoft.com; rc=$?
+  assert_true "$rc" "www.microsoft.com 支持 TLS 1.3"
+fi
+
+# apt update 失败必须中止：否则依赖装不上，调用方却以为装好了。
+# 用 mock 覆盖 tui_run 让它失败（子 shell 内覆盖，不污染测试进程）。
+# 若本机已存在标记文件则跳过（此时函数会提前返回 0，用例前提不成立）。
+if [[ ! -f /var/lib/vless-reality/apt-updated ]]; then
+  ( tui_run() { return 1; }; apt_update_once >/dev/null 2>&1 ); rc=$?
+  assert_false "$rc" "apt update 失败时 apt_update_once 必须返回非零"
 fi
 ```
 
@@ -1417,10 +1430,19 @@ target_latency_ms() {
 apt_update_once() {
   [[ -f /var/lib/vless-reality/apt-updated ]] && return 0
   tui_run "更新软件源索引 (apt update)" apt-get update -y -o Acquire::Retries=3
-  if [[ $? -eq 0 ]]; then
-    mkdir -p /var/lib/vless-reality
-    touch /var/lib/vless-reality/apt-updated
+  local rc=$?
+  # 必须显式判失败并返回非零：若写成
+  #   if [[ $? -eq 0 ]]; then ...; fi
+  # 则 apt update 失败时走假分支，而【无 else 的 if 在条件为假时返回 0】——
+  # apt_update_once 于是「成功」返回，ensure_packages 继续装依赖，
+  # 依赖装不上却没人知道。
+  if (( rc != 0 )); then
+    tui_err "apt update 失败（退出码 $rc），无法继续安装依赖"
+    return 1
   fi
+  mkdir -p /var/lib/vless-reality
+  touch /var/lib/vless-reality/apt-updated
+  return 0
 }
 
 ensure_packages() {
@@ -1429,7 +1451,9 @@ ensure_packages() {
     have_cmd "$p" || missing+=("$p")
   done
   ((${#missing[@]} == 0)) && return 0
-  apt_update_once
+  # apt update 失败必须中止，否则依赖静默装不上而部署继续往下走。
+  apt_update_once || return 1
+  # tui_run 是最后一条语句 → 其退出码就是本函数的退出码（透传给调用方）。
   tui_run "安装依赖：${missing[*]}" env DEBIAN_FRONTEND=noninteractive \
     apt-get install -y --no-install-recommends "${missing[@]}"
 }
