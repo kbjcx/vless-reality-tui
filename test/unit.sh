@@ -162,7 +162,14 @@ assert_eq "1" "$(printf '%s\n' "$out" | grep -c '编号')" "缓冲区提示行�
 fmt=$(grep -o "printf '[^']*编号[^']*'" "$ROOT/lib/tui.sh" | head -1)
 nspec=$(printf '%s' "$fmt" | grep -o '%s' | wc -l)
 nargs=$(grep -A1 "printf '.*编号" "$ROOT/lib/tui.sh" | tail -1 | grep -o '"\$[A-Za-z_]' | wc -l)
-assert_eq "$nspec" "$nargs" "缓冲区提示行格式串 %s 个数（$nspec）与实参个数（$nargs）严格相等"
+# 封口：grep 匹配不到时 nspec/nargs 会同时变成 0，assert_eq 0 0 就是恒真通过。
+# 所以必须先确认「确实匹配到了格式串」，匹配不到就算这条断言失败。
+if (( nspec >= 1 )); then
+  assert_eq "$nspec" "$nargs" "缓冲区提示行格式串 %s 个数（$nspec）与实参个数（$nargs）严格相等"
+else
+  assert_eq "至少 1 个 %s 占位符" "0（未在 lib/tui.sh 中匹配到缓冲区提示行格式串）" \
+    "缓冲区提示行格式串 %s 个数（$nspec）与实参个数（$nargs）严格相等"
+fi
 
 # 方向键下移后回车 → 选中第 2 项（索引 1）
 out=$( { printf '\033[B'; sleep 0.3; printf '\n'; } | bash "$ROOT/test/helpers/menu_tty.sh" "选择" "A" "B" "C" ); rc=$?
@@ -195,19 +202,28 @@ test_case "TUI tui_run 降级路径（临时文件不可用）"
 # 用 mktemp -d 建一个唯一目录来制造这个场景，不依赖 /tmp/.tui.$$ 这类
 # 全局路径状态（上一轮遗留同名文件时，用例前提会静默失效）。
 d=$(mktemp -d 2>/dev/null)
-mkdir -p "$d/blocked"
-out=$(mktemp() { printf '%s' "$d/blocked"; }; tui_run "回落不可用" bash -c 'echo ran-ok; exit 7' 2>&1); rc=$?
-assert_status 7 "$rc" "回落路径不可写时命令仍被执行并透传退出码"
+# 前提守卫：mktemp -d 失败时 $d 为空。此时若继续往下走，
+# mkdir -p "$d/blocked" 会退化成在【根目录】建 /blocked（污染系统），
+# 而且重定向报错文本不在匹配名单内 → 泄漏断言退化成真空通过。
+# 所以必须让用例【明确失败】，且绝不去动根目录。
+if [[ -n "$d" && -d "$d" ]]; then
+  mkdir -p "$d/blocked"
+  out=$(mktemp() { printf '%s' "$d/blocked"; }; tui_run "回落不可用" bash -c 'echo ran-ok; exit 7' 2>&1); rc=$?
+  assert_status 7 "$rc" "回落路径不可写时命令仍被执行并透传退出码"
 
-# 探测失败不得把 shell 诊断泄漏到 stderr：失败的重定向先于 2>/dev/null 生效，
-# 必须用 { : >"$tmp"; } 2>/dev/null 把整条重定向包起来
-err=$(mktemp() { printf '%s' "$d/blocked"; }; tui_run "回落不可用" bash -c 'true' 2>&1 >/dev/null)
-case "$err" in
-  *"is a directory"*|*"Is a directory"*|*"cannot create"*|*"Permission denied"*) leaked=1 ;;
-  *) leaked=0 ;;
-esac
-assert_eq "0" "$leaked" "临时文件探测失败时不泄漏 shell 诊断到 stderr"
-rm -rf "$d"
+  # 探测失败不得把 shell 诊断泄漏到 stderr：失败的重定向先于 2>/dev/null 生效，
+  # 必须用 { : >"$tmp"; } 2>/dev/null 把整条重定向包起来
+  err=$(mktemp() { printf '%s' "$d/blocked"; }; tui_run "回落不可用" bash -c 'true' 2>&1 >/dev/null)
+  case "$err" in
+    *"is a directory"*|*"Is a directory"*|*"cannot create"*|*"Permission denied"*) leaked=1 ;;
+    *) leaked=0 ;;
+  esac
+  assert_eq "0" "$leaked" "临时文件探测失败时不泄漏 shell 诊断到 stderr"
+  rm -rf "$d"
+else
+  assert_eq "mktemp -d 能创建唯一临时目录" "失败（mktemp -d 返回空路径）" \
+    "tui_run 降级用例前提：mktemp -d 必须能创建唯一临时目录，否则场景无法构造"
+fi
 
 # mktemp 真失败时：命令仍被执行，且输出仍能被捕获
 rm -f "/tmp/.tui.$$" 2>/dev/null
