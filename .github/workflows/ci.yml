@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 语法检查 (bash -n)
+        run: |
+          set -e
+          find . -name '*.sh' -not -path './.git/*' -not -path './.worktrees/*' -print0 | xargs -0 -n1 bash -n
+
+      - name: ShellCheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          # 用 find 而不是写死文件名：写死 uninstall.sh / demo.sh 的话，
+          # 在这两个文件还没创建的提交上跑 CI 必然失败（shellcheck 找不到文件就退出非零）。
+          # dist/ 是构建产物，不重复检查。
+          find . -name '*.sh' -not -path './.git/*' -not -path './.worktrees/*' \
+               -not -path './dist/*' -print0 | xargs -0 -r shellcheck --severity=warning
+
+      - name: 单元测试
+        run: bash test/unit.sh
+
+      - name: dist 与源码同步校验
+        run: |
+          set -e
+          bash build.sh
+          if ! git diff --exit-code --stat dist/install.sh; then
+            echo "::error::dist/install.sh 与 lib/ 已脱节，请运行 ./build.sh 后提交。"
+            exit 1
+          fi

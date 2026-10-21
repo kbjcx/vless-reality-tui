@@ -1,0 +1,4 @@
+# SC1090/SC1091：脚本在运行时 source 其它文件，shellcheck 无法静态解析
+disable=SC1090,SC1091
+# SC2034：全局状态变量在各模块间传递，单独看像是未使用
+disable=SC2034

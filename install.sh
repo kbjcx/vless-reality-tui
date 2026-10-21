@@ -2,11 +2,15 @@
 # install.sh — VLESS + REALITY 一键部署工具（入口）
 #
 # 用法:
-#   sudo ./install.sh              交互式向导
-#   sudo ./install.sh -y           全自动（用默认值）
-#   sudo ./install.sh --menu       进入管理菜单
-#   sudo ./install.sh --status     查看运行状态
-#   sudo ./install.sh --uninstall  卸载
+#   sudo bash install.sh              交互式向导
+#   sudo bash install.sh -y           全自动（用默认值）
+#   sudo bash install.sh --menu       进入管理菜单
+#   sudo bash install.sh --status     查看运行状态
+#   sudo bash install.sh --uninstall  卸载
+#
+# ⚠️ 用 `bash install.sh` 而不是 `./install.sh`：
+#    仓库里的 .sh 提交模式是 100644（core.fileMode=false），
+#    新克隆的仓库里这个文件【不可执行】→ ./install.sh 会 Permission denied。
 
 set -uo pipefail
 
@@ -35,7 +39,7 @@ usage() {
 ${APP_NAME} v${APP_VERSION}
 
 用法:
-  sudo ./install.sh [选项]
+  sudo bash install.sh [选项]
 
 选项:
   -y, --yes          全自动无交互，使用内置默认值

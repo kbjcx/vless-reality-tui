@@ -3073,4 +3073,124 @@ fi
 rm -rf "$T11_TMP"
 
 
+# ── Task 12：构建产物、CI 与脚本可执行位 ─────────────────────────
+# ⚠️ 本段【不写任何会整块跳过的条件块】：
+#    build.sh 在本段开头【必定先跑一遍】→ dist/install.sh 必定存在 →
+#    断言条数与机器 / 网络 / 依赖状态【无关】。
+#    即使 build.sh 失败，后续断言也照样执行（只是变红）→ 条数恒定。
+#    （原计划把 4 条断言放在 `if [[ -f dist/install.sh ]]` 里，
+#      条件不成立时那 4 条不执行 → 条数会随 build.sh 成败漂移。）
+
+test_case "Task 12：构建产物"
+
+# ⚠️ 用 out=$(...) 包起来再取 $?：rc 与输出同时拿到，
+#    build.sh 失败时能把它的报错直接打进断言消息。
+out=$(bash "$ROOT/build.sh" 2>&1); rc=$?
+assert_status 0 "$rc" "build.sh 执行成功"
+assert_contains "$out" "已生成" "build.sh 报告已生成产物"
+assert_true "$([[ -f "$ROOT/dist/install.sh" ]] && echo 0 || echo 1)" "生成 dist/install.sh"
+
+# build.sh 本身的两条硬要求：
+#   ① 不用 `sed … | head -1`：head 命中即退出会让上游 sed 收到 SIGPIPE(141)，
+#      而 build.sh 有 `set -euo pipefail` → 管道 rc=141 → 构建中止
+#      （本仓库的既定约定见 lib/core.sh 的 port_occupant）；
+#   ② 必须 chmod +x 产物：分发物 clone 下来要能直接 ./install.sh。
+bsh=$(cat "$ROOT/build.sh")
+# ⚠️ 判据必须看【代码行】，不能做字面量查找：
+#    build.sh 自己的注释里就写着 "head -1"（为了说明为什么不能这么写），
+#    字面量查找会把【注释】当成【代码】→ 这条断言【恒红】，什么也证明不了
+#    （控制器实测：字面量判据 = 1，代码判据 = 0，而旧版 build.sh 才是真的用了它）。
+#    判据：行首不是注释（`^[^#]*`）的行里出现 "| head"。
+assert_eq "0" "$(grep -cE '^[^#]*\|[[:space:]]*head' "$ROOT/build.sh" 2>/dev/null || true)" \
+  "build.sh 不用提前退出的管道（head -1）"
+assert_contains "$bsh" 'chmod +x' "build.sh 把产物设为可执行"
+
+test_case "Task 12：单文件产物自包含"
+
+dist="$ROOT/dist/install.sh"
+# 单文件产物必须【不引用】外部 lib/ 路径 —— 否则「下载一个文件就能用」是假的
+assert_eq "0" "$(grep -c 'source.*lib/' "$dist" 2>/dev/null || true)" \
+  "单文件产物不引用外部 lib/ 路径"
+# set 行必须【恰好一条】：零条 → 产物没有 set -u → 未定义变量不报错；
+# 两条 → 后一条可能把 -u 关掉
+assert_eq "1" "$(grep -c '^set -uo pipefail$' "$dist" 2>/dev/null || true)" \
+  "单文件产物里恰好一条 set -uo pipefail"
+# shellcheck 注释也要剥掉（否则产物里留着「这个文件来自 lib/」的误导性注释）
+assert_eq "0" "$(grep -c 'shellcheck source=lib/' "$dist" 2>/dev/null || true)" \
+  "单文件产物里没有 shellcheck source 注释"
+# ROOT_DIR 必须由头部定义（install.sh 自己那行被剥掉了）
+assert_contains "$(cat "$dist" 2>/dev/null)" 'ROOT_DIR="$(cd --' \
+  "单文件产物自己定义 ROOT_DIR"
+# 四个模块都在
+# ⚠️ 用 tui_pad 而不是 tui_banner 做判据：tui_banner 在 install.sh 里也有【调用点】，
+#    只看 tui_banner 无法区分「lib/tui.sh 内联进来了」与「只是调用点被带进来了」；
+#    tui_pad 是 lib/tui.sh 【独有】的符号 → 判据唯一。
+assert_contains "$(cat "$dist" 2>/dev/null)" "tui_pad" "单文件产物包含 TUI 实现"
+assert_contains "$(cat "$dist" 2>/dev/null)" "render_server_config" "单文件产物包含配置渲染"
+# ⚠️ 判据用 client.sh【独有】的 render_client_config，不用 build_share_link：
+#    后者在 lib/deploy.sh 里也有【调用点】→ 只看这个名字分不清
+#    「client.sh 被内联进来了」与「只是调用点被带进来了」
+#    （与上面 tui_pad 不用 tui_banner 是同一条理由）。
+assert_contains "$(cat "$dist" 2>/dev/null)" "render_client_config" "单文件产物包含分享链接生成"
+
+test_case "Task 12：单文件产物可独立执行"
+
+out=$(bash "$dist" --help 2>&1); rc=$?
+assert_status 0 "$rc" "单文件产物 --help 退出码为 0"
+assert_contains "$out" "用法" "单文件产物 --help 给出用法"
+out=$(bash -n "$dist" 2>&1); rc=$?
+assert_status 0 "$rc" "单文件产物语法正确"
+
+test_case "Task 12：可执行位与用法文案（定点修订）"
+
+# ⚠️ 仓库里所有 .sh 的提交模式曾经是 100644（core.fileMode=false）→
+#    `./install.sh` 会 Permission denied → 用法文案必须写 `sudo bash install.sh`。
+inst=$(cat "$ROOT/install.sh")
+assert_not_contains "$inst" "sudo ./install.sh" "install.sh 的用法文案不写 sudo ./install.sh"
+assert_contains "$inst" "sudo bash install.sh" "install.sh 的用法文案写 sudo bash install.sh"
+# 产物里也必须改掉（产物是从 install.sh 派生的）
+assert_not_contains "$(cat "$dist" 2>/dev/null)" "sudo ./install.sh" \
+  "单文件产物的用法文案不写 sudo ./install.sh"
+
+test_case "Task 12：CI 与按键超时（定点修订）"
+
+assert_true "$([[ -f "$ROOT/.github/workflows/ci.yml" ]] && echo 0 || echo 1)" "CI 配置文件存在"
+cic=$(cat "$ROOT/.github/workflows/ci.yml" 2>/dev/null)
+assert_contains "$cic" "bash build.sh" "CI 校验 dist 与源码同步"
+# ⚠️ 下面四条判据必须看【结构】，不能只查「字符串是否出现」—— 否则【恒真】：
+#    * "git diff --exit-code"：把校验的路径改掉之后它【还在】→
+#      「字符串还在」的判据抓不住「校验目标被改错」；
+#    * "shellcheck"：CI 里出现【两次】（安装 + 执行）→ 删掉安装那一步后，
+#      执行那行还在 → 照样抓不住；
+#    * .shellcheckrc 的【注释行】里就写着 "SC1090/SC1091" →
+#      删掉 disable 行之后整文件里依然有 "SC1090" → 照样抓不住。
+#    → 改成数【结构性出现次数】，必须恰好 1 个。
+assert_eq "1" "$(grep -c 'git diff --exit-code' "$ROOT/.github/workflows/ci.yml" 2>/dev/null || true)" \
+  "CI 用 git diff 判定产物是否脱节"
+assert_eq "1" "$(grep -cE '^[[:space:]]*- name: ShellCheck$' "$ROOT/.github/workflows/ci.yml" 2>/dev/null || true)" \
+  "CI 跑 ShellCheck"
+# shellcheck 的豁免要看【disable= 行】，不能看整文件：
+# .shellcheckrc 的注释里就写着 SC1090/SC1091 → 整文件查找恒真。
+assert_eq "1" "$(grep -cE '^disable=.*SC1090' "$ROOT/.shellcheckrc" 2>/dev/null || true)" \
+  "shellcheck 豁免运行时 source（SC1090）"
+assert_eq "1" "$(grep -cE '^disable=.*SC1091' "$ROOT/.shellcheckrc" 2>/dev/null || true)" \
+  "shellcheck 豁免找不到被 source 的文件（SC1091）"
+
+# lib/tui.sh 的两个按键超时必须【可被环境变量覆盖】：
+# 默认的 0.2 / 0.35 秒是【墙钟截止点】，机器繁忙时会把方向键读丢、
+# 把两位数输入截断 → CI 上随机红（GitHub runner 是共享机器，负载不可控）。
+# 改成 ${TUI_KEY_TIMEOUT:-0.2} 之后，测试 helper 可以把它放大到确定值。
+tuic=$(cat "$ROOT/lib/tui.sh")
+assert_contains "$tuic" '${TUI_KEY_TIMEOUT:-' "lib/tui.sh 的方向键超时可被环境变量覆盖"
+assert_contains "$tuic" '${TUI_DIGIT_TIMEOUT:-' "lib/tui.sh 的数字键超时可被环境变量覆盖"
+# ⚠️ 判据必须是「值确实被放大了」，不能只看「出现了这个名字」——
+#    `export TUI_KEY_TIMEOUT=0.2` 里也有 TUI_KEY_TIMEOUT → 名字判据【恒真】。
+#    → 解析出导出的值，要求它【严格大于默认值】（0.2 / 0.35）；
+#      解析不到（文件缺失 / 写法变了）→ 按 0 处理 → 判红。
+mh=$(cat "$ROOT/test/helpers/menu_tty.sh")
+kto=$(sed -n 's/^export TUI_KEY_TIMEOUT=//p' "$ROOT/test/helpers/menu_tty.sh" | tr -d '[:space:]')
+dto=$(sed -n 's/^export TUI_DIGIT_TIMEOUT=//p' "$ROOT/test/helpers/menu_tty.sh" | tr -d '[:space:]')
+assert_true "$(awk -v v="${kto:-0}" 'BEGIN{print (v+0>0.2)?0:1}')" "菜单测试 helper 放大了方向键超时"
+assert_true "$(awk -v v="${dto:-0}" 'BEGIN{print (v+0>0.35)?0:1}')" "菜单测试 helper 放大了数字键超时"
+
 test_summary

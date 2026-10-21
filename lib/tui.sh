@@ -494,7 +494,14 @@ tui_menu() {
       #     会被当成方向键序列的第 3 字节吞掉，回车就丢了；
       #   * -n2 时两个字节齐备就立即返回，不会平白多等 -t 的超时，
       #     单独按 ESC 时才超时（此时 seq 为空 → 不移动，光标不动）。
-      IFS= read -rsn2 -t 0.2 seq || true
+      # ⚠️ 超时必须【可被环境变量覆盖】：
+      #    0.2 秒是【墙钟截止点】，不是「等够 2 字节」的条件 →
+      #    机器繁忙时写端还没把字节送进管道，读端已经等满 → 方向键读不到 →
+      #    回车选中的是【高亮项(索引 0)】而不是期望的索引 → 断言随机变红。
+      #    GitHub Actions 是共享 runner，负载不可控 → CI 上必然会有随机红。
+      #    改成环境变量后，测试 helper（test/helpers/menu_tty.sh）可以把它放大到 2 秒，
+      #    交互体验完全不变，CI 变成确定性的。
+      IFS= read -rsn2 -t "${TUI_KEY_TIMEOUT:-0.2}" seq || true
       case "$seq" in
         '[A') idx=$(( (idx - 1 + n) % n )); buf='' ;;
         '[B') idx=$(( (idx + 1) % n )); buf='' ;;
@@ -528,7 +535,9 @@ tui_menu() {
       buf+="$key"
       if (( 10#$buf >= 1 && 10#$buf <= n )); then
         local more=''
-        IFS= read -rsn1 -t 0.35 more || more=''
+        # ⚠️ 同上：0.35 秒在繁忙机器上会把两位数输入（"10"）截成"1"，
+        #    并且「编号」提示行一次都不打印 → 断言随机变红。
+        IFS= read -rsn1 -t "${TUI_DIGIT_TIMEOUT:-0.35}" more || more=''
         if [[ -z "$more" ]]; then
           local d=$((10#$buf - 1))
           printf '\033[%dA\033[J' "$((n + 1))"
