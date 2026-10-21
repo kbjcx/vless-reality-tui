@@ -529,6 +529,22 @@ if [[ -n "$bad_dir" ]]; then
   assert_status 0 "$rc" "load_state 对带副作用的合法状态文件仍视为可读"
   assert_eq "1" "$(wc -l < "$bad_dir/sidefx" 2>/dev/null | tr -d ' ')" \
     "load_state 只把状态文件执行一次（不得用子 shell 探测导致双执行）"
+  # 第三态「不可读」：权限问题，报『不可读』而不是笼统失败。
+  # 本平台（Windows + MSYS）chmod 000 只会把 mode 变成 444、文件仍然可读 →
+  # 该分支在这台机器上不可达，断言自动跳过；
+  # 在 Debian / CI（以非 root 运行）下会真正执行。
+  unread_dir=$(mktemp -d 2>/dev/null)
+  if [[ -n "$unread_dir" ]]; then
+    printf 'PORT=443\n' > "$unread_dir/unreadable.env"
+    chmod 000 "$unread_dir/unreadable.env" 2>/dev/null
+    if [[ ! -r "$unread_dir/unreadable.env" ]]; then
+      out=$( ( STATE_FILE="$unread_dir/unreadable.env"; load_state ) 2>&1 ); rc=$?
+      assert_status 1 "$rc" "load_state 对不可读的状态文件返回非零"
+      assert_contains "$out" "状态文件不可读" \
+        "load_state 对不可读的状态文件报『不可读』而不是笼统失败"
+    fi
+  fi
+  rm -rf "$unread_dir"
 else
   assert_eq "mktemp -d 能创建唯一临时目录" "失败（mktemp -d 返回空路径）" \
     "load_state 失败路径用例前提：mktemp -d 必须能创建唯一临时目录"
