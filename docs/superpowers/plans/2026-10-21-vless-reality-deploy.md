@@ -508,15 +508,19 @@ git commit -m "feat(tui): 基础层——颜色、宽度计算、边框与消息
 **Files:**
 - Modify: `lib/tui.sh`（追加交互组件）
 - Modify: `test/unit.sh`（追加用例）
+- Create: `test/helpers/menu_noninteractive.sh`
+- Create: `test/helpers/menu_tty.sh`（强制 TUI_TTY=1，管道喂按键驱动交互分支）
+- Create: `test/helpers/confirm.sh`
+- Create: `test/helpers/input.sh`
 
 **Interfaces:**
 - Consumes: Task 1 的 `tui_pad` `tui_repeat` `tui_section` `C_*` 变量
 - Produces:
-  - `tui_run <msg> <cmd> [args...]` → 返回命令退出码；非 TTY 下不显示 spinner
-  - `tui_confirm <prompt> [y|n]` → `0`=是 `1`=否
-  - `tui_input <prompt> [default] [hint]` → stdout 输出用户输入
-  - `tui_input_secret <prompt> [default]` → stdout 输出用户输入（不回显）
-  - `tui_menu <title> <item>...` → stdout 打印选中项；返回 0-based 索引，取消返回 `255`
+  - `tui_run <msg> <cmd> [args...]` → 返回命令退出码；非 TTY 下不显示 spinner，但仍捕获输出并在失败时打印
+  - `tui_confirm <prompt> [y|n]` → `0`=是 `1`=否；**提示走 stderr**
+  - `tui_input <prompt> [default] [hint]` → stdout 输出用户输入；**提示走 stderr**
+  - `tui_input_secret <prompt> [default]` → stdout 输出用户输入（不回显）；提示走 stderr
+  - `tui_menu <title> <item>...` → **整个菜单打到 stdout**；返回 0-based 索引，取消返回 `255`
   - `tui_select <title> <default_item> <item>...` → 同上，默认高亮 `default_item`
   - `tui_pause`
 
@@ -546,9 +550,36 @@ assert_contains "$out" "no" "tui_confirm 默认值 n → no"
 # 输入：空输入回落到默认值
 out=$(printf '\n' | bash "$ROOT/test/helpers/input.sh" "默认端口" "443")
 assert_eq "443" "$out" "tui_input 空输入返回默认值"
+
+test_case "TUI 菜单交互路径（强制 TUI_TTY=1，管道喂按键模拟真终端）"
+
+# 数字缓冲区被非数字污染 → 必须取消，绝不能静默选中第一项
+out=$(printf '1q' | bash "$ROOT/test/helpers/menu_tty.sh" "选择" "A" "B" "C"); rc=$?
+assert_status 255 "$rc" "数字后按 q 必须取消(255)，不得静默选中第一项"
+assert_contains "$out" "已取消" "数字后按 q 显示取消"
+
+# EOF / Ctrl-D → 必须取消，不得当成回车去确认高亮项
+printf '' | bash "$ROOT/test/helpers/menu_tty.sh" "选择" "A" "B" "C" >/dev/null 2>&1; rc=$?
+assert_status 255 "$rc" "EOF 必须取消(255)"
+
+# 缓冲区提示行只能打印一次（printf 格式串 %s 个数必须等于实参个数）
+out=$(printf '1' | bash "$ROOT/test/helpers/menu_tty.sh" "选择" "A" "B" "C")
+assert_eq "1" "$(printf '%s\n' "$out" | grep -c '编号')" "缓冲区提示行只打印一次"
+
+# 方向键下移后回车 → 选中第 2 项（索引 1）
+out=$( { printf '\033[B'; sleep 0.3; printf '\n'; } | bash "$ROOT/test/helpers/menu_tty.sh" "选择" "A" "B" "C" ); rc=$?
+assert_status 1 "$rc" "方向键下移后回车选中第 2 项(索引 1)"
+
+# 多位数：>=10 项时输入 10 应选中第 10 项（索引 9）
+out=$(printf '10' | bash "$ROOT/test/helpers/menu_tty.sh" "选择" 1 2 3 4 5 6 7 8 9 10 11); rc=$?
+assert_status 9 "$rc" "多位数 10 选中第 10 项(索引 9)"
+
+# 直接按 q → 取消
+printf 'q' | bash "$ROOT/test/helpers/menu_tty.sh" "选择" "A" "B" "C" >/dev/null 2>&1; rc=$?
+assert_status 255 "$rc" "直接按 q 返回 255"
 ```
 
-同时创建三个 helper（`test/helpers/`）：
+同时创建四个 helper（`test/helpers/`）：
 
 `test/helpers/menu_noninteractive.sh`：
 
@@ -582,6 +613,21 @@ tui_input "$1" "$2"
 printf '\n'
 ```
 
+`test/helpers/menu_tty.sh`（强制走交互分支，用管道喂按键模拟真终端）：
+
+```bash
+#!/usr/bin/env bash
+# 用法: printf '按键序列' | bash menu_tty.sh "标题" "选项1" "选项2" ...
+# 退出码 = tui_menu 的返回码（0-based 索引，取消为 255）
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "$ROOT/lib/tui.sh"
+tui_init
+# 必须在 tui_init 之后覆盖：tui_init 会按真实 TTY 把 TUI_TTY 置 0
+TUI_TTY=1
+tui_menu "$@"
+exit $?
+```
+
 **Step 2: 运行测试确认失败**
 
 ```bash
@@ -599,19 +645,46 @@ tui_run() {
   local msg="$1"; shift
   local tmp rc=0
 
-  if [[ $TUI_TTY -eq 0 ]]; then
-    printf '  %s%s%s %s ... ' "$C_ACCENT" "$I_ARROW" "$C_RESET" "$msg"
-    if "$@" >/dev/null 2>&1; then
-      printf '%s%s%s\n' "$C_OK" "$I_OK" "$C_RESET"; return 0
-    fi
-    printf '%s%s%s\n' "$C_ERR" "$I_ERR" "$C_RESET"; return 1
+  # 临时文件：mktemp 失败时退回一个可预测路径，该路径可能不可写或已被占用。
+  # 此时必须【仍然把命令跑起来】——不能因为捕获输出失败就不执行命令，
+  # 否则用户只会看到一个没有原因的失败标记。
+  tmp=$(mktemp 2>/dev/null || printf '/tmp/.tui.%s' "$$")
+  if ! : >"$tmp" 2>/dev/null; then
+    tmp=''
   fi
 
-  tmp=$(mktemp 2>/dev/null || printf '/tmp/.tui.%s' "$$")
-  "$@" >"$tmp" 2>&1 &
-  local pid=$! frames='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏' i=0
+  if [[ $TUI_TTY -eq 0 ]]; then
+    # 非 TTY 不画 spinner，但仍然捕获输出：失败时必须让用户看到原因，
+    # 否则「依赖没装上」会退化成静默故障。
+    printf '  %s%s%s %s ... ' "$C_ACCENT" "$I_ARROW" "$C_RESET" "$msg"
+    if [[ -n "$tmp" ]]; then
+      "$@" >"$tmp" 2>&1
+      rc=$?
+    else
+      "$@" >/dev/null 2>&1
+      rc=$?
+    fi
+    if [[ $rc -eq 0 ]]; then
+      printf '%s%s%s\n' "$C_OK" "$I_OK" "$C_RESET"
+    else
+      printf '%s%s%s\n' "$C_ERR" "$I_ERR" "$C_RESET"
+      [[ -n "$tmp" && -s "$tmp" ]] && sed -e 's/^/      /' "$tmp"
+    fi
+    [[ -n "$tmp" ]] && { rm -f "$tmp" 2>/dev/null || true; }
+    return $rc
+  fi
+
+  if [[ -n "$tmp" ]]; then
+    "$@" >"$tmp" 2>&1 &
+  else
+    "$@" >/dev/null 2>&1 &
+  fi
+  local pid=$! i=0
+  # spinner 帧必须逐【字符】取：用数组而不是 ${str:i:1}——后者在 C locale 下
+  # 是按字节切，会把 3 字节的盲文点阵字符切成半个（服务器上 LANG 常未设置）。
+  local -a frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
   while kill -0 "$pid" 2>/dev/null; do
-    printf '\r  %s%s%s %s%s%s' "$C_ACCENT" "${frames:$((i % 10)):1}" "$C_RESET" "$C_GRAY" "$msg" "$C_RESET"
+    printf '\r  %s%s%s %s%s%s' "$C_ACCENT" "${frames[$((i % 10))]}" "$C_RESET" "$C_GRAY" "$msg" "$C_RESET"
     i=$((i + 1)); sleep 0.08
   done
   wait "$pid" || rc=$?
@@ -620,66 +693,85 @@ tui_run() {
     printf '\r  %s%s%s %s%s%s%s\n' "$C_OK" "$I_OK" "$C_RESET" "$C_GRAY" "$msg" "$C_RESET"
   else
     printf '\r  %s%s%s %s%s%s%s\n' "$C_ERR" "$I_ERR" "$C_RESET" "$C_GRAY" "$msg" "$C_RESET"
-    [[ -s "$tmp" ]] && sed -e 's/^/      /' "$tmp"
+    [[ -n "$tmp" && -s "$tmp" ]] && sed -e 's/^/      /' "$tmp"
   fi
-  rm -f "$tmp" 2>/dev/null || true
+  [[ -n "$tmp" ]] && { rm -f "$tmp" 2>/dev/null || true; }
   return $rc
 }
 
+# 确认：返回 0=是 / 1=否。第二个参数是默认值（y|n），默认 y。
+# 提示语走 stderr（与 tui_input / tui_input_secret 保持一致）：
+# 本函数只通过返回码给值，提示不应混进 stdout。
 tui_confirm() {
   local prompt="$1" default="${2:-y}" ans hint
   if [[ "$default" == "y" || "$default" == "Y" ]]; then hint="Y/n"; else hint="y/N"; fi
   if [[ $TUI_TTY -eq 0 ]]; then
-    printf '  %s%s%s %s [%s]: ' "$C_ACCENT" "$I_ARROW" "$C_RESET" "$prompt" "$hint"
-    IFS= read -r ans || ans=''
+    printf '  %s%s%s %s [%s]: ' "$C_ACCENT" "$I_ARROW" "$C_RESET" "$prompt" "$hint" >&2
+    # 用 `|| true` 而不是 `|| ans=''`：read 遇到没有换行符结尾的末行时
+    # 返回 1，但变量里已经存着有效内容——`|| ans=''` 会把它抹掉。
+    IFS= read -r ans || true
+    ans=${ans%$'\r'}
     [[ -z "$ans" ]] && ans="$default"
     [[ "${ans,,}" == y* ]]
     return
   fi
-  printf '  %s%s%s %s %s[%s]%s ' "$C_ACCENT" "$I_ARROW" "$C_RESET" "$prompt" "$C_GRAY" "$hint" "$C_RESET"
-  IFS= read -rsn1 ans || ans=''
+  printf '  %s%s%s %s %s[%s]%s ' "$C_ACCENT" "$I_ARROW" "$C_RESET" "$prompt" "$C_GRAY" "$hint" "$C_RESET" >&2
+  IFS= read -rsn1 ans || true
+  # 终端回车可能是 CR，也可能被 read 当作行分隔符吞掉（此时 ans 为空）；
+  # 两种情况都表示「直接回车」→ 落到默认值，而不是被判成「否」。
+  ans=${ans//$'\r'/}
+  ans=${ans//$'\n'/}
   printf '\n'
   [[ -z "$ans" ]] && ans="$default"
   [[ "${ans,,}" == y* ]]
 }
 
+# 单行输入：stdout 输出用户输入（空输入回落默认值），提示语走 stderr。
 tui_input() {
   local prompt="$1" def="${2:-}" hint="${3:-}" ans
   if [[ $TUI_TTY -eq 0 ]]; then
     if [[ -n "$hint" ]]; then
-      printf '  %s%s%s %s (%s): ' "$C_ACCENT" "$I_ARROW" "$C_RESET" "$prompt" "$hint"
+      printf '  %s%s%s %s (%s): ' "$C_ACCENT" "$I_ARROW" "$C_RESET" "$prompt" "$hint" >&2
     else
-      printf '  %s%s%s %s: ' "$C_ACCENT" "$I_ARROW" "$C_RESET" "$prompt"
+      printf '  %s%s%s %s: ' "$C_ACCENT" "$I_ARROW" "$C_RESET" "$prompt" >&2
     fi
-    IFS= read -r ans || ans=''
+    IFS= read -r ans || true
+    ans=${ans%$'\r'}
     [[ -z "$ans" ]] && ans="$def"
     printf '%s' "$ans"; return
   fi
   if [[ -n "$hint" ]]; then
-    printf '  %s%s%s %s %s(%s)%s ' "$C_ACCENT" "$I_ARROW" "$C_RESET" "$prompt" "$C_GRAY" "$hint" "$C_RESET"
+    printf '  %s%s%s %s %s(%s)%s ' "$C_ACCENT" "$I_ARROW" "$C_RESET" "$prompt" "$C_GRAY" "$hint" "$C_RESET" >&2
   else
-    printf '  %s%s%s %s ' "$C_ACCENT" "$I_ARROW" "$C_RESET" "$prompt"
+    printf '  %s%s%s %s ' "$C_ACCENT" "$I_ARROW" "$C_RESET" "$prompt" >&2
   fi
-  IFS= read -r ans || ans=''
+  IFS= read -r ans || true
+  ans=${ans%$'\r'}
   [[ -z "$ans" ]] && ans="$def"
   printf '%s' "$ans"
 }
 
+# 秘密输入：同 tui_input，但 TTY 下不回显。
 tui_input_secret() {
   local prompt="$1" def="${2:-}" ans
   if [[ $TUI_TTY -eq 0 ]]; then
-    printf '  %s%s%s %s: ' "$C_ACCENT" "$I_ARROW" "$C_RESET" "$prompt"
-    IFS= read -r ans || ans=''
+    printf '  %s%s%s %s: ' "$C_ACCENT" "$I_ARROW" "$C_RESET" "$prompt" >&2
+    IFS= read -r ans || true
+    ans=${ans%$'\r'}
     [[ -z "$ans" ]] && ans="$def"
     printf '%s' "$ans"; return
   fi
-  printf '  %s%s%s %s ' "$C_ACCENT" "$I_ARROW" "$C_RESET" "$prompt"
-  IFS= read -rs ans || ans=''
+  printf '  %s%s%s %s ' "$C_ACCENT" "$I_ARROW" "$C_RESET" "$prompt" >&2
+  IFS= read -rs ans || true
+  ans=${ans%$'\r'}
   printf '\n'
   [[ -z "$ans" ]] && ans="$def"
   printf '%s' "$ans"
 }
 
+# 菜单：stdout 打印选中项；返回 0-based 索引，用户取消返回 255。
+# 注意：整个菜单（选项列表 + 提示行）都打到 stdout，
+# 调用方必须用【返回码】取选中项，不要捕获 stdout。
 tui_menu() {
   local title="$1"; shift
   local -a items=("$@")
@@ -697,12 +789,14 @@ tui_menu() {
     done
     local sel=''
     printf '  %s请输入序号 [1-%d]: %s' "$C_ACCENT" "$n" "$C_RESET"
-    IFS= read -r sel || sel=''
+    IFS= read -r sel || true
+    sel=${sel%$'\r'}
     [[ -z "$sel" ]] && return 255
     [[ "$sel" =~ ^[0-9]+$ ]] || return 255
-    (( sel >= 1 && sel <= n )) || return 255
-    printf '%s\n' "${items[$((sel - 1))]}"
-    return $((sel - 1))
+    # 用 10# 前缀：裸算术会把 "08" 当八进制，直接报「value too great for base」。
+    (( 10#$sel >= 1 && 10#$sel <= n )) || return 255
+    printf '%s\n' "${items[$((10#$sel - 1))]}"
+    return $((10#$sel - 1))
   fi
 
   tui_section "$title"
@@ -717,24 +811,55 @@ tui_menu() {
       fi
     done
     if [[ -n "$buf" ]]; then
-      printf '     %s编号: %s_%s  %s↑↓ 移动 · Enter 确认 · q 取消%s\n' \
+      # 格式串的 %s 个数必须与实参个数严格相等（6 ↔ 6）：
+      # 多一个 %s 会让 bash printf 复用一次格式串，把提示行打印两遍，
+      # 而重绘统一按 n+1 行回退 → 缓冲区非空时每次重绘少算一行，
+      # 光标逐行下移、ESC[J 清不到上一行残留，菜单整体错位一行。
+      # 另外数字必须在光标【之前】：渲染成 "10_"，不是 "_10"。
+      printf '     %s编号: %s%s%s_  %s↑↓ 移动 · Enter 确认 · q 取消%s%s\n' \
         "$C_GRAY" "$C_ACCENT$C_BOLD" "$buf" "$C_RESET" "$C_GRAY" "$C_RESET"
     else
       printf '     %s↑↓ 移动 · 数字直选 · Enter 确认 · q 取消%s\n' "$C_GRAY" "$C_RESET"
     fi
 
     key=''
-    IFS= read -rsn1 key || key=$'\n'
+    # 必须保留 read 的状态位：read -rsn1 遇回车(LF)返回【空串+rc=0】，
+    # 遇 EOF/Ctrl-D 返回【空串+rc=1】。两者都靠状态位才能区分：
+    # EOF 必须是「取消」(255)，不能当成回车去确认高亮项。
+    local krc=0
+    IFS= read -rsn1 key || krc=$?
+    if (( krc > 0 )); then
+      printf '\033[%dA\033[J' "$((n + 1))"
+      printf '   %s已取消%s\n' "$C_GRAY" "$C_RESET"
+      return 255
+    fi
+    # read -n1 碰到回车时返回的是【空串】（状态 0），不是 "\n"；
+    # 终端也可能送 CR。两种情况都表示「用户按了回车」→ 统一成 "\n"，
+    # 否则 Enter 会变成一个按下去没反应的死键。
+    [[ -z "$key" ]] && key=$'\n'
+    key=${key//$'\r'/$'\n'}
 
     if [[ $key == $'\e' ]]; then
       seq=''
-      IFS= read -rsn3 -t 0.2 seq || true
+      # ESC 已被上一条 read 吃掉，方向键只剩 "[A" / "[B" 2 个字节。
+      # 必须用 -n2 精确读这 2 个字节：
+      #   * -n3 会多吞一个字节——用户「按下方向键后立刻回车」时，那个回车
+      #     会被当成方向键序列的第 3 字节吞掉，回车就丢了；
+      #   * -n2 时两个字节齐备就立即返回，不会平白多等 -t 的超时，
+      #     单独按 ESC 时才超时（此时 seq 为空 → 不移动，光标不动）。
+      IFS= read -rsn2 -t 0.2 seq || true
       case "$seq" in
         '[A') idx=$(( (idx - 1 + n) % n )); buf='' ;;
         '[B') idx=$(( (idx + 1) % n )); buf='' ;;
       esac
     elif [[ $key == $'\n' || $key == $'\r' ]]; then
       if [[ -n "$buf" ]]; then
+        # 缓冲区只允许数字：进算术前再守一道，避免 10# 触发 bash 算术错误
+        if [[ ! "$buf" =~ ^[0-9]+$ ]]; then
+          buf=''
+          printf '\033[%dA\033[J' "$((n + 1))"
+          continue
+        fi
         local d=$((10#$buf - 1))
         if (( d >= 0 && d < n )); then
           printf '\033[%dA\033[J' "$((n + 1))"
@@ -763,17 +888,33 @@ tui_menu() {
           printf '   %s%s%s %s\n' "$C_OK" "$I_OK" "$C_RESET" "${items[$d]}"
           return $d
         fi
-        buf+="$more"
+        if [[ "$more" =~ ^[0-9]$ ]]; then
+          buf+="$more"
+        else
+          # 非数字键绝不能进数字缓冲区：否则「1」之后按「q」会得到 buf="1q"，
+          # 10#1q 触发 bash 算术错误 → d 为空 → 范围检查把空值当 0 通过
+          # → 静默选中【第一项】并执行，等于把「取消」变成「继续执行」。
+          buf=''
+          if [[ "$more" == 'q' || "$more" == 'Q' ]]; then
+            printf '\033[%dA\033[J' "$((n + 1))"
+            printf '   %s已取消%s\n' "$C_GRAY" "$C_RESET"
+            return 255
+          fi
+        fi
       fi
     fi
     printf '\033[%dA\033[J' "$((n + 1))"
   done
 }
 
+# 带默认项的菜单：默认高亮 default_item（找不到则默认第一项）。
 tui_select() {
   local title="$1" def="$2"; shift 2
   local -a items=("$@")
   local i d=0
+  # 空列表直接返回：bash 4.2/4.3 在 set -u 下展开空数组 ${items[@]} 会报
+  # 「unbound variable」。
+  (( ${#items[@]} == 0 )) && return 255
   for ((i = 0; i < ${#items[@]}; i++)); do
     if [[ "${items[$i]}" == "$def" ]]; then d=$i; break; fi
   done
@@ -784,14 +925,16 @@ tui_select() {
   return $r
 }
 
+# 等待回车：非 TTY 下直接返回，不得阻塞。
 tui_pause() {
   [[ $TUI_TTY -eq 1 ]] || return 0
   printf '\n  %s按 Enter 键继续...%s' "$C_GRAY" "$C_RESET"
   IFS= read -r _ || true
   printf '\n'
 }
-```
 
+
+```
 **Step 4: 运行测试确认通过**
 
 ```bash
@@ -2241,8 +2384,19 @@ choose_target() {
   fi
 
   # 交由 tui_menu 统一渲染，避免重复打印列表
-  local sel
-  sel=$(tui_menu "选择 REALITY 伪装目标（SNI）" "${labels[@]}") || sel=0
+  # tui_menu 把整张菜单打到 stdout，【不能】用 $(...) 捕获——那样拿到的是菜单文本。
+  # 必须用返回码取选中项。注意返回码本身就是 0-based 索引：
+  #   0  = 选中第一项（成功）
+  #   1..n-1 = 选中第 n 项（成功，但也是非零码，不能用 && || 区分）
+  #   255 = 用户取消
+  local sel=0 rc=0
+  tui_menu "选择 REALITY 伪装目标（SNI）" "${labels[@]}" || rc=$?
+  if (( rc == 255 )); then
+    tui_warn "未选择伪装目标，回退到第一项"
+    sel=0
+  else
+    sel=$rc
+  fi
   printf '%s' "${hosts[$sel]}"
 }
 
@@ -2298,10 +2452,17 @@ deploy_wizard() {
       tui_tip "已自动改用空闲端口：$PORT"
     else
       local choice
-      choice=$(tui_menu "如何处理端口冲突？" \
+      # 同上：用返回码取选中项，不要用 $(...) 捕获 stdout
+      local choice=0 crc=0
+      tui_menu "如何处理端口冲突？" \
         "改用随机空闲端口" \
         "我手动指定其它端口" \
-        "取消部署")
+        "取消部署" || crc=$?
+      if (( crc == 255 )); then
+        choice=2
+      else
+        choice=$crc
+      fi
       case $choice in
         0) PORT=$(random_free_port); tui_tip "已改用端口 $PORT" ;;
         1) PORT=$(tui_input "请输入新端口" "$PORT" "1-65535")
@@ -2532,7 +2693,9 @@ management_menu() {
       tui_warn "尚未部署。选「重新部署」开始，或直接退出。"
     fi
     local choice
-    choice=$(tui_menu "请选择操作" \
+    # 同上：用返回码取选中项，不要用 $(...) 捕获 stdout
+    local choice=0 crc=0
+    tui_menu "请选择操作" \
       "重新部署（重跑向导）" \
       "查看配置 / 分享链接 / 二维码" \
       "重启服务" \
@@ -2541,7 +2704,12 @@ management_menu() {
       "网络调优（BBR / 防火墙）" \
       "轮换密钥与 UUID" \
       "卸载" \
-      "退出")
+      "退出" || crc=$?
+    if (( crc == 255 )); then
+      tui_info "已退出"
+      return 0
+    fi
+    choice=$crc
     case "$choice" in
       0) deploy_wizard ;;
       1) menu_show_client ;;
