@@ -6161,8 +6161,7 @@ git commit -m "feat(wizard): 部署向导——参数确认、目标探测与六
 ## Task 10: install.sh 管理菜单
 
 **Files:**
-- Modify: `lib/deploy.sh`（追加 `menu_*` 与 `management_menu`）
-- Modify: `install.sh`（删除 `management_menu` / `deploy_wizard` 的占位实现）
+- Modify: `lib/deploy.sh`（追加 `menu_*` 与 `management_menu`；并对 Task 9 的 `deploy_wizard` 做两处定点修订）
 - Modify: `test/unit.sh`
 - Create: `test/helpers/menu_management.sh`
 
@@ -6172,17 +6171,568 @@ git commit -m "feat(wizard): 部署向导——参数确认、目标探测与六
   - `management_menu` → 循环直到用户退出
   - `menu_show_client` / `menu_restart` / `menu_logs` / `menu_update_xray` / `menu_tune` / `menu_rotate_keys` / `menu_uninstall`
 
+#### 修订轮 1 的逐项发现与处置
+
+> 本节由**控制器**在 Task 10 派发前预扫（静态核对 + 沙箱实证）之后写入。
+> 本节列的全是**计划缺陷**，责任方是控制器；Task 10 的代码块本身还没被实施过。
+>
+> 沙箱底座 = `git archive HEAD` 整棵树（**Task 9 的实施结果** `e55e8e2`）
+> + Task 10 的两个新代码块 + 两处定点修订。
+>
+> ⚠️ **底座必须是 Task 10 实施时的 HEAD**，不能沿用别的任务里的基线。
+
+| # | 级别 | 发现 | 处置 |
+|---|---|---|---|
+| T10-1 | **Important** | **Step 1 只有 2 条断言，8 个新函数几乎零覆盖。** 新增 `menu_show_client` `menu_restart` `menu_logs` `menu_update_xray` `menu_tune` `menu_rotate_keys` `menu_uninstall` `management_menu` 共 8 个函数，原 Step 1 只验证了「未部署时菜单能退出」+「有『未部署』提示」两条。`menu_rotate_keys`（密钥轮换）、`menu_update_xray`（**以 root 下载并执行 GitHub 上的远程脚本**）、`menu_tune`（动防火墙）都是**高危路径**，一条断言都没有 —— 与 T9-1 同款缺陷 | Step 1 重写：2 → **78 条**断言，覆盖 8 个函数的全部分支；全部 mock（`journalctl` `curl` `ensure_packages` `tui_run` `restart_service` `open_firewall` `enable_bbr` `gen_keys` `render_server_config` `write_config_atomic` `export_client_artifacts` `build_share_link` 全部换成假实现），**一次网络请求都不发、一次防火墙命令都不执行**；另加一组**完全不 mock** 的真实 shell 集成用例（起真的 bash、source 真的 lib/*、管道喂「9」选中「退出」） |
+| T10-2 | **Important** | **`menu_tune` 没有「尚未部署」守卫。** `menu_show_client` 和 `menu_rotate_keys` 都有，唯独 `menu_tune` 没有 → 未部署时 `$PORT` 是**空串**（`core.sh:26` 给的全局默认值）→ `open_firewall ""` → `ufw allow "/tcp"` / `iptables --dport ""` / `nft ... tcp dport ""` **三条全报错**，而且报出来的错与真实原因（压根没部署、没有端口）完全无关 | Step 3 加 `state_exists` + `load_state` 双守卫，与另两个菜单函数一致；Step 1 补三条断言（返回非零 / 明确提示 / **不碰防火墙**） |
+| T10-3 | **Important** | **`management_menu` 与 `deploy_wizard` 互相递归。** 菜单第 0 项「重新部署」调 `deploy_wizard`；而 `deploy_wizard` 末尾（`OPT_YES≠1`）会 `tui_pause; management_menu` → **再开一层菜单**。用户在菜单里选一次「重新部署」，部署完掉进第二层菜单；再选一次就是第三层。内层退出后回到外层 → 用户被两层菜单夹住 | Step 3 用全局标志位 `IN_MENU` 掐断这条回路（`management_menu` 入口置 1，`deploy_wizard` 用 `${IN_MENU:-0}` 判断）；**作为对 Task 9 产物的定点修订 P2**；Step 1 补**正反一对**断言 |
+| T10-4 | Minor | **`local choice` 被声明了两次**（`local choice` + `local choice=0 crc=0`）—— 与 T9-9 同款 | Step 3 合并成一条 |
+| T10-5 | Minor | **Step 3 末尾的说明与 install.sh 现状矛盾。** 原文：「并把 `install.sh` 的 `management_menu` 占位改为直接调用 `lib/deploy.sh` 中的实现（删除占位函数），`deploy_wizard` 若也移入 `lib/deploy.sh` 需一并移动（`install.sh` 中删除其占位定义）。」—— 但 install.sh **从来没有** `management_menu` 占位函数（它走的是 `declare -F management_menu` 守卫 + 直接调用），`deploy_wizard` 也在 Task 9 就进了 `lib/deploy.sh`，install.sh 里同样没有它的占位。照这段话做会找不到东西 | 删掉这段过期说明；Task 10 的提交清单里**去掉 `install.sh`** |
+| T10-6 | Minor | **`menu_logs` 用 `journalctl -f`（跟随模式），非 TTY 下会永久阻塞。** 测试一旦覆盖到这条就会挂死（`timeout` → rc=124） | Step 1 里 `journalctl` 必须 mock 成一次性返回；Step 3 的注释里写明「`-f` 在 TTY 下需 Ctrl+C 退出」 |
+| T10-7 | Minor | **`menu_update_xray` 以 root 下载并执行 GitHub 上的 `install-release.sh`，无校验和。** 这就是登记在案的 **T6-7** | 保留实现（用户明确要求「更新内核」能力），但 **Task 13 的 README「验证状态声明」必须点名这一条**；本任务的验收标准里也要写明 |
+| T10-8 | Minor | **`management_menu` 的 `tui_menu` 没有把菜单重定向到 stderr。** Task 9 的 `choose_target` 已经踩过这个坑（`SNI=$(choose_target)` 把整张菜单吞成 SNI）。`management_menu` 目前没有 `$(...)` 捕获的调用点 → 当下无害，但 `deploy_wizard` 末尾会调它，而 `deploy_wizard` 在 Task 9 的测试里是被 `out=$( ( ... deploy_wizard ) 2>&1)` 捕获的 → 菜单文本会混进 `$out` | Step 3 给 `tui_menu` 加 `>&2`，与 Task 9 的做法统一；Step 1 补「菜单不写 stdout / 菜单确实写到 stderr」一对断言 |
+| T10-9 | Minor | **`menu_rotate_keys` 中途失败会留下「配置已换、状态未落盘」的不一致。** 顺序是 `write_config_atomic` → `save_state` → `restart_service` → `export_client_artifacts`；`save_state` 失败时 config.json 已经是新密钥、状态文件还是旧的 → 分享链接里的公钥与服务端实际公钥**不匹配** → 客户端连不上，而用户只看到一句「状态保存失败」 | Step 3 把提示改成明示「服务端配置已更新为新密钥，但状态文件未落盘」+ 给出补救动作（`install.sh --status`）；Step 1 补两条断言 |
+| T10-10 | Minor | **`management_menu` 未部署时仍列出全部 9 个选项**（含「轮换密钥」「卸载」），用户点进去只得到「未部署」提示 | 属设计取舍，不改。**但 T10-2 的守卫必须补上**，否则「网络调优」不是提示而是**真的去动防火墙** |
+
+#### 修订轮 1 顺带修掉的一个 Task 9 遗留缺陷
+
+| # | 级别 | 发现 | 处置 |
+|---|---|---|---|
+| **T9-x** | Minor | **`deploy_wizard` 的「我手动指定其它端口」分支不复查端口占用。** `--yes` 分支与菜单的「改用随机端口」分支都做了 `port_in_use` 复查（T9-8 的修复），唯独「手动输入」这条只校验了范围 → 用户手动输入一个**已被占用**的端口 → 部署一路走到 `setup_systemd` 才炸，首句报错是「systemd 配置失败」—— **正是计划自己在 T9-7 里批评过的那种「首句报错与真实原因无关」** | 作为**定点修订 P1** 补上复查；Step 1 补**正反一对**断言（被占用 → 中止；空闲 → 照常部署） |
+
+> **为什么并进 Task 10 而不是另开一轮 Task 9 修订：**
+> P1 改的是 `lib/deploy.sh` 里 `deploy_wizard` 的一个分支，与 Task 10 的新代码**在同一个文件**；
+> 为一个 Minor 缺陷重开一轮「改计划 → 重新派发 → 重新复核」的成本远高于收益。
+> **代价是 Task 9 的 Step 3 块不再与最终 `lib/deploy.sh` 逐字节一致** ——
+> 因此本任务把「定点修订」写成**可机械核对的精确文本替换**（P1 / P2），
+> 验收标准里逐条点名，控制器复核时逐条核对。
+
+#### 修订轮 1 的定点修订（对 Task 9 产物的精确文本替换）
+
+这两处改的是 `lib/deploy.sh` 里 `deploy_wizard` 函数内部。
+**除此之外，`lib/deploy.sh` 的 Task 9 Step 3 块一字不动。**
+
+> 下面四个代码块用 `text` 围栏而不是 `bash` —— 它们是**函数内部的片段**，
+> 单独 `bash -n` 必然报语法错（`case` 分支的 `1) ...` 结尾缺 `;;` 上下文、
+> 结尾多一个 `}`）。用 `text` 围栏可以让计划的语法自检脚本跳过它们，
+> 同时**原样**展示要替换的文本。
+
+**P1 —— 手动指定端口的分支必须复查占用**
+
+- 改前：
+
+```text
+        1) PORT=$(tui_input "请输入新端口" "$PORT" "1-65535")
+            # 用 10# 前缀：裸算术会把 "08" 当八进制，直接报「value too great for base」。
+            # ⚠️ 必须是 10#$PORT（带 $）：bash 不会在 10# 后解析【变量名】，
+            #    10#PORT 会被当成「以 10 为基的数字 PORT」→ 直接报
+            #    "value too great for base" → 用户手动指定的端口【必然】被判非法。
+            [[ "$PORT" =~ ^[0-9]+$ ]] && (( 10#$PORT > 0 && 10#$PORT < 65536 )) || { tui_err "端口非法"; return 1; } ;;
+```
+
+- 改后：
+
+```text
+        1) PORT=$(tui_input "请输入新端口" "$PORT" "1-65535")
+            # 用 10# 前缀：裸算术会把 "08" 当八进制，直接报「value too great for base」。
+            # ⚠️ 必须是 10#$PORT（带 $）：bash 不会在 10# 后解析【变量名】，
+            #    10#PORT 会被当成「以 10 为基的数字 PORT」→ 直接报
+            #    "value too great for base" → 用户手动指定的端口【必然】被判非法。
+            [[ "$PORT" =~ ^[0-9]+$ ]] && (( 10#$PORT > 0 && 10#$PORT < 65536 )) || { tui_err "端口非法"; return 1; }
+            # 手动指定的端口同样必须复查占用：只校验范围不校验占用 →
+            # 用户会一路走到 systemd 才炸，首句报错是「systemd 配置失败」，
+            # 与真实原因（端口被占）完全无关 —— 正是本轮修掉的 T9-7 抱怨过的那类错。
+            if port_in_use "$PORT"; then
+              tui_err "端口 $PORT 已被占用，请另选一个。"
+              return 1
+            fi ;;
+```
+
+**P2 —— 已经在管理菜单里时不再嵌套调用 `management_menu`**
+
+- 改前：
+
+```text
+  if [[ ${OPT_YES:-0} -eq 0 ]]; then
+    tui_pause
+    management_menu
+  fi
+  return 0
+}
+```
+
+- 改后：
+
+```text
+  # ⚠️ 已经在管理菜单里就【不要】再开一层：
+  #    管理菜单的第 0 项「重新部署」会调 deploy_wizard，
+  #    而这里又会调 management_menu → 用户在菜单里选一次「重新部署」，
+  #    部署完就掉进第二层菜单，再选一次「重新部署」就是第三层。
+  #    用 IN_MENU 标志位把这条回路掐断。
+  #    用 ${IN_MENU:-0} 读：deploy.sh 被单独 source（单元测试 / helper）时
+  #    它可能根本没定义，在 set -u 下直接引用会报 unbound variable。
+  if [[ ${OPT_YES:-0} -eq 0 && "${IN_MENU:-0}" -eq 0 ]]; then
+    tui_pause
+    management_menu
+  fi
+  return 0
+}
+```
+
+> ⚠️ **两处替换的命中次数必须【恰好各 1 次】** —— 命中 0 次说明文本对不上，
+> 命中 ≥2 次说明改错了地方。控制器与实施者都要自己核。
+
+#### 修订轮 1 的验收标准
+
+1. `lib/deploy.sh` 追加的内容与下面 **Step 3 代码块逐字节一致**（追加在文件末尾）。
+2. `lib/deploy.sh` 中 `deploy_wizard` 的**两处**定点修订（P1 / P2）与上面写的
+   **改后**文本逐字一致；**除这两处外，Task 9 Step 3 块一字未动**。
+3. `test/unit.sh` 里 Task 10 的插入段与下面 **Step 1 代码块逐字节一致**
+   （追加在 `test_summary` **之前**）。
+4. `bash test/unit.sh` 全部通过、退出码 0。
+5. 断言总数必须恒定，且**连跑 4 次条数相同**。
+   ⚠️ **平台差是【三个数】**（构成见 Global Constraints）：
+   本机（Windows + MSYS）**623**、Debian **以 root 运行** **628**、
+   Debian **以非 root 运行** **630**（= GitHub Actions runner 的身份）。
+   （底座 545 + Task 10 修订轮 1 的 78）
+   报告里必须写明「哪个平台 **+ 以什么身份运行**」。
+6. 红灯证据（**24 条变异**，每条都要贴出**变红的断言原文**）：
+   - A1 把 `management_menu` 的「尚未部署」提示去掉
+     → 「未部署时给出明确提示」必须变红；
+   - A2 把 `management_menu` 的 `tui_menu` 的 `>&2` 去掉
+     → 「management_menu 把菜单渲染到 stderr」必须变红；
+   - A3 把 `management_menu` 第 0 项的 `deploy_wizard` 换成 `:` 
+     → 「management_menu 第 0 项调用 deploy_wizard」必须变红；
+   - A4 把第 1 项改成调 `menu_restart`
+     → 「management_menu 第 1 项展示分享链接」必须变红；
+   - A5 把第 2 项改成调 `menu_show_client`
+     → 「management_menu 第 2 项调用 restart_service」必须变红；
+   - A6 把第 3 项改成调 `menu_restart`
+     → 「management_menu 第 3 项调用 journalctl」必须变红；
+   - A7 把第 7 项的手工卸载指引去掉
+     → 「management_menu 第 7 项在没有卸载脚本时给出明确提示」必须变红；
+   - A8 把第 8 项的 `tui_info "已退出"` 去掉
+     → 「management_menu 第 8 项提示已退出」必须变红；
+   - B1 把 `menu_tune` 的「尚未部署」守卫去掉
+     → 「menu_tune 在未部署时返回非零」必须变红；
+   - B2 把 `menu_tune` 的 `open_firewall` 失败处理改成 `|| true`
+     → 「menu_tune 在防火墙放行失败时返回非零」必须变红；
+   - B3 把 `menu_tune` 的 `enable_bbr` 失败改成 `return 1`
+     → 「menu_tune 在 BBR 未启用时仍返回 0」必须变红；
+   - C1 把 `menu_show_client` 的「尚未部署」守卫去掉
+     → 「menu_show_client 在未部署时返回非零」必须变红；
+   - C2 把 `menu_rotate_keys` 的「尚未部署」守卫去掉
+     → 「menu_rotate_keys 在未部署时返回非零」必须变红；
+   - C3 把 `menu_rotate_keys` 的 `save_state` 失败处理改成 `|| true`
+     → 「menu_rotate_keys 在状态保存失败时返回非零」必须变红；
+   - C4 把 `menu_rotate_keys` 的 `save_state` 失败提示改回旧文案
+     → 「menu_rotate_keys 如实说明服务端配置已换但状态未落盘」必须变红；
+   - C5 把 `menu_rotate_keys` 的 `export_client_artifacts` 失败处理改成 `|| true`
+     → 「menu_rotate_keys 在客户端物料导出失败时返回非零」必须变红；
+   - C6 把 `menu_rotate_keys` 的「用户取消」改成 `return 1`
+     → 「menu_rotate_keys 在用户取消时返回 0」必须变红；
+   - D1 把 `menu_update_xray` 的 `ensure_packages` 失败处理改成 `|| true`
+     → 「menu_update_xray 在依赖安装失败时返回非零」必须变红；
+   - D2 把 `menu_update_xray` 的 `curl` 失败处理改成 `|| true`
+     → 「menu_update_xray 在下载安装脚本失败时返回非零」必须变红；
+   - D3 把 `menu_update_xray` 的 mktemp 空值守卫去掉
+     → 「menu_update_xray 在 mktemp 失败时返回非零」必须变红；
+   - D4 把 `menu_update_xray` 的 `return $rc` 改成 `return 0`
+     → 「menu_update_xray 在安装脚本执行失败时返回非零」必须变红；
+   - E1 让定点修订 P1 失效（去掉手动端口的占用复查）
+     → 「deploy_wizard 在手动指定的端口被占用时返回非零」必须变红；
+   - E2 让定点修订 P2 失效（去掉 `IN_MENU` 判断）
+     → 「deploy_wizard 在已经处于管理菜单中时不再嵌套调用管理菜单」必须变红。
+   ⚠️ **点名的断言必须与预演结果里【实际变红的那一条】逐字对上**，不能只看「红了几条」。
+   ⚠️ **变异串必须与 `lib/deploy.sh` 的实际文本逐字一致** —— 片段命中次数 ≠ 1 时，
+   变异就是**没生效**。
+   ⚠️ **mock 必须精确**：共享 mock 集合里**不许**出现与被测对象同名的函数
+   （`t10_mocks` 里不许有 `management_menu` / `menu_*`；
+   `deploy_wizard` 也不许在 `t10_mocks` 里 —— 它在「向导」那组用例里是被测对象，
+   因此单独放在 `t10_mocks_menu`）。
+7. `lib/tui.sh`、`lib/core.sh`、`lib/client.sh`、`test/lib.sh`、`install.sh`、Task 5 段、Task 6 段、Task 7 段、Task 8 段、Task 9 段 **一字未动**（本任务只改 `lib/deploy.sh` 与 `test/unit.sh`）。
+8. 计划文件实施者一个字都不许改。
+9. **T9-y 复核**：`management_menu` 落地后，交互式部署跑完最后一步不再出现
+   `management_menu: command not found`（`deploy_wizard` 末尾的调用必须能命中本任务新实现的
+   `management_menu`）。**由 Task 9 遗留、在本任务消解。**
+
 **Step 1: 写失败的测试**
 
 追加到 `test/unit.sh`：
 
 ```bash
-test_case "管理菜单（未部署状态下的健壮性）"
+# ── Task 10：管理菜单（全部 mock：不装内核、不动防火墙、不联网、不起服务）──
+# ⚠️ 本段【不写任何会整块跳过的条件块】：外部依赖一律用 shell 函数 mock。
+#    mock 一律打印可辨认的标记，断言据此判断「哪一步真的执行了」。
+#
+# ⚠️ 共享 mock 集合里【不许】出现与被测对象同名的函数（Task 9 的教训：
+#    把 do_deploy 放进共享 mock → 把被测对象本身替换掉 → 22 条断言全红）。
+#    本任务被测对象是 management_menu 与 menu_* 系列 → 共享集合里一个都不许有。
+#
+# ⚠️ assert_not_contains 是 Task 8 段已定义好的辅助断言，直接用。
 
-# 未部署时进入管理菜单，菜单必须正常渲染而不是崩溃
-out=$(printf '9\n' | bash "$ROOT/test/helpers/menu_management.sh" 2>&1)
-assert_status 0 "$?" "未部署时管理菜单可正常退出"
-assert_contains "$out" "未部署" "未部署时给出明确提示"
+# 共享 mock 集合：管理菜单依赖的【所有】外部动作换成会打印标记的假实现。
+t10_mocks() {
+  cat <<'MOCKS'
+state_exists() { return 1; }
+load_state() { return 1; }
+save_state() { printf 'MOCK_SAVE_STATE\n'; return 0; }
+restart_service() { printf 'MOCK_RESTART\n'; return 0; }
+service_status() { printf 'MOCK_STATUS\n'; return 0; }
+open_firewall() { printf 'MOCK_FIREWALL PORT=%s\n' "$1"; return 0; }
+enable_bbr() { printf 'MOCK_BBR\n'; return 0; }
+ensure_packages() { printf 'MOCK_ENSURE_PKGS %s\n' "$*"; return 0; }
+curl() { printf 'MOCK_CURL %s\n' "$*"; return 0; }
+journalctl() { printf 'MOCK_JOURNALCTL %s\n' "$*"; return 0; }
+tui_run() { printf 'MOCK_TUI_RUN %s\n' "$*"; return 0; }
+tui_banner() { printf 'MOCK_BANNER\n'; return 0; }
+tui_pause() { printf 'MOCK_PAUSE\n'; return 0; }
+tui_confirm() { return 0; }
+tui_input() { printf '8443'; return 0; }
+gen_keys() { UUID='22222222-3333-4444-5555-666666666666'; PRIVATE_KEY='PRIVKEY2'; PUBLIC_KEY='PUBKEY2'; SHORT_ID='b2c3d4e5'; printf 'MOCK_GEN_KEYS\n'; return 0; }
+render_server_config() { printf 'MOCK_RENDER\n'; return 0; }
+write_config_atomic() { printf 'MOCK_ATOMIC\n'; return 0; }
+export_client_artifacts() { printf 'MOCK_EXPORT\n'; return 0; }
+build_share_link() { printf 'vless://22222222-3333-4444-5555-666666666666@198.51.100.9:443?security=reality#n'; return 0; }
+detect_public_ip() { printf '198.51.100.9'; return 0; }
+detect_local_ip() { printf '10.0.0.5'; return 0; }
+MOCKS
+}
+
+# ⚠️ deploy_wizard 用例的 mock 必须【单独】一份：
+#    它要替换掉 do_deploy 与 management_menu —— 后者是本任务的被测对象，
+#    放进共享集合会把它替换掉（Task 9 的同款错误）。
+t10_mocks_wizard() {
+  cat <<'MOCKS'
+do_deploy() { UUID='22222222-3333-4444-5555-666666666666'; PUBLIC_KEY='PUBKEY2'; SHORT_ID='b2c3d4e5'; printf 'MOCK_DO_DEPLOY PORT=%s SNI=%s\n' "$PORT" "$SNI"; FIREWALL_OK=1; return 0; }
+management_menu() { printf 'MOCK_MENU\n'; return 0; }
+choose_target() { printf 'www.microsoft.com'; return 0; }
+random_free_port() { printf '8443'; return 0; }
+port_occupant() { printf ''; return 0; }
+MOCKS
+}
+
+# ⚠️ 管理菜单用例也要单独一份：第 0 项会调 deploy_wizard，
+#    这里要把它换成假实现，否则会真的跑一遍部署向导。
+#    （不能放进 t10_mocks —— deploy_wizard 在「向导」那组用例里是被测对象。）
+t10_mocks_menu() {
+  cat <<'MOCKS'
+deploy_wizard() { printf 'MOCK_DEPLOY_WIZARD\n'; return 0; }
+MOCKS
+}
+
+# tui_menu 的返回码序列：第一次返回 MENU_PICK，之后一律 255（用户取消）
+# → management_menu 的 while 循环必须能退出，测试才不会挂死。
+t10_menu_pick() {
+  MENU_N=0
+  tui_menu() {
+    MENU_N=$((MENU_N + 1))
+    if (( MENU_N == 1 )); then return "$MENU_PICK"; fi
+    return 255
+  }
+}
+
+T10_TMP=$(mktemp -d 2>/dev/null)
+if [[ -n "$T10_TMP" ]]; then
+
+test_case "管理菜单：未部署状态下的健壮性"
+
+# 未部署时进入管理菜单：必须给出明确提示，并且能正常退出
+out=$( ( eval "$(t10_mocks; t10_mocks_menu)"
+         MENU_PICK=255
+         t10_menu_pick
+         management_menu ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "未部署时管理菜单可正常退出"
+assert_contains "$out" "尚未部署" "未部署时给出明确提示"
+assert_contains "$out" "已退出" "用户取消菜单时提示已退出"
+
+# 菜单必须渲染到 stderr —— tui_menu 把整张菜单打到 stdout，
+# 而 deploy_wizard 末尾会调 management_menu，一旦有人用 $(...) 捕获就会吞掉菜单。
+out=$( ( eval "$(t10_mocks; t10_mocks_menu)"
+         tui_menu() { printf 'MOCK_MENU_MARKER\n'; return 255; }
+         management_menu ) 2>/dev/null )
+err=$( ( eval "$(t10_mocks; t10_mocks_menu)"
+         tui_menu() { printf 'MOCK_MENU_MARKER\n'; return 255; }
+         management_menu ) 2>&1 >/dev/null )
+assert_not_contains "$out" "MOCK_MENU_MARKER" "management_menu 把菜单渲染到 stderr（不污染 stdout）"
+assert_contains "$err" "MOCK_MENU_MARKER" "management_menu 的菜单确实写到了 stderr"
+
+test_case "管理菜单：各菜单项的分发"
+
+# 第 0 项：重新部署 → 调 deploy_wizard
+out=$( ( eval "$(t10_mocks; t10_mocks_menu)"
+         MENU_PICK=0
+         t10_menu_pick
+         management_menu ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "管理菜单选择「重新部署」时正常返回"
+assert_contains "$out" "MOCK_DEPLOY_WIZARD" "management_menu 第 0 项调用 deploy_wizard"
+
+# 第 1 项：查看配置 → 调 menu_show_client
+out=$( ( eval "$(t10_mocks; t10_mocks_menu)"
+         state_exists() { return 0; }
+         load_state() { UUID='22222222-3333-4444-5555-666666666666'; SERVER_IP='198.51.100.9'; PORT=443; SNI='www.microsoft.com'; PUBLIC_KEY='PUBKEY2'; SHORT_ID='b2c3d4e5'; REMARK='node'; return 0; }
+         MENU_PICK=1
+         t10_menu_pick
+         management_menu ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "管理菜单选择「查看配置」时正常返回"
+assert_contains "$out" "vless://22222222-3333-4444-5555-666666666666@198.51.100.9:443" "management_menu 第 1 项展示分享链接"
+assert_contains "$out" "198.51.100.9:443" "management_menu 第 1 项展示节点地址"
+
+# 第 2 项：重启服务 → 调 restart_service
+out=$( ( eval "$(t10_mocks; t10_mocks_menu)"
+         MENU_PICK=2
+         t10_menu_pick
+         management_menu ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "管理菜单选择「重启服务」时正常返回"
+assert_contains "$out" "MOCK_RESTART" "management_menu 第 2 项调用 restart_service"
+
+# 第 3 项：实时日志 → 调 journalctl
+out=$( ( eval "$(t10_mocks; t10_mocks_menu)"
+         MENU_PICK=3
+         t10_menu_pick
+         management_menu ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "管理菜单选择「实时日志」时正常返回"
+assert_contains "$out" "MOCK_JOURNALCTL" "management_menu 第 3 项调用 journalctl"
+
+# 第 4 项：更新内核 → 调 ensure_packages + curl + tui_run
+out=$( ( eval "$(t10_mocks; t10_mocks_menu)"
+         MENU_PICK=4
+         t10_menu_pick
+         management_menu ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "管理菜单选择「更新内核」时正常返回"
+assert_contains "$out" "MOCK_ENSURE_PKGS" "management_menu 第 4 项先补齐依赖"
+assert_contains "$out" "MOCK_CURL" "management_menu 第 4 项下载安装脚本"
+assert_contains "$out" "MOCK_TUI_RUN" "management_menu 第 4 项执行安装脚本"
+assert_contains "$out" "MOCK_RESTART" "management_menu 第 4 项更新成功后重启服务"
+
+# 第 5 项：网络调优 → 已部署时放行防火墙 + 开 BBR
+out=$( ( eval "$(t10_mocks; t10_mocks_menu)"
+         state_exists() { return 0; }
+         load_state() { PORT=443; return 0; }
+         MENU_PICK=5
+         t10_menu_pick
+         management_menu ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "管理菜单选择「网络调优」时正常返回"
+assert_contains "$out" "MOCK_FIREWALL PORT=443" "management_menu 第 5 项放行已部署的端口"
+assert_contains "$out" "MOCK_BBR" "management_menu 第 5 项开启 BBR"
+assert_contains "$out" "MOCK_STATUS" "management_menu 第 5 项最后展示服务状态"
+
+# 第 6 项：轮换密钥 → 走完整的换密钥链路
+out=$( ( eval "$(t10_mocks; t10_mocks_menu)"
+         state_exists() { return 0; }
+         load_state() { UUID='22222222-3333-4444-5555-666666666666'; SERVER_IP='198.51.100.9'; PORT=443; SNI='www.microsoft.com'; PUBLIC_KEY='PUBKEY2'; SHORT_ID='b2c3d4e5'; REMARK='node'; return 0; }
+         XRAY_CONFIG="$T10_TMP/cfg.json"
+         OUT_DIR="$T10_TMP/out"
+         MENU_PICK=6
+         t10_menu_pick
+         management_menu ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "管理菜单选择「轮换密钥」时正常返回"
+assert_contains "$out" "MOCK_GEN_KEYS" "management_menu 第 6 项生成新密钥"
+assert_contains "$out" "MOCK_RENDER" "management_menu 第 6 项重新渲染服务端配置"
+assert_contains "$out" "MOCK_ATOMIC" "management_menu 第 6 项原子替换服务端配置"
+assert_contains "$out" "MOCK_SAVE_STATE" "management_menu 第 6 项保存新状态"
+assert_contains "$out" "MOCK_EXPORT" "management_menu 第 6 项重新导出客户端物料"
+assert_contains "$out" "密钥已轮换" "management_menu 第 6 项提示密钥已轮换"
+
+# 第 7 项：卸载 → 单文件分发版没有 uninstall.sh，必须给出手工指引
+out=$( ( eval "$(t10_mocks; t10_mocks_menu)"
+         ROOT_DIR="$T10_TMP"
+         MENU_PICK=7
+         t10_menu_pick
+         management_menu ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "管理菜单选择「卸载」时正常返回"
+assert_contains "$out" "没有 uninstall.sh" "management_menu 第 7 项在没有卸载脚本时给出明确提示"
+assert_contains "$out" "systemctl disable --now xray" "management_menu 第 7 项给出手工卸载命令"
+
+# 第 8 项：退出
+out=$( ( eval "$(t10_mocks; t10_mocks_menu)"
+         MENU_PICK=8
+         t10_menu_pick
+         management_menu ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "管理菜单选择「退出」时正常返回"
+assert_contains "$out" "已退出" "management_menu 第 8 项提示已退出"
+
+test_case "管理菜单项：未部署时的守卫"
+
+# menu_show_client：未部署 → 提示 + 返回非零，且绝不能去拼分享链接
+out=$( ( eval "$(t10_mocks; t10_mocks_menu)"
+         menu_show_client ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "menu_show_client 在未部署时返回非零"
+assert_contains "$out" "尚未部署" "menu_show_client 在未部署时给出明确提示"
+assert_not_contains "$out" "vless://" "menu_show_client 在未部署时不展示分享链接"
+
+# menu_rotate_keys：未部署 → 提示 + 返回非零，且绝不能生成新密钥
+out=$( ( eval "$(t10_mocks; t10_mocks_menu)"
+         menu_rotate_keys ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "menu_rotate_keys 在未部署时返回非零"
+assert_contains "$out" "尚未部署" "menu_rotate_keys 在未部署时给出明确提示"
+assert_not_contains "$out" "MOCK_GEN_KEYS" "menu_rotate_keys 在未部署时不生成新密钥"
+
+# ⚠️ menu_tune：未部署时 $PORT 是空串 → open_firewall "" 会去执行
+#    `ufw allow "/tcp"` / `iptables --dport ""` —— 报错与真实原因完全无关。
+#    必须有「尚未部署」的守卫，且绝不能碰防火墙。
+out=$( ( eval "$(t10_mocks; t10_mocks_menu)"
+         menu_tune ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "menu_tune 在未部署时返回非零"
+assert_contains "$out" "尚未部署" "menu_tune 在未部署时给出明确提示"
+assert_not_contains "$out" "MOCK_FIREWALL" "menu_tune 在未部署时不碰防火墙"
+
+test_case "管理菜单项：失败路径必须报错"
+
+# menu_tune：防火墙放行失败 → 必须报错并返回非零
+out=$( ( eval "$(t10_mocks; t10_mocks_menu)"
+         state_exists() { return 0; }
+         load_state() { PORT=443; return 0; }
+         open_firewall() { printf 'MOCK_FIREWALL PORT=%s\n' "$1"; return 1; }
+         menu_tune ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "menu_tune 在防火墙放行失败时返回非零"
+assert_contains "$out" "防火墙放行失败" "menu_tune 在防火墙放行失败时给出明确提示"
+
+# menu_tune：BBR 没开是非致命的 → 仍然返回 0
+out=$( ( eval "$(t10_mocks; t10_mocks_menu)"
+         state_exists() { return 0; }
+         load_state() { PORT=443; return 0; }
+         enable_bbr() { printf 'MOCK_BBR\n'; return 1; }
+         menu_tune ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "menu_tune 在 BBR 未启用时仍返回 0"
+assert_contains "$out" "BBR 未启用" "menu_tune 在 BBR 未启用时给出警告"
+
+# menu_rotate_keys：状态保存失败 → 必须报错，并如实说明「配置已换、状态没落盘」
+out=$( ( eval "$(t10_mocks; t10_mocks_menu)"
+         state_exists() { return 0; }
+         load_state() { UUID='u'; SERVER_IP='1.2.3.4'; PORT=443; SNI='s'; PUBLIC_KEY='p'; SHORT_ID='x'; REMARK='r'; return 0; }
+         save_state() { printf 'MOCK_SAVE_STATE\n'; return 1; }
+         XRAY_CONFIG="$T10_TMP/cfg.json"
+         OUT_DIR="$T10_TMP/out"
+         menu_rotate_keys ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "menu_rotate_keys 在状态保存失败时返回非零"
+assert_contains "$out" "状态保存失败" "menu_rotate_keys 在状态保存失败时给出明确提示"
+assert_contains "$out" "已更新为新密钥" "menu_rotate_keys 如实说明服务端配置已换但状态未落盘"
+
+# menu_rotate_keys：物料导出失败 → 必须报错
+out=$( ( eval "$(t10_mocks; t10_mocks_menu)"
+         state_exists() { return 0; }
+         load_state() { UUID='u'; SERVER_IP='1.2.3.4'; PORT=443; SNI='s'; PUBLIC_KEY='p'; SHORT_ID='x'; REMARK='r'; return 0; }
+         export_client_artifacts() { printf 'MOCK_EXPORT\n'; return 1; }
+         XRAY_CONFIG="$T10_TMP/cfg.json"
+         OUT_DIR="$T10_TMP/out"
+         menu_rotate_keys ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "menu_rotate_keys 在客户端物料导出失败时返回非零"
+assert_contains "$out" "客户端物料导出失败" "menu_rotate_keys 在物料导出失败时给出明确提示"
+
+# menu_rotate_keys：用户取消 → 返回 0（不是失败）
+out=$( ( eval "$(t10_mocks; t10_mocks_menu)"
+         state_exists() { return 0; }
+         load_state() { UUID='u'; SERVER_IP='1.2.3.4'; PORT=443; SNI='s'; PUBLIC_KEY='p'; SHORT_ID='x'; REMARK='r'; return 0; }
+         tui_confirm() { return 1; }
+         menu_rotate_keys ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "menu_rotate_keys 在用户取消时返回 0"
+assert_contains "$out" "已取消" "menu_rotate_keys 在用户取消时给出明确提示"
+assert_not_contains "$out" "MOCK_GEN_KEYS" "menu_rotate_keys 在用户取消时不生成新密钥"
+
+# menu_update_xray：依赖装不上 → 必须停在这里（不能去下载脚本）
+out=$( ( eval "$(t10_mocks; t10_mocks_menu)"
+         ensure_packages() { printf 'MOCK_ENSURE_PKGS %s\n' "$*"; return 1; }
+         menu_update_xray ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "menu_update_xray 在依赖安装失败时返回非零"
+assert_contains "$out" "依赖安装失败" "menu_update_xray 在依赖安装失败时给出明确提示"
+assert_not_contains "$out" "MOCK_CURL" "menu_update_xray 在依赖安装失败后不下载安装脚本"
+
+# menu_update_xray：下载失败 → 必须报错
+out=$( ( eval "$(t10_mocks; t10_mocks_menu)"
+         curl() { printf 'MOCK_CURL %s\n' "$*"; return 1; }
+         menu_update_xray ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "menu_update_xray 在下载安装脚本失败时返回非零"
+assert_contains "$out" "下载安装脚本失败" "menu_update_xray 在下载失败时给出明确提示"
+assert_not_contains "$out" "MOCK_TUI_RUN" "menu_update_xray 在下载失败后不执行安装脚本"
+
+# menu_update_xray：mktemp 失败 → 必须中止（否则 curl -o "" 会失败、rm -f "" 会报错）
+out=$( ( eval "$(t10_mocks; t10_mocks_menu)"
+         mktemp() { return 1; }
+         menu_update_xray ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "menu_update_xray 在 mktemp 失败时返回非零"
+assert_contains "$out" "无法创建临时文件" "menu_update_xray 在 mktemp 失败时给出明确提示"
+
+# menu_update_xray：安装脚本执行失败 → 必须返回非零且不重启
+out=$( ( eval "$(t10_mocks; t10_mocks_menu)"
+         tui_run() { printf 'MOCK_TUI_RUN %s\n' "$*"; return 1; }
+         menu_update_xray ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "menu_update_xray 在安装脚本执行失败时返回非零"
+assert_not_contains "$out" "MOCK_RESTART" "menu_update_xray 在安装失败后不重启服务"
+
+test_case "向导：手动指定端口的占用复查"
+
+# 手动输入的端口【同样】必须复查占用：
+# 只校验范围不校验占用 → 用户会一路走到 systemd 才炸，
+# 首句报错是「systemd 配置失败」，与真实原因（端口被占）完全无关。
+out=$( ( eval "$(t10_mocks; t10_mocks_wizard)"
+         OPT_YES=0
+         OPT_PORT=443
+         port_in_use() { [[ "$1" == "443" || "$1" == "8443" ]] && return 0 || return 1; }
+         tui_menu() { return 1; }
+         tui_input() { printf '8443'; return 0; }
+         XRAY_CONFIG="$T10_TMP/cfg.json"
+         OUT_DIR="$T10_TMP/out"
+         deploy_wizard ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "deploy_wizard 在手动指定的端口被占用时返回非零"
+assert_contains "$out" "已被占用" "deploy_wizard 在手动指定的端口被占用时给出明确提示"
+assert_not_contains "$out" "MOCK_DO_DEPLOY" "deploy_wizard 在手动端口被占用时不继续部署"
+
+# 反向对照：手动指定的端口【没有】被占用 → 必须照常部署
+out=$( ( eval "$(t10_mocks; t10_mocks_wizard)"
+         OPT_YES=0
+         OPT_PORT=443
+         port_in_use() { [[ "$1" == "443" ]] && return 0 || return 1; }
+         tui_menu() { return 1; }
+         tui_input() { printf '8443'; return 0; }
+         XRAY_CONFIG="$T10_TMP/cfg.json"
+         OUT_DIR="$T10_TMP/out"
+         deploy_wizard ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "deploy_wizard 在手动指定的端口空闲时正常部署"
+assert_contains "$out" "MOCK_DO_DEPLOY PORT=8443" "deploy_wizard 采用手动指定的新端口继续部署"
+
+# ⚠️ 防递归：管理菜单的「重新部署」会调 deploy_wizard，
+#    而 deploy_wizard 末尾又会调 management_menu → 用户选一次「重新部署」
+#    就被套进第二层菜单。用 IN_MENU 标志位把这条回路掐断。
+#    正向：已经在菜单里（IN_MENU=1）→ deploy_wizard 【不得】再调管理菜单。
+out=$( ( eval "$(t10_mocks; t10_mocks_wizard)"
+         OPT_YES=0
+         IN_MENU=1
+         port_in_use() { return 1; }
+         XRAY_CONFIG="$T10_TMP/cfg.json"
+         OUT_DIR="$T10_TMP/out"
+         deploy_wizard ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "deploy_wizard 在已经处于管理菜单中时正常返回"
+assert_not_contains "$out" "MOCK_MENU" "deploy_wizard 在已经处于管理菜单中时不再嵌套调用管理菜单"
+
+# 反向对照：不在菜单里（IN_MENU=0）→ deploy_wizard 仍然要落回管理菜单
+out=$( ( eval "$(t10_mocks; t10_mocks_wizard)"
+         OPT_YES=0
+         IN_MENU=0
+         port_in_use() { return 1; }
+         XRAY_CONFIG="$T10_TMP/cfg.json"
+         OUT_DIR="$T10_TMP/out"
+         deploy_wizard ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "deploy_wizard 在不在管理菜单中时正常返回"
+assert_contains "$out" "MOCK_MENU" "deploy_wizard 在【不】处于管理菜单中时仍然落回管理菜单"
+
+test_case "管理菜单：真实 shell 里的非 TTY 渲染"
+
+# 这一组【不 mock 任何东西】：起一个真实的 bash，source 真实的 lib/*，
+# 用管道喂「9」选中「退出」→ 验证真实菜单在非 TTY 下能正常渲染并退出。
+# ⚠️ 状态文件必须指向一个【必然不存在】的路径：
+#    core.sh 的 STATE_FILE="${STATE_FILE:-...}" 会保留调用方预设的值 →
+#    开发机上真的部署过时，这一组断言也不会翻脸。
+out=$(printf '9\n' | T10_STATE_FILE="$T10_TMP/no-such-state.env" bash "$ROOT/test/helpers/menu_management.sh" 2>&1); rc=$?
+assert_status 0 "$rc" "真实 shell 里进入管理菜单并选择退出时返回 0"
+assert_contains "$out" "尚未部署" "真实 shell 里未部署时给出明确提示"
+assert_contains "$out" "已退出" "真实 shell 里选择退出时提示已退出"
+
+else
+  assert_eq "mktemp -d 能创建唯一临时目录" "失败（mktemp -d 返回空路径）" \
+    "Task 10 用例前提：mktemp -d 必须能创建唯一临时目录"
+fi
+rm -rf "$T10_TMP"
 ```
 
 创建 `test/helpers/menu_management.sh`（管理菜单实现在 `lib/deploy.sh`，直接 source 调用，
@@ -6190,10 +6740,25 @@ assert_contains "$out" "未部署" "未部署时给出明确提示"
 
 ```bash
 #!/usr/bin/env bash
+# 管理菜单的「真实 shell」入口：source 真实的 lib/*，进管理菜单。
+# 用法：printf '9\n' | bash test/helpers/menu_management.sh
+#   → 管道喂「9」= 选中第 9 项「退出」→ 菜单正常退出（rc=0）
+#
+# ⚠️ 状态文件必须指向一个【必然不存在】的路径：
+#    core.sh 里是 STATE_FILE="${STATE_FILE:-/etc/vless-reality/deploy.env}"
+#    —— 预设值会被保留 → 传进来一个假路径就能确定地测「未部署」分支，
+#    不受「这台机器上是不是真的部署过」的影响。
+export STATE_FILE="${T10_STATE_FILE:-/nonexistent/vless-reality-test/deploy.env}"
+export STATE_DIR="$(dirname "$STATE_FILE")"
+
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+# shellcheck source=lib/tui.sh
 source "$ROOT/lib/tui.sh"
+# shellcheck source=lib/core.sh
 source "$ROOT/lib/core.sh"
+# shellcheck source=lib/deploy.sh
 source "$ROOT/lib/deploy.sh"
+# shellcheck source=lib/client.sh
 source "$ROOT/lib/client.sh"
 tui_init
 load_state || true
@@ -6247,6 +6812,8 @@ menu_restart() {
 
 menu_logs() {
   tui_info "实时日志输出，Ctrl+C 退出"
+  # -f 是跟随模式，会一直挂着直到用户 Ctrl+C。
+  # 非 TTY（CI / 单元测试）下必须由调用方 mock 掉，否则会永久阻塞。
   journalctl -u xray -f --no-pager
 }
 
@@ -6273,6 +6840,13 @@ menu_update_xray() {
 }
 
 menu_tune() {
+  # 必须先确认「已部署」：未部署时 $PORT 是【空串】（core.sh 给的全局默认值），
+  # 此时 open_firewall "" 会去执行 `ufw allow "/tcp"` / `iptables --dport ""` /
+  # `nft ... tcp dport ""` —— 三条全部报错，而且报出来的错与真实原因
+  # （压根没部署、根本没有端口）完全无关。
+  # menu_show_client 与 menu_rotate_keys 都有这道守卫，menu_tune 原来漏了。
+  state_exists || { tui_warn "尚未部署，无端口可放行，无法调优。"; return 1; }
+  load_state || { tui_err "状态文件读取失败，无法调优。"; return 1; }
   # 不能用 `|| true` 吞掉失败：防火墙没放行、BBR 没开，
   # 用户却只看到 service_status 的输出 → 以为调优成功了。
   # 两个动作互相独立，所以各自报错、最后统一返回。
@@ -6300,7 +6874,11 @@ menu_rotate_keys() {
   # 与 do_deploy 走同一个入口：write_config_atomic（校验 → 原子替换 → 600）
   write_config_atomic "$XRAY_CONFIG" "$cfg" || { rm -f "$cfg"; return 1; }
   rm -f "$cfg"
-  save_state || { tui_err "状态保存失败"; return 1; }
+  # ⚠️ 这一步失败时，服务端配置【已经】换成新密钥了，而状态文件还是旧的
+  #    （旧 UUID / 旧公钥）→ 分享链接里的公钥与服务端实际公钥对不上 →
+  #    客户端导入后连不上，而用户只看到一句「状态保存失败」。
+  #    所以提示里必须如实说明「配置已换、状态没落盘」，并给出补救动作。
+  save_state || { tui_err "状态保存失败：服务端配置已更新为新密钥，但状态文件未落盘。"; tui_tip "请用 install.sh --status 核对，或重新执行一次部署。"; return 1; }
   restart_service || return 1
   # 物料导出失败必须报错：否则「密钥已轮换」这条提示会让人以为
   # client.json / link.txt 已经是新的，实际还是旧的（甚至根本没生成）。
@@ -6320,14 +6898,23 @@ menu_uninstall() {
 }
 
 management_menu() {
+  # ⚠️ 防止「管理菜单 ↔ deploy_wizard」互相递归：
+  #    菜单第 0 项「重新部署」会调 deploy_wizard，而 deploy_wizard 末尾又会调
+  #    management_menu → 用户在菜单里选一次「重新部署」，部署完就掉进第二层菜单，
+  #    再选一次「重新部署」就是第三层。
+  #    用全局标志位告诉 deploy_wizard「现在已经在菜单里了，别再开一层」。
+  #    用 ${IN_MENU:-0} 读：deploy.sh 被单独 source（单元测试 / helper）时它可能没定义，
+  #    在 set -u 下直接引用会报 unbound variable。
+  IN_MENU=1
   while true; do
     tui_banner "$APP_NAME" "管理菜单"
     if ! state_exists; then
       tui_warn "尚未部署。选「重新部署」开始，或直接退出。"
     fi
-    local choice
-    # 同上：用返回码取选中项，不要用 $(...) 捕获 stdout
     local choice=0 crc=0
+    # 菜单必须渲染到 stderr：tui_menu 把整张菜单打到 stdout，而 deploy_wizard
+    # 末尾会调 management_menu —— 一旦有人用 $(...) 捕获它，菜单文本就会被
+    # 当成返回值吞进去。与 choose_target 是同一个坑。
     tui_menu "请选择操作" \
       "重新部署（重跑向导）" \
       "查看配置 / 分享链接 / 二维码" \
@@ -6337,7 +6924,7 @@ management_menu() {
       "网络调优（BBR / 防火墙）" \
       "轮换密钥与 UUID" \
       "卸载" \
-      "退出" || crc=$?
+      "退出" >&2 || crc=$?
     if (( crc == 255 )); then
       tui_info "已退出"
       return 0
@@ -6360,8 +6947,8 @@ management_menu() {
 }
 ```
 
-并把 `install.sh` 的 `management_menu` 占位改为直接调用 `lib/deploy.sh` 中的实现（删除占位函数），
-`deploy_wizard` 若也移入 `lib/deploy.sh` 需一并移动（`install.sh` 中删除其占位定义）。
+`install.sh` **无需任何改动** —— 它已在 Task 8 通过 `declare -F management_menu` 守卫 + 直接调用
+来使用本任务的实现（`deploy_wizard` 也早在 Task 9 就进了 `lib/deploy.sh`，install.sh 里没有它的占位）。
 
 **Step 4: 运行测试确认通过**
 
@@ -6374,7 +6961,7 @@ bash test/unit.sh
 **Step 5: 提交**
 
 ```bash
-git add lib/deploy.sh install.sh test/unit.sh test/helpers/
+git add lib/deploy.sh test/unit.sh test/helpers/
 git commit -m "feat(menu): 管理菜单——查看、重启、日志、更新、轮换密钥与卸载"
 ```
 
