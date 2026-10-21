@@ -18,7 +18,7 @@
 
 - 纯 bash 4.2+，**零第三方 TUI 依赖**（不装 dialog / whiptail / gum / ncurses）
 - 允许使用的外部命令仅限（**运行时 / 分发物内**，即 `dist/install.sh` 与 `lib/`）：
-  - 基础系统工具（Debian 基础系统自带，coreutils 等）：`awk` `sed` `grep` `tr` `cat` `od` `cut` `head` `sort` `seq` `sleep` `date` `uname` `hostname` `env` `timeout`
+  - 基础系统工具（Debian 基础系统自带，coreutils 等）：`awk` `sed` `grep` `tr` `cat` `od` `cut` `head` `sort` `seq` `sleep` `date` `uname` `hostname` `env` `timeout` `id` `sysctl`
   - 文件与权限：`mktemp` `cp` `mv` `rm` `mkdir` `chmod` `chown`
   - 网络与系统：`curl` `openssl` `systemctl` `journalctl` `ss` `ip`
   - 防火墙（三选一，缺失时只提示不改规则）：`ufw` `iptables` `nft`
@@ -1038,7 +1038,11 @@ test_case "core 纯函数"
 assert_eq "hello world" "$(trim '  hello world  ')" "trim 去除首尾空白"
 assert_eq "a%20b" "$(urlencode 'a b')" "urlencode 编码空格"
 assert_eq "%E4%B8%AD%E6%96%87" "$(urlencode '中文')" "urlencode 编码中文"
-assert_eq "abc123" "$(urlencode 'abc-123')" "urlencode 保留安全字符"
+# 期望值必须是 "abc-123"：连字符 '-' 是 RFC 3986 的 unreserved 字符，
+# Python 的 quote(s, safe="") 必然保留它，回退分支的安全集里也有 '-'。
+# 原先写成 "abc123" 等于要求「把连字符删掉」，与它自己的描述自相矛盾。
+assert_eq "abc-123" "$(urlencode 'abc-123')" "urlencode 保留安全字符（连字符不编码）"
+assert_eq "abc123" "$(urlencode 'abc123')" "urlencode 保留字母与数字"
 
 assert_eq "16"  "$(printf '%s' "$(random_hex 8)" | wc -c | tr -d ' ')" "random_hex 8 字节 = 16 个十六进制字符"
 assert_match_hex() {
@@ -1140,6 +1144,14 @@ XRAY_BIN="${XRAY_BIN:-/usr/local/bin/xray}"
 XRAY_CONFIG="${XRAY_CONFIG:-/usr/local/etc/xray/config.json}"
 LOG_DIR="${LOG_DIR:-/var/log/xray}"
 
+# 全局部署状态：Task 5/7/9 赋值，Task 3 的 save_state 负责持久化。
+# 必须显式声明：install.sh 跑在 `set -u` 下，未声明又未赋值的变量一旦被引用
+# 就会触发 unbound variable。
+PORT=''; UUID=''; SNI=''; TARGET=''
+PRIVATE_KEY=''; PUBLIC_KEY=''; SHORT_ID=''
+SERVER_IP=''; REMARK=''
+MODE='native'; FLOW='xtls-rprx-vision'; FINGERPRINT='chrome'
+
 REALITY_TARGETS=(
   'www.microsoft.com'
   'dl.google.com'
@@ -1173,6 +1185,11 @@ urlencode() {
     c=${s:$i:1}
     case "$c" in
       [a-zA-Z0-9.~_-]) out+="$c" ;;
+      # ' 与 \ 的编码写死：printf '%%%02X' "'$c" 依赖 bash 对「以 ' 开头的字符常量」
+      # 的解释，这是未文档化的实现细节（实测 bash 5.3 给出 39/92，bash 4.2 无保证）。
+      # 写死后任意 bash 4.2+ 结果一致，输出与原写法逐字节相同。
+      "'")  out+='%27' ;;
+      '\')  out+='%5C' ;;
       *) out+=$(printf '%%%02X' "'$c") ;;
     esac
   done
@@ -1182,9 +1199,12 @@ urlencode() {
 random_hex() {
   local n="${1:-8}"
   if have_cmd openssl; then
-    openssl rand -hex "$n" 2>/dev/null | tr -d '\n'; return 0
+    # 连 CR 一起删：某些 openssl 构建输出的是 \r\n，只删 LF 会残留一个 \r，
+    # 而这个 \r 会混进 SHORT_ID / 密钥，随后被原样写进 config.json
+    # （JSON 字符串里不允许裸控制字符）→ 直接让部署失败。
+    openssl rand -hex "$n" 2>/dev/null | tr -d '\r\n'; return 0
   fi
-  od -An -tx1 -N "$n" /dev/urandom 2>/dev/null | tr -d ' \n'
+  od -An -tx1 -N "$n" /dev/urandom 2>/dev/null | tr -d ' \r\n'
 }
 
 read_file() {
@@ -1307,6 +1327,16 @@ bash test/unit.sh
 git add lib/core.sh test/unit.sh
 git commit -m "feat(core): 纯函数工具集与部署状态持久化"
 ```
+
+> **实施说明（Task 3 已完成，以 `lib/core.sh` 与 `test/unit.sh` 为准）**：上面的 Step 1
+> 是本任务的**最低规格**。实际实现在此基础上把用例拆成 4 组
+> （`core 纯函数` / `core SNI 主机名校验` / `core 状态持久化` / `core 常量与文件边界`），
+> 并补充到 **130 条断言全部通过**（Task 2 结束时 52 条）。实现有 3 处受控偏离：
+> `urlencode` 写死 `'`→`%27`、`\`→`%5C`（bash 的字符常量解析未文档化）；
+> `random_hex` 连 `\r` 一起删（openssl 的 `\r\n` 会把裸控制字符带进 config.json）；
+> Step 1 里 `urlencode 保留安全字符` 的期望值原为笔误（见 Step 1 上方说明）。
+> 逐条证据见 `.superpowers/sdd/2026-10-21-vless-reality-deploy/task-3-report.md`。
+> **本任务后续不再修改**；Task 4 只在 `lib/core.sh` 末尾追加网络探测函数。
 
 ---
 
@@ -1551,10 +1581,18 @@ assert_eq "" "$out" "无法识别时返回空串且退出码非零"
 
 test_case "服务端配置渲染"
 
+# mktemp 失败时 $cfg 为空 → 渲染函数会写出 ".new" 污染仓库当前目录 → 必须守卫。
 cfg=$(mktemp)
+if [[ -z "$cfg" ]]; then
+  assert_eq "mktemp 能创建临时文件" "失败（mktemp 返回空路径）" "渲染用例前提：mktemp 必须可用"
+else
 render_server_config "$cfg" "11111111-2222-3333-4444-555555555555" "PRIVKEY" "www.microsoft.com" "443" "a1b2c3d4" >/dev/null
-assert_true "$(python3 -c "import json,sys;json.load(open(sys.argv[1]));print(0)" "$cfg" 2>/dev/null || echo 1)" "生成的配置是合法 JSON" 2>/dev/null || true
-if have_cmd python3; then
+# JSON 合法性检查必须在 python3 判活守卫【之内】：
+# 守卫外的那条会在「没有 python3」的机器上必然判红（捕获到 "1" → assert_true 失败）。
+# 判活必须用【功能可用】而不是 have_cmd：本机可能存在名为 python3 的占位/存根
+# （例如 Microsoft Store 的 app execution alias），`command -v` 找得到但一跑就失败。
+# 用 have_cmd 判活会让「JSON 合法性」断言在这些机器上必然判红。
+if python3 -c 'import json' >/dev/null 2>&1; then
   assert_status 0 "$(python3 -c "import json,sys;json.load(open(sys.argv[1]));print(0)" "$cfg" 2>/dev/null || echo 1)" "生成的配置是合法 JSON"
   assert_contains "$(cat "$cfg")" '"security": "reality"' "配置启用 reality"
   assert_contains "$(cat "$cfg")" '"target": "www.microsoft.com:443"' "reality target 正确"
@@ -1565,6 +1603,7 @@ if have_cmd python3; then
   assert_eq 0 "$(grep -c 'geoip' "$cfg")" "配置不引用 geoip（避免 geoip.dat 依赖）"
 fi
 rm -f "$cfg"
+fi
 ```
 
 **Step 2: 运行测试确认失败**
@@ -1594,9 +1633,13 @@ xray_parse_keys() {
     if [[ "$line" == *=* && "$line" != *:* ]]; then
       key="${line%%=*}"
       val="${line#*=}"
-    else
+    elif [[ "$line" == *:* ]]; then
       key="${line%%:*}"
       val="${line#*:}"
+    else
+      # 既无 ':' 也无 '=' 的行：上面两种取法都会把整行当成 key 和 val，
+      # 例如单独一行 "PrivateKey" 会被误判成私钥 "PrivateKey" → 必须跳过。
+      continue
     fi
     key=$(trim "$key")
     val=$(trim "$val")
@@ -1800,8 +1843,11 @@ if [[ ! -x "$XRAY_BIN" ]]; then
   assert_fails "未安装时 xray_installed 返回非零" xray_installed
 fi
 
-# enable_bbr 在不支持 bbr 的内核上必须安全失败而非崩溃；输出必须提及 bbr
-out=$(enable_bbr 2>&1) || true
+# enable_bbr 在不支持 bbr 的内核上必须安全失败而非崩溃；输出必须提及 bbr。
+# 必须 mock 掉 sysctl 走「不支持 bbr」分支：真实调用会写
+# /etc/sysctl.d/99-vless-reality-bbr.conf 并 `sysctl -p` 立即应用，
+# 那是单元测试不该有的主机副作用（CI 上会真的改掉运行内核的拥塞控制）。
+out=$( ( sysctl() { printf 'cubic\n'; }; enable_bbr 2>&1 ) ) || true
 assert_contains "$out" "bbr" "enable_bbr 输出提及 bbr 状态"
 
 # open_firewall 在无任何防火墙工具时必须明确告知而不是静默成功
@@ -1836,7 +1882,8 @@ install_xray() {
     tui_tip "如需更新请使用管理菜单的「更新 Xray 内核」"
     return 0
   fi
-  ensure_packages curl ca-certificates
+  # 依赖装不上就必须中止：ensure_packages 会透传 apt 的失败码。
+  ensure_packages curl ca-certificates || return 1
   local installer
   installer=$(mktemp)
   if ! curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o "$installer"; then
@@ -2017,9 +2064,14 @@ assert_contains "$link" "sid=a1b2c3d4" "链接含 shortId"
 assert_contains "$link" "type=tcp" "链接含传输协议"
 assert_contains "$link" "%E6%88%91%E7%9A%84%E8%8A%82%E7%82%B9" "备注被 URL 编码"
 
+# 同上：mktemp 失败时路径为空会写出 ".new" 污染仓库 → 必须守卫。
 ccfg=$(mktemp)
+if [[ -z "$ccfg" ]]; then
+  assert_eq "mktemp 能创建临时文件" "失败（mktemp 返回空路径）" "客户端渲染用例前提：mktemp 必须可用"
+else
 render_client_config "$ccfg" "UUID123" "1.2.3.4" "443" "www.microsoft.com" "PUBKEY" "a1b2c3d4" >/dev/null
-if have_cmd python3; then
+# 判活用【功能可用】而不是 have_cmd（见 Task 5 处的同一条说明）。
+if python3 -c 'import json' >/dev/null 2>&1; then
   assert_status 0 "$(python3 -c "import json,sys;json.load(open(sys.argv[1]));print(0)" "$ccfg" 2>/dev/null || echo 1)" "客户端配置是合法 JSON"
 fi
 assert_contains "$(cat "$ccfg")" '"port": 1080' "客户端含 socks 入站 1080"
@@ -2028,6 +2080,7 @@ assert_contains "$(cat "$ccfg")" '"publicKey": "PUBKEY"' "客户端含公钥"
 assert_contains "$(cat "$ccfg")" '"serverName": "www.microsoft.com"' "客户端含 serverName"
 assert_contains "$(cat "$ccfg")" '"fingerprint": "chrome"' "客户端含 fingerprint"
 rm -f "$ccfg"
+fi
 ```
 
 **Step 2: 运行测试确认失败**
@@ -2504,6 +2557,11 @@ bash test/unit.sh
 probe_targets() {
   local host tmp sortkey h t l
   tmp=$(mktemp)
+  # mktemp 失败时 tmp 为空 → 后面会写出 ".<host>" 污染当前目录 → 必须守卫。
+  if [[ -z "$tmp" ]]; then
+    tui_err "无法创建临时文件，目标探测中止"
+    return 1
+  fi
   local -a pids=() hosts=()
   for host in "${REALITY_TARGETS[@]}"; do
     (
@@ -2545,7 +2603,10 @@ choose_target() {
     fi
   done <<<"$probe"
 
-  if [[ $OPT_YES -eq 1 ]]; then
+  # 用 ${OPT_YES:-0} 而不是 $OPT_YES：OPT_* 是 install.sh 的全局，
+  # deploy.sh 单独被 source（单元测试 / helper）时它们可能根本没定义，
+  # 在 `set -u` 下会直接报 unbound variable。
+  if [[ ${OPT_YES:-0} -eq 1 ]]; then
     # 自动挑选第一个支持 TLS1.3 且延迟已知的目标
     local pick=''
     while IFS='|' read -r host tls lat; do
@@ -2562,7 +2623,12 @@ choose_target() {
   #   1..n-1 = 选中第 n 项（成功，但也是非零码，不能用 && || 区分）
   #   255 = 用户取消
   local sel=0 rc=0
-  tui_menu "选择 REALITY 伪装目标（SNI）" "${labels[@]}" || rc=$?
+  # 必须把 tui_menu 的输出重定向到 stderr：tui_menu 会把【整张菜单】打到 stdout，
+  # 而调用方是 `SNI=$(choose_target)` —— 不重定向的话，SNI 会变成
+  # 「菜单标题 + 选项列表 + 选中的 host」的多行字符串，随后被原样写进
+  # config.json → JSON 非法 → xray run -test 失败 → 部署以一句看不懂的报错中止。
+  # 选中项一律用【返回码】取，stdout 只留最后 printf 的那个 host。
+  tui_menu "选择 REALITY 伪装目标（SNI）" "${labels[@]}" >&2 || rc=$?
   if (( rc == 255 )); then
     tui_warn "未选择伪装目标，回退到第一项"
     sel=0
@@ -2580,7 +2646,7 @@ do_deploy() {
 
   tui_step "② 生成 REALITY 密钥与 UUID"
   gen_keys || { tui_err "密钥生成失败，部署中止"; return 1; }
-  [[ -n "$OPT_UUID" ]] && UUID="$OPT_UUID"
+  [[ -n "${OPT_UUID:-}" ]] && UUID="${OPT_UUID:-}"
 
   tui_step "③ 生成服务端配置"
   mkdir -p "$(dirname "$XRAY_CONFIG")"
@@ -2619,7 +2685,7 @@ deploy_wizard() {
     local occ
     occ=$(port_occupant "$PORT")
     tui_warn "端口 $PORT 已被占用${occ:+（$occ）}"
-    if [[ $OPT_YES -eq 1 ]]; then
+    if [[ ${OPT_YES:-0} -eq 1 ]]; then
       PORT=$(random_free_port)
       tui_tip "已自动改用空闲端口：$PORT"
     else
@@ -2638,7 +2704,8 @@ deploy_wizard() {
       case $choice in
         0) PORT=$(random_free_port); tui_tip "已改用端口 $PORT" ;;
         1) PORT=$(tui_input "请输入新端口" "$PORT" "1-65535")
-            [[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT > 0 && PORT < 65536 )) || { tui_err "端口非法"; return 1; } ;;
+            # 用 10# 前缀：裸算术会把 "08" 当八进制，直接报「value too great for base」。
+            [[ "$PORT" =~ ^[0-9]+$ ]] && (( 10#PORT > 0 && 10#PORT < 65536 )) || { tui_err "端口非法"; return 1; } ;;
         *) tui_info "已取消部署"; return 1 ;;
       esac
     fi
@@ -2666,7 +2733,7 @@ deploy_wizard() {
     "REALITY 密钥|自动生成" \
     "内核|原生二进制 + systemd"
 
-  if [[ $OPT_YES -eq 0 ]]; then
+  if [[ ${OPT_YES:-0} -eq 0 ]]; then
     tui_confirm "确认开始部署？" "y" || { tui_info "已取消"; return 1; }
   fi
 
@@ -2702,7 +2769,7 @@ deploy_wizard() {
     cat "$OUT_DIR/qrcode.txt"
   fi
 
-  if [[ $OPT_YES -eq 0 ]]; then
+  if [[ ${OPT_YES:-0} -eq 0 ]]; then
     tui_pause
     management_menu
   fi
@@ -3142,7 +3209,11 @@ tmp="$OUT.tmp"
 # 修改请编辑 lib/ 下的源文件与 install.sh 后重新运行 build.sh。
 #
 # 构建版本: ${VERSION}
-# 构建时间: $(date -u '+%Y-%m-%dT%H:%M:%SZ')
+#
+# 注意：此处【不能】嵌入构建时间戳。CI 用
+#   bash build.sh && git diff --exit-code dist/install.sh
+# 来校验「dist 与源码同步」——一旦产物里带时间戳，每次构建都不同，
+# 这条校验【永远失败】。构建时间以 git 提交时间为准。
 #
 # 用法: sudo bash install.sh [-y|--menu|--status|--uninstall|-h]
 set -uo pipefail
@@ -3205,7 +3276,7 @@ jobs:
       - name: 语法检查 (bash -n)
         run: |
           set -e
-          find . -name '*.sh' -not -path './.git/*' -print0 | xargs -0 -n1 bash -n
+          find . -name '*.sh' -not -path './.git/*' -not -path './.worktrees/*' -print0 | xargs -0 -n1 bash -n
 
       - name: ShellCheck
         run: |
@@ -3265,7 +3336,10 @@ git commit -m "feat(build): 单文件构建脚本、dist 产物与 CI 流水线"
 ```bash
 test_case "demo.sh 不触碰系统"
 
-out=$(bash "$ROOT/demo.sh" 2>&1)
+# 必须给 demo.sh 接上 </dev/null：demo.sh 会调用 tui_menu / tui_input /
+# tui_confirm，这三个在【非 TTY 分支里仍然 read stdin】。
+# 不接 /dev/null 时，本地交互式跑测试（stdin 是终端）会直接挂死。
+out=$(bash "$ROOT/demo.sh" </dev/null 2>&1)
 assert_status 0 "$?" "demo.sh 正常退出"
 assert_contains "$out" "分享链接" "demo 展示分享链接样例"
 assert_eq 0 "$(grep -c 'systemctl ' <<<"$out")" "demo 不调用 systemctl"
