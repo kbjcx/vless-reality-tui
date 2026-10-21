@@ -5248,25 +5248,584 @@ git commit -m "feat(cli): 入口骨架、参数解析与环境预检"
   - `choose_target` → stdout 选中的 host
   - `do_deploy` → `0`/`1`
 
+#### 修订轮 1 的逐项发现与处置
+
+> 本节由**控制器**在 Task 9 派发前预扫（沙箱实证）之后写入。
+> 本节列的全是**计划缺陷**，责任方是控制器；Task 9 的代码块本身还没被实施过。
+>
+> 沙箱底座 = `git archive HEAD` 整棵树（**Task 8 的实施结果** `d8b35d8`）
+> + Task 9 的两个代码块。
+>
+> ⚠️ **底座必须是 Task 9 实施时的 HEAD**，不能沿用别的任务里的基线
+> —— 否则会重犯 Task 7 的 T7-18（底座用错 → 预期条数算错）。
+
+| # | 级别 | 发现 | 处置 |
+|---|---|---|---|
+| T9-1 | **Important** | **四个函数【完全零覆盖】。** 控制器逐个掏空实测：把 `probe_targets` / `choose_target` / `do_deploy` / `deploy_wizard` 整个换成 `return 0` → **0 条红**。而这四个函数就是「部署向导」的全部 —— **用户点一次部署能不能成功，全靠它们** | Step 1 重写：97 → **100 条**断言，覆盖四个函数的全部分支 |
+| T9-2 | **Important** | **断言条数随环境漂移。** 原 Step 1 只有 14 行，且整段包在 `if have_cmd openssl` + `if [[ -n "$probe" ]]` 两个条件块里 → 本机（没有 openssl / 没有外网）**一条断言都没跑**（Task 9 段条数 = 0），有 openssl + 外网的机器上跑 8 条 → **条数在机器之间不一致** → 违反「条数恒定」铁律 | Step 1 **一个条件块都不写**：全部依赖用 shell 函数 mock，断言条数与机器 / 网络 / 权限状态**完全无关** |
+| T9-3 | **Important** | **原 Step 1 真联网探测。** `probe_targets` 会真的对 7 个候选目标跑 `openssl s_client` + `curl` → CI 上要么超时要么不稳定（还依赖外网） | Step 1 全部 mock（`target_supports_tls13` / `target_latency_ms`），**一次网络请求都不发** |
+| T9-4 | **Important** | **`(( 10#PORT > 0 && 10#PORT < 65536 ))` 漏了 `$` → 用户手动指定的端口【必然】被判非法。** bash 不会在 `10#` 之后解析**变量名**：`10#PORT` 被当成「以 10 为基的数字 PORT」→ 直接报 `value too great for base`。控制器实测：`PORT=9443; (( 10#PORT > 0 ))` → `value too great for base (error token is "10#PORT")`。**全库唯一一处同款错误** —— 其余 8 处 `10#` 都带 `$`（`install.sh` / `lib/core.sh` / `lib/tui.sh` / `test/unit.sh` 各处） | Step 3 改成 `10#$PORT`；Step 1 补「用户手动指定端口」用例把这条钉住 |
+| T9-5 | **Important** | **`choose_target` 的两条 `tui_warn` 写到 stdout → `SNI=$(choose_target)` 会把提示文本当成主机名吞进去。** `tui_warn` 默认写 stdout（`lib/tui.sh:254`），而调用方是 `SNI=$(choose_target)` → SNI 变成「提示文本 + 主机名」的多行串 → 写进 `config.json` 就是**废配置**。原计划只给 `tui_menu` 加了 `>&2`，漏了 `tui_warn` | Step 3 给两条 `tui_warn` 加 `>&2`；Step 1 用「stdout 纯净度」断言钉住（`assert_eq "www.microsoft.com" "$sel"`） |
+| T9-6 | **Important** | **`probe_targets` 的 `tui_err` 写到 stdout → 报错被当成探测数据吞掉。** 调用方是 `probe=$(probe_targets)` → mktemp 失败时，`probe` 里装的是那段报错文本 → `choose_target` 拿它去按 `host\|tls\|latency` 解析 → **解析出垃圾主机名**，而且 `-z "$probe"` 的回退判断也失效了 | Step 3 给 `tui_err` 加 `>&2`；Step 1 断言「stdout 必须为空」 |
+| T9-7 | Minor | **`port_in_use` 分不清「探测失败」与「端口空闲」。** 既没有 `ss` 也没有 `netstat` 时它恒返回 1（= 空闲）→ 用户以为端口干净 → 部署走到 systemd 阶段才炸，首句报错是「systemd 配置失败」，与真正原因无关。**Task 5 段早就把它登记成「Task 9 修订项」，一直没做** | Step 3 在向导开头加一条提示：「无法确认端口是否空闲（系统缺少 ss 与 netstat）」 |
+| T9-8 | Minor | **`random_free_port` 的硬编码兜底 44321 从未校验。** 40 次随机全占用的概率极低，但兜底端口未验证 → 可能又是占用。**同样是 Task 5 段登记的「Task 9 修订项」** | Step 3 在向导改用随机端口后**再验一次** `port_in_use`；仍被占用 → 明确报错中止。根因在 `lib/core.sh`，本轮**不改 core.sh**（避免动 Task 3 的终版），在调用点兜住 |
+| T9-9 | Minor | `local choice` 被声明了两次（`local choice` + `local choice=0 crc=0`） | Step 3 合并成一条 |
+| T9-10 | Minor | `probe_targets` 里 `for host in "${pids[@]}"` —— 循环变量装的是 **PID**，名字却叫 `host` | Step 3 改名 `pid` |
+| T9-11 | Minor | Task 9 **没有独立的验收标准段**（Task 3–8 都有） | 补一个 |
+| T9-12 | 测试侧 | **控制器自己第一版新 Step 1 有三处缺陷**（都在测试侧，不是实现侧）：① 共享 mock 集合里含 `do_deploy` → 把**被测对象本身**替换掉了 → 22 条 `do_deploy` 断言全部变红（基线 rc=1、红 26 条）；② 两个二维码用例共用同一个 `OUT_DIR` → 前一个用例造的 `qrcode.txt` 让后一个「不打印」的断言变红；③ 控制器自己的诊断脚本里写了 `10#PORT`（**与实现侧同一个 bug**）→ 先栽在这上面，才顺藤摸瓜找到 T9-4 | ① `do_deploy` 的 mock 单独放一份 `t9_mocks_wizard`，只给 `deploy_wizard` 的用例用；② 二维码的「没有文件」用例换用另一个 `OUT_DIR`；③ 诊断脚本改成 `10#$PORT` |
+
+> **控制器的自我记账**：
+> ① 本轮预扫用的探针脚本第一版**装错了沙箱**（把 `install.sh` 加进了 `test/unit.sh`
+>    的 source 区域）—— 与 Task 8 同款错误。修法：分两次跑，先手工跑通再批量变异。
+> ② **「探针给出的异常结论必须先用手工的最简复现核对」这条纪律，本轮又用上一次**：
+>    诊断脚本里 `(( 10#PORT ))` 报错，第一反应是「测试写错了」，手工复现后才发现
+>    **实现侧也是错的**（计划第 5448 行）—— 如果不复现，这个 bug 会被当成「测试的错」
+>    顺手改掉，然后**原样的 bug 留在计划里**。
+> ③ 变异矩阵第一版有 **1 条**变异串与新 Step 3 的实际文本不符（B3：缩进写成 8 空格，
+>    实际是 6 空格）→ 片段命中 0 次 → 变异根本没生效 → 那条「已验证」是假的。
+>    矩阵脚本对**命中次数 ≠ 1** 直接报错、不静默跳过 → 修串后单独复跑，
+>    确认它真的命中点名的断言（1 条红，正是「choose_target 在 --yes 下自动挑选
+>    第一个 ok 且延迟已知的目标」）。**最终 28 条变异全部命中。**
+
+#### 修订轮 1 的验收标准
+
+1. `lib/deploy.sh` 追加的内容与下面 **Step 3 代码块逐字节一致**（追加在文件末尾）。
+2. `test/unit.sh` 里 Task 9 的插入段与下面 **Step 1 代码块逐字节一致**
+   （追加在 `test_summary` **之前**）。
+3. `bash test/unit.sh` 全部通过、退出码 0。
+4. 断言总数必须恒定，且**连跑 4 次条数相同**。
+   ⚠️ **平台差是【三个数】**（构成见 Global Constraints）：
+   本机（Windows + MSYS）**545**、Debian **以 root 运行** **550**、
+   Debian **以非 root 运行** **552**（= GitHub Actions runner 的身份）。
+   报告里必须写明「哪个平台 **+ 以什么身份运行**」。
+   （底座 445 + Task 9 修订轮 1 的 100）
+5. 红灯证据（**28 条变异**，每条都要贴出**变红的断言原文**）：
+   - 把 `probe_targets` 的 mktemp 空值守卫去掉
+     → 「probe_targets 在 mktemp 失败时返回非零」必须变红；
+   - 把 `probe_targets` 的 `tui_err` 的 `>&2` 去掉
+     → 「probe_targets 的诊断信息不写 stdout」必须变红；
+   - 把 `probe_targets` 的「未知延迟排最后」处理去掉
+     → 「probe_targets 把未知延迟的目标排在最后」必须变红；
+   - 把 `probe_targets` 的 TLS1.3 判定去掉
+     → 「probe_targets 输出格式为 host|tls|latency」必须变红；
+   - 把 `choose_target` 回退分支的 `tui_warn` 的 `>&2` 去掉
+     → 「choose_target 在探测不可用时回退到默认目标」必须变红；
+   - 把 `choose_target` 取消分支的 `tui_warn` 的 `>&2` 去掉
+     → 「choose_target 在用户取消时回退到第一项」必须变红；
+   - 把 `choose_target` 自动挑选里的 `&& "$lat" != '?'` 去掉
+     → 「choose_target 在 --yes 下自动挑选第一个 ok 且延迟已知的目标」必须变红；
+   - 把 `choose_target` 的 `tui_menu` 的 `>&2` 去掉
+     → 「choose_target 把菜单渲染到 stderr」必须变红；
+   - 把 `do_deploy` 的 `install_xray` 失败处理去掉
+     → 「do_deploy 在安装内核失败时返回非零」必须变红；
+   - 把 `do_deploy` 的 `gen_keys` 失败处理去掉
+     → 「do_deploy 在生成密钥失败时返回非零」必须变红；
+   - 把 `do_deploy` 的 `render_server_config` 失败处理去掉
+     → 「do_deploy 在渲染配置失败时返回非零」必须变红；
+   - 把 `do_deploy` 的 `write_config_atomic` 失败处理去掉
+     → 「do_deploy 在写配置失败时返回非零」必须变红；
+   - 把 `do_deploy` 的 `setup_systemd` 失败处理去掉
+     → 「do_deploy 在 systemd 配置失败时返回非零」必须变红；
+   - 把 `do_deploy` 的 `FIREWALL_OK=0` 改成 `=1`
+     → 「do_deploy 在防火墙放行失败时把状态标记为 0」必须变红；
+   - 把 `do_deploy` 的 mktemp 空值守卫去掉
+     → 「do_deploy 在 mktemp 失败时返回非零」必须变红；
+   - 把 `deploy_wizard` 里 `--yes` 分支的「改用端口后再验一次」去掉
+     → 「deploy_wizard 在改用的端口仍被占用时返回非零」必须变红；
+   - 把 `deploy_wizard` 里菜单分支的「改用端口后再验一次」去掉
+     → 「deploy_wizard 在菜单改端口后遇到占用端口时中止」必须变红；
+   - 把 `deploy_wizard` 的「端口探测不可用」提示去掉
+     → 「deploy_wizard 在端口探测不可用时给出提示」必须变红；
+   - 把 `deploy_wizard` 的「回退到本机地址」去掉
+     → 「deploy_wizard 回退使用本机地址」必须变红；
+   - 把 `deploy_wizard` 的「探测不到地址就中止」去掉
+     → 「deploy_wizard 在探测不到任何地址时返回非零」必须变红；
+   - 把 `deploy_wizard` 的「伪装目标为空就中止」去掉
+     → 「deploy_wizard 在伪装目标为空时返回非零」必须变红；
+   - 把 `deploy_wizard` 的「用户取消就中止」去掉
+     → 「deploy_wizard 在用户不确认时返回非零」必须变红；
+   - 把 `deploy_wizard` 的「状态保存失败就中止」去掉
+     → 「deploy_wizard 在状态保存失败时返回非零」必须变红；
+   - 把 `deploy_wizard` 的「物料导出失败就中止」去掉
+     → 「deploy_wizard 在客户端物料导出失败时返回非零」必须变红；
+   - 把 `deploy_wizard` 的「分享链接为空就中止」去掉
+     → 「deploy_wizard 在分享链接为空时返回非零」必须变红；
+   - 把 `deploy_wizard` 的「面板里反映防火墙放行失败」去掉
+     → 「deploy_wizard 在部署完成面板里如实反映防火墙放行失败」必须变红；
+   - 把 `deploy_wizard` 的 `10#$PORT` 改回 `10#PORT`（**还原 T9-4 那个 bug**）
+     → 「deploy_wizard 在用户手动指定端口时继续部署」必须变红；
+   - 把 `deploy_wizard` 的「有 qrcode.txt 才打印」去掉
+     → 「deploy_wizard 在没有 qrcode.txt 时不打印二维码小节标题」必须变红。
+   ⚠️ **点名的断言必须与预演结果里【实际变红的那一条】逐字对上**，不能只看「红了几条」。
+   ⚠️ **变异串必须与 `lib/deploy.sh` 的实际文本逐字一致** —— 片段命中次数 ≠ 1 时，
+   变异就是**没生效**（控制器第一版有 2 条这样的假验证）。
+   ⚠️ **mock 必须精确**：共享 mock 集合里**不许**出现与被测对象同名的函数。
+6. `lib/tui.sh`、`lib/core.sh`、`lib/client.sh`、`test/lib.sh`、`install.sh`、Task 5 段、Task 6 段、Task 7 段、Task 8 段 **一字未动**（本任务只改 `lib/deploy.sh` 与 `test/unit.sh`）。
+7. 计划文件实施者一个字都不许改。
+
 **Step 1: 写失败的测试**
 
 追加到 `test/unit.sh`：
 
 ```bash
-test_case "目标探测与排序"
+# ── Task 9：部署向导（全部 mock：不联网、不装内核、不开防火墙、不碰系统目录）──
+# ⚠️ 本段【不写任何会整块跳过的条件块】：原 Step 1 就是栽在这里 ——
+#    「有 openssl + 有外网」才跑断言 → 本机一条都没跑 → 条数在机器之间漂移。
+#    所有外部依赖一律用 shell 函数 mock；mock 一律打印可辨认的标记，
+#    断言据此判断「哪一步真的执行了」以及「执行时拿到了什么值」。
+#
+# ⚠️ assert_not_contains 是 Task 8 段已经定义好的辅助断言，直接用。
 
-# 探测结果必须形如 host|ok|latency，且只包含 REALITY_TARGETS 中的条目
-if have_cmd openssl; then
-  probe=$(probe_targets 2>/dev/null || true)
-  if [[ -n "$probe" ]]; then
-    assert_contains "$probe" "|" "探测结果含分隔符"
-    while IFS='|' read -r h tls lat; do
-      found=0
-      for t in "${REALITY_TARGETS[@]}"; do [[ "$t" == "$h" ]] && found=1; done
-      assert_eq 1 "$found" "探测目标 $h 在候选列表内"
-    done <<<"$probe"
-  fi
+# 统一的向导 mock 集合：把 do_deploy / deploy_wizard 依赖的【所有】外部动作
+# 换成会打印标记的假实现。定义一次，各用例用 `eval "$(t9_mocks)"` 引入；
+# 需要改行为的用例，在 eval 之后【重新定义】同名函数覆盖它。
+t9_mocks() {
+  cat <<'MOCKS'
+install_xray() { printf 'MOCK_INSTALL_XRAY\n'; return 0; }
+gen_keys() { UUID='11111111-2222-3333-4444-555555555555'; PRIVATE_KEY='PRIVKEY0123456789abcdefghijklmnopqrstuvwxyzABCDE'; PUBLIC_KEY='PUBKEY0123456789abcdefghijklmnopqrstuvwxyzABCDE'; SHORT_ID='a1b2c3d4'; printf 'MOCK_GEN_KEYS\n'; return 0; }
+render_server_config() { printf 'MOCK_RENDER\n'; return 0; }
+write_config_atomic() { printf 'MOCK_ATOMIC\n'; return 0; }
+setup_systemd() { printf 'MOCK_SYSTEMD\n'; return 0; }
+open_firewall() { printf 'MOCK_FIREWALL\n'; return 0; }
+enable_bbr() { printf 'MOCK_BBR\n'; return 0; }
+save_state() { printf 'MOCK_SAVE_STATE UUID=%s PORT=%s\n' "$UUID" "$PORT"; return 0; }
+export_client_artifacts() { printf 'MOCK_EXPORT DIR=%s PORT=%s\n' "$1" "$4"; return 0; }
+build_share_link() { printf 'vless://11111111-2222-3333-4444-555555555555@203.0.113.9:443?security=reality#node'; return 0; }
+choose_target() { printf 'www.microsoft.com'; return 0; }
+port_in_use() { return 1; }
+port_occupant() { printf ''; return 0; }
+random_free_port() { printf '8443'; return 0; }
+detect_public_ip() { printf '203.0.113.9'; return 0; }
+detect_local_ip() { printf '10.0.0.5'; return 0; }
+have_cmd() { return 0; }
+tui_confirm() { return 0; }
+tui_input() { printf '8443'; return 0; }
+tui_menu() { return 0; }
+tui_pause() { return 0; }
+management_menu() { printf 'MOCK_MENU\n'; return 0; }
+MOCKS
+}
+
+# ⚠️ do_deploy 的 mock 必须【单独】一份：
+#    它和 do_deploy 本身同名 → 放进共享集合会把【被测对象】替换掉，
+#    于是「测 do_deploy」的用例其实在测这个假实现（控制器第一版就栽在这里：
+#    22 条 do_deploy 断言全部变红）。
+t9_mocks_wizard() {
+  cat <<'MOCKS'
+do_deploy() { UUID='11111111-2222-3333-4444-555555555555'; PUBLIC_KEY='PUBKEY0123456789abcdefghijklmnopqrstuvwxyzABCDE'; SHORT_ID='a1b2c3d4'; printf 'MOCK_DO_DEPLOY PORT=%s SNI=%s IP=%s\n' "$PORT" "$SNI" "$SERVER_IP"; FIREWALL_OK=1; return 0; }
+MOCKS
+}
+
+T9_TMP=$(mktemp -d 2>/dev/null)
+if [[ -n "$T9_TMP" ]]; then
+
+test_case "向导：目标探测与排序"
+
+# probe_targets：输出 "host|tls|latency"，按延迟升序，未知延迟 '?' 排最后。
+out=$( ( REALITY_TARGETS=(slow.test ok.test unknown.test)
+         target_supports_tls13() { [[ "$1" == "ok.test" ]]; }
+         target_latency_ms() { case "$1" in slow.test) printf '30' ;; ok.test) printf '10' ;; unknown.test) printf '?' ;; esac; }
+         probe_targets ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "probe_targets 正常路径返回 0"
+assert_contains "$out" "ok.test|ok|10" "probe_targets 输出格式为 host|tls|latency"
+assert_contains "$out" "slow.test|fail|30" "probe_targets 把不支持 TLS1.3 的目标标为 fail"
+assert_contains "$out" "unknown.test|fail|?" "probe_targets 把未知延迟标为 ?"
+assert_eq "ok.test|ok|10" "$(printf '%s\n' "$out" | head -1)" "probe_targets 把延迟最小的目标排在第一"
+assert_eq "unknown.test|fail|?" "$(printf '%s\n' "$out" | tail -1)" "probe_targets 把未知延迟的目标排在最后"
+assert_eq "3" "$(printf '%s\n' "$out" | grep -c '|')" "probe_targets 的输出行数等于候选数"
+
+# probe_targets：mktemp 失败必须报错退出，且【诊断信息不能走 stdout】——
+# 调用方是 `probe=$(probe_targets)`：报错被当成探测数据吞进 probe，
+# choose_target 就会拿一段错误文本当主机名去解析。
+out=$( ( mktemp() { return 1; }
+         target_supports_tls13() { return 0; }
+         target_latency_ms() { printf '10'; }
+         probe_targets ) 2>/dev/null ); rc=$?
+assert_status 1 "$rc" "probe_targets 在 mktemp 失败时返回非零"
+assert_eq "" "$out" "probe_targets 的诊断信息不写 stdout（否则会被当成探测数据吞掉）"
+err=$( ( mktemp() { return 1; }
+         target_supports_tls13() { return 0; }
+         target_latency_ms() { printf '10'; }
+         probe_targets ) 2>&1 >/dev/null )
+assert_contains "$err" "无法创建临时文件" "probe_targets 在 mktemp 失败时给出明确提示"
+
+test_case "向导：伪装目标选择"
+
+# choose_target：探测不可用（返回空）时回退默认目标，
+# 且【提示语不能进 stdout】——调用方是 `SNI=$(choose_target)`。
+sel=$( ( probe_targets() { return 0; }
+         choose_target ) 2>/dev/null )
+assert_eq "www.microsoft.com" "$sel" "choose_target 在探测不可用时回退到默认目标"
+err=$( ( probe_targets() { return 0; }
+         choose_target ) 2>&1 >/dev/null )
+assert_contains "$err" "目标探测不可用" "choose_target 在探测不可用时把提示写到 stderr"
+
+# choose_target：探测【失败】（rc≠0、stdout 为空）时同样走回退路径
+sel=$( ( probe_targets() { return 1; }
+         choose_target ) 2>/dev/null )
+assert_eq "www.microsoft.com" "$sel" "choose_target 在探测失败时回退到默认目标"
+
+# choose_target：--yes 自动挑选「第一个支持 TLS1.3 且延迟已知」的目标
+# ⚠️ 第一个候选必须是「ok 但延迟未知（?）」：否则去掉 `&& "$lat" != '?'`
+#    那个条件，选中的目标【不变】→ 这条断言就恒真了。
+sel=$( ( OPT_YES=1
+         probe_targets() { printf 'a.test|ok|?\nb.test|ok|20\nc.test|ok|30\n'; }
+         choose_target ) 2>/dev/null )
+assert_eq "b.test" "$sel" "choose_target 在 --yes 下自动挑选第一个 ok 且延迟已知的目标"
+
+# choose_target：--yes 且没有 ok 目标时回退到第一个候选
+sel=$( ( OPT_YES=1
+         probe_targets() { printf 'a.test|fail|10\nb.test|fail|20\n'; }
+         choose_target ) 2>/dev/null )
+assert_eq "a.test" "$sel" "choose_target 在 --yes 且无 ok 目标时回退到第一个候选"
+
+# choose_target：交互模式下用菜单返回码取选中项；
+# 菜单文本必须走 stderr —— 它会把整张菜单打到 stdout，
+# 而调用方是 `SNI=$(choose_target)` → SNI 会变成「菜单 + 主机名」的多行串。
+sel=$( ( probe_targets() { printf 'a.test|ok|10\nb.test|ok|20\n'; }
+         tui_menu() { printf '菜单标题\n选项一\n选项二\n'; return 1; }
+         choose_target ) 2>/dev/null )
+assert_eq "b.test" "$sel" "choose_target 用菜单返回码取选中项"
+err=$( ( probe_targets() { printf 'a.test|ok|10\nb.test|ok|20\n'; }
+         tui_menu() { printf '菜单标题\n选项一\n选项二\n'; return 1; }
+         choose_target ) 2>&1 >/dev/null )
+assert_contains "$err" "菜单标题" "choose_target 把菜单渲染到 stderr"
+
+# choose_target：用户取消（返回码 255）时回退到第一项
+sel=$( ( probe_targets() { printf 'a.test|ok|10\nb.test|ok|20\n'; }
+         tui_menu() { printf '菜单标题\n'; return 255; }
+         choose_target ) 2>/dev/null )
+assert_eq "a.test" "$sel" "choose_target 在用户取消时回退到第一项"
+
+test_case "向导：六步部署"
+
+# do_deploy 的六步全部 mock 成功 → 走完全程
+out=$( ( XRAY_CONFIG="$T9_TMP/cfg.json"
+         eval "$(t9_mocks)"
+         do_deploy ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "do_deploy 全部步骤成功时返回 0"
+assert_contains "$out" "MOCK_INSTALL_XRAY" "do_deploy 执行了安装内核这一步"
+assert_contains "$out" "MOCK_GEN_KEYS" "do_deploy 执行了生成密钥这一步"
+assert_contains "$out" "MOCK_RENDER" "do_deploy 执行了渲染配置这一步"
+assert_contains "$out" "MOCK_ATOMIC" "do_deploy 执行了原子写配置这一步"
+assert_contains "$out" "MOCK_SYSTEMD" "do_deploy 执行了配置 systemd 这一步"
+assert_contains "$out" "MOCK_FIREWALL" "do_deploy 执行了放行防火墙这一步"
+assert_contains "$out" "MOCK_BBR" "do_deploy 执行了网络调优这一步"
+assert_contains "$out" "服务端配置已写入" "do_deploy 成功后提示配置已写入"
+assert_contains "$out" "部署完成" "do_deploy 成功后提示部署完成"
+
+# do_deploy：安装内核失败必须中止，且后续步骤一步都不许执行
+out=$( ( XRAY_CONFIG="$T9_TMP/cfg.json"
+         eval "$(t9_mocks)"
+         install_xray() { printf 'MOCK_INSTALL_XRAY\n'; return 1; }
+         do_deploy ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "do_deploy 在安装内核失败时返回非零"
+assert_contains "$out" "Xray 安装失败" "do_deploy 在安装内核失败时给出明确提示"
+assert_not_contains "$out" "MOCK_GEN_KEYS" "do_deploy 在安装内核失败后不继续生成密钥"
+
+# do_deploy：生成密钥失败必须中止
+out=$( ( XRAY_CONFIG="$T9_TMP/cfg.json"
+         eval "$(t9_mocks)"
+         gen_keys() { printf 'MOCK_GEN_KEYS\n'; return 1; }
+         do_deploy ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "do_deploy 在生成密钥失败时返回非零"
+assert_contains "$out" "密钥生成失败" "do_deploy 在生成密钥失败时给出明确提示"
+assert_not_contains "$out" "MOCK_RENDER" "do_deploy 在生成密钥失败后不继续渲染配置"
+
+# do_deploy：渲染配置失败必须中止，且不得再写配置
+out=$( ( XRAY_CONFIG="$T9_TMP/cfg.json"
+         eval "$(t9_mocks)"
+         render_server_config() { printf 'MOCK_RENDER\n'; return 1; }
+         do_deploy ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "do_deploy 在渲染配置失败时返回非零"
+assert_not_contains "$out" "MOCK_ATOMIC" "do_deploy 在渲染配置失败后不写配置"
+
+# do_deploy：写配置失败必须中止，且不得打印「已写入」
+out=$( ( XRAY_CONFIG="$T9_TMP/cfg.json"
+         eval "$(t9_mocks)"
+         write_config_atomic() { printf 'MOCK_ATOMIC\n'; return 1; }
+         do_deploy ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "do_deploy 在写配置失败时返回非零"
+assert_not_contains "$out" "服务端配置已写入" "do_deploy 在写配置失败时不提示配置已写入"
+
+# do_deploy：systemd 配置失败必须中止
+out=$( ( XRAY_CONFIG="$T9_TMP/cfg.json"
+         eval "$(t9_mocks)"
+         setup_systemd() { printf 'MOCK_SYSTEMD\n'; return 1; }
+         do_deploy ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "do_deploy 在 systemd 配置失败时返回非零"
+assert_contains "$out" "systemd 配置失败" "do_deploy 在 systemd 配置失败时给出明确提示"
+
+# do_deploy：防火墙放行失败【不中止】部署，但必须如实标记
+out=$( ( XRAY_CONFIG="$T9_TMP/cfg.json"
+         eval "$(t9_mocks)"
+         open_firewall() { printf 'MOCK_FIREWALL\n'; return 1; }
+         do_deploy
+         printf 'FIREWALL_OK=%s\n' "${FIREWALL_OK:-unset}" ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "do_deploy 在防火墙放行失败时不中止部署"
+assert_contains "$out" "防火墙放行未成功" "do_deploy 在防火墙放行失败时给出警告"
+assert_contains "$out" "FIREWALL_OK=0" "do_deploy 在防火墙放行失败时把状态标记为 0"
+
+# do_deploy：网络调优失败是非致命的
+out=$( ( XRAY_CONFIG="$T9_TMP/cfg.json"
+         eval "$(t9_mocks)"
+         enable_bbr() { printf 'MOCK_BBR\n'; return 1; }
+         do_deploy ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "do_deploy 在网络调优失败时不中止部署"
+assert_contains "$out" "部署完成" "do_deploy 在网络调优失败后仍然提示部署完成"
+
+# do_deploy：mktemp 失败必须中止（否则会把配置写到 ".new" 污染当前目录）
+out=$( ( XRAY_CONFIG="$T9_TMP/cfg.json"
+         eval "$(t9_mocks)"
+         mktemp() { return 1; }
+         do_deploy ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "do_deploy 在 mktemp 失败时返回非零"
+assert_contains "$out" "无法创建临时文件" "do_deploy 在 mktemp 失败时给出明确提示"
+
+test_case "向导：部署参数确认与收尾"
+
+# deploy_wizard 的正常路径：端口 / 地址 / 伪装目标都要正确传给后续步骤
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=1
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "deploy_wizard 正常路径返回 0"
+assert_contains "$out" "PORT=443" "deploy_wizard 把默认端口 443 传给 do_deploy"
+assert_contains "$out" "SNI=www.microsoft.com" "deploy_wizard 把伪装目标传给 do_deploy"
+assert_contains "$out" "IP=203.0.113.9" "deploy_wizard 把探测到的公网地址传给 do_deploy"
+assert_contains "$out" "MOCK_SAVE_STATE UUID=11111111-2222-3333-4444-555555555555" "deploy_wizard 保存的状态里带着生成的 UUID"
+assert_contains "$out" "MOCK_EXPORT" "deploy_wizard 导出客户端物料"
+assert_contains "$out" "部署完成" "deploy_wizard 成功后打印部署完成面板"
+assert_contains "$out" "vless://11111111-2222-3333-4444-555555555555@203.0.113.9:443" "deploy_wizard 打印分享链接"
+assert_not_contains "$out" "MOCK_MENU" "deploy_wizard 在 --yes 下不进入管理菜单"
+
+# deploy_wizard：--addr 指定的地址优先于探测
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=1
+         OPT_ADDR='198.51.100.7'
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "deploy_wizard 在指定 --addr 时返回 0"
+assert_contains "$out" "IP=198.51.100.7" "deploy_wizard 优先使用 --addr 指定的地址"
+
+# deploy_wizard：探测不到公网 IP 时回退到本机地址并提示
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=1
+         detect_public_ip() { return 1; }
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "deploy_wizard 在探测不到公网 IP 时回退到本机地址"
+assert_contains "$out" "IP=10.0.0.5" "deploy_wizard 回退使用本机地址"
+assert_contains "$out" "未能自动探测到公网地址" "deploy_wizard 回退时给出提示"
+
+# deploy_wizard：公网 IP 与本机地址都探测不到必须中止
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=1
+         detect_public_ip() { return 1; }
+         detect_local_ip() { return 1; }
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "deploy_wizard 在探测不到任何地址时返回非零"
+assert_contains "$out" "无法探测到本机地址" "deploy_wizard 在探测不到任何地址时给出明确提示"
+
+# deploy_wizard：伪装目标为空必须中止
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=1
+         choose_target() { return 0; }
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "deploy_wizard 在伪装目标为空时返回非零"
+assert_contains "$out" "未确定伪装目标" "deploy_wizard 在伪装目标为空时给出明确提示"
+
+# deploy_wizard：用户不确认必须中止
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=0
+         tui_confirm() { return 1; }
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "deploy_wizard 在用户不确认时返回非零"
+assert_contains "$out" "已取消" "deploy_wizard 在用户不确认时给出取消提示"
+assert_not_contains "$out" "MOCK_DO_DEPLOY" "deploy_wizard 在用户不确认时不执行部署"
+
+# deploy_wizard：部署失败必须中止，且不得保存状态
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=1
+         do_deploy() { printf 'MOCK_DO_DEPLOY\n'; return 1; }
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "deploy_wizard 在部署失败时返回非零"
+assert_not_contains "$out" "MOCK_SAVE_STATE" "deploy_wizard 在部署失败时不保存状态"
+
+# deploy_wizard：状态没落盘必须停在这里（否则 --status 会显示未部署）
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=1
+         save_state() { printf 'MOCK_SAVE_STATE\n'; return 1; }
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "deploy_wizard 在状态保存失败时返回非零"
+assert_contains "$out" "状态保存失败" "deploy_wizard 在状态保存失败时给出明确提示"
+assert_not_contains "$out" "MOCK_EXPORT" "deploy_wizard 在状态保存失败后不导出客户端物料"
+
+# deploy_wizard：物料导出失败必须中止
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=1
+         export_client_artifacts() { printf 'MOCK_EXPORT\n'; return 1; }
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "deploy_wizard 在客户端物料导出失败时返回非零"
+assert_contains "$out" "客户端物料导出失败" "deploy_wizard 在物料导出失败时给出明确提示"
+
+# deploy_wizard：分享链接为空必须中止（空链接粘到客户端就是一条废链接）
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=1
+         build_share_link() { return 0; }
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "deploy_wizard 在分享链接为空时返回非零"
+assert_contains "$out" "分享链接生成为空" "deploy_wizard 在分享链接为空时给出明确提示"
+
+# deploy_wizard：防火墙放行失败必须在最终面板里如实反映
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=1
+         do_deploy() { printf 'MOCK_DO_DEPLOY\n'; FIREWALL_OK=0; return 0; }
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "deploy_wizard 在防火墙放行失败时仍完成部署"
+assert_contains "$out" "放行失败" "deploy_wizard 在部署完成面板里如实反映防火墙放行失败"
+
+# deploy_wizard：有终端二维码文件才打印
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=1
+         mkdir -p "$T9_TMP/out"
+         printf 'QR-PLACEHOLDER\n' > "$T9_TMP/out/qrcode.txt"
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1 ); rc=$?
+assert_contains "$out" "QR-PLACEHOLDER" "deploy_wizard 在存在 qrcode.txt 时打印终端二维码"
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=1
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out-noqr"
+         deploy_wizard ) 2>&1 ); rc=$?
+assert_not_contains "$out" "QR-PLACEHOLDER" "deploy_wizard 在没有 qrcode.txt 时不打印二维码"
+assert_not_contains "$out" "终端二维码" "deploy_wizard 在没有 qrcode.txt 时不打印二维码小节标题"
+
+# deploy_wizard：交互模式（--yes=0）确认后进入管理菜单
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=0
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "deploy_wizard 在交互模式完成部署后返回 0"
+assert_contains "$out" "MOCK_MENU" "deploy_wizard 在交互模式下进入管理菜单"
+
+test_case "向导：端口冲突处理"
+
+# 端口被占用 + --yes → 自动改用随机空闲端口
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=1
+         port_in_use() { [[ "$1" == "443" ]] && return 0 || return 1; }
+         port_occupant() { printf 'nginx'; return 0; }
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "deploy_wizard 在端口冲突且 --yes 时自动改端口并继续"
+assert_contains "$out" "已被占用" "deploy_wizard 在端口被占用时给出提示"
+assert_contains "$out" "PORT=8443" "deploy_wizard 在端口冲突时改用随机空闲端口"
+
+# 端口被占用 + 交互 + 选「改用随机空闲端口」
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=0
+         port_in_use() { [[ "$1" == "443" ]] && return 0 || return 1; }
+         tui_menu() { return 0; }
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "deploy_wizard 在菜单选「改用随机端口」时继续部署"
+assert_contains "$out" "PORT=8443" "deploy_wizard 按菜单选择改用随机端口"
+
+# 端口被占用 + 交互 + 选「我手动指定其它端口」
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=0
+         port_in_use() { [[ "$1" == "443" ]] && return 0 || return 1; }
+         tui_menu() { return 1; }
+         tui_input() { printf '9443'; return 0; }
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1); rc=$?
+assert_status 0 "$rc" "deploy_wizard 在用户手动指定端口时继续部署"
+assert_contains "$out" "PORT=9443" "deploy_wizard 使用用户手动输入的端口"
+
+# 端口被占用 + 交互 + 输入非法端口必须中止
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=0
+         port_in_use() { [[ "$1" == "443" ]] && return 0 || return 1; }
+         tui_menu() { return 1; }
+         tui_input() { printf 'abc'; return 0; }
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1); rc=$?
+assert_status 1 "$rc" "deploy_wizard 在用户输入非法端口时返回非零"
+assert_contains "$out" "端口非法" "deploy_wizard 在用户输入非法端口时给出明确提示"
+
+# 端口被占用 + 用户取消必须中止
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=0
+         port_in_use() { [[ "$1" == "443" ]] && return 0 || return 1; }
+         tui_menu() { return 255; }
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1); rc=$?
+assert_status 1 "$rc" "deploy_wizard 在用户取消端口冲突处理时返回非零"
+assert_contains "$out" "已取消部署" "deploy_wizard 在用户取消时给出取消提示"
+
+# 随机端口仍然被占用必须中止（random_free_port 的兜底端口从未校验过）
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=1
+         port_in_use() { return 0; }
+         random_free_port() { printf '8443'; return 0; }
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1); rc=$?
+assert_status 1 "$rc" "deploy_wizard 在改用的端口仍被占用时返回非零"
+assert_contains "$out" "仍被占用" "deploy_wizard 在改用的端口仍被占用时给出明确提示"
+
+# 同上，但走的是「菜单选 0 改用随机端口」那条路径（与上面是【两处】代码）
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=0
+         port_in_use() { return 0; }
+         tui_menu() { return 0; }
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1); rc=$?
+assert_status 1 "$rc" "deploy_wizard 在菜单改端口后遇到占用端口时中止"
+assert_contains "$out" "仍被占用" "deploy_wizard 在菜单改端口后遇到占用端口时给出明确提示"
+
+# 端口探测不可用（既没有 ss 也没有 netstat）时必须提示
+out=$( ( eval "$(t9_mocks; t9_mocks_wizard)"
+         OPT_YES=1
+         have_cmd() { case "$1" in ss|netstat) return 1 ;; *) return 0 ;; esac; }
+         XRAY_CONFIG="$T9_TMP/cfg.json"
+         OUT_DIR="$T9_TMP/out"
+         deploy_wizard ) 2>&1); rc=$?
+assert_contains "$out" "无法确认端口是否空闲" "deploy_wizard 在端口探测不可用时给出提示"
+
+else
+  assert_eq "mktemp -d 能创建唯一临时目录" "失败（mktemp -d 返回空路径）" \
+    "Task 9 用例前提：mktemp -d 必须能创建唯一临时目录"
 fi
+rm -rf "$T9_TMP"
 ```
 
 **Step 2: 运行测试确认失败**
@@ -5285,11 +5844,14 @@ bash test/unit.sh
 # 并发探测候选伪装目标：TLS1.3 支持 + 连通延迟，按延迟升序输出 "host|tls|latency"
 # 未知延迟（'?'）视为最大，排在最后
 probe_targets() {
-  local host tmp sortkey h t l
+  local host tmp sortkey h t l pid
   tmp=$(mktemp)
   # mktemp 失败时 tmp 为空 → 后面会写出 ".<host>" 污染当前目录 → 必须守卫。
   if [[ -z "$tmp" ]]; then
-    tui_err "无法创建临时文件，目标探测中止"
+    # ⚠️ 诊断信息必须走 stderr：调用方是 `probe=$(probe_targets)` ——
+    #    tui_err 默认写 stdout → 这条报错会被当成【探测数据】吞进 probe，
+    #    于是 choose_target 拿到的是一段错误文本而不是空串 → 解析出垃圾主机名。
+    tui_err "无法创建临时文件，目标探测中止" >&2
     return 1
   fi
   local -a pids=() hosts=()
@@ -5303,7 +5865,8 @@ probe_targets() {
     pids+=($!)
     hosts+=("$host")
   done
-  for host in "${pids[@]}"; do wait "$host" 2>/dev/null || true; done
+  # 循环变量是 PID，不是主机名 —— 名字写错会让人以为 wait 的是 host。
+  for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
   for host in "${hosts[@]}"; do
     [[ -f "$tmp.$host" ]] || continue
     IFS='|' read -r h t l <"$tmp.$host"
@@ -5319,7 +5882,10 @@ choose_target() {
   local probe line host tls lat
   probe=$(probe_targets)
   if [[ -z "$probe" ]]; then
-    tui_warn "目标探测不可用，回退默认：www.microsoft.com"
+    # ⚠️ 提示语必须走 stderr：调用方是 `SNI=$(choose_target)` ——
+    #    tui_warn 默认写 stdout → 这条提示会被当成【主机名】吞进去，
+    #    SNI 变成「提示文本 + 主机名」的多行串 → 写进 config.json 就是废配置。
+    tui_warn "目标探测不可用，回退默认：www.microsoft.com" >&2
     printf 'www.microsoft.com'; return 0
   fi
   local -a labels=() hosts=()
@@ -5360,7 +5926,9 @@ choose_target() {
   # 选中项一律用【返回码】取，stdout 只留最后 printf 的那个 host。
   tui_menu "选择 REALITY 伪装目标（SNI）" "${labels[@]}" >&2 || rc=$?
   if (( rc == 255 )); then
-    tui_warn "未选择伪装目标，回退到第一项"
+    # ⚠️ 提示语必须走 stderr：调用方是 `SNI=$(choose_target)` ——
+    #    tui_warn 默认写 stdout → 这条提示会被当成【主机名】吞进去。
+    tui_warn "未选择伪装目标，回退到第一项" >&2
     sel=0
   else
     sel=$rc
@@ -5421,15 +5989,30 @@ deploy_wizard() {
 
   # 端口
   PORT="${OPT_PORT:-443}"
+  # ⚠️ 端口探测不可用时必须提示：
+  #    port_in_use 在【既没有 ss 也没有 netstat】时恒返回 1（= 端口空闲）
+  #    → 用户以为端口干净 → 部署走到 systemd 阶段才炸，
+  #    而且首句报错是「systemd 配置失败」，与真正原因（端口被占）无关。
+  if ! have_cmd ss && ! have_cmd netstat; then
+    tui_warn "无法确认端口是否空闲（系统缺少 ss 与 netstat）"
+    tui_tip "若部署时报端口被占用，请用 --port 指定其它端口。"
+  fi
   if port_in_use "$PORT"; then
     local occ
     occ=$(port_occupant "$PORT")
     tui_warn "端口 $PORT 已被占用${occ:+（$occ）}"
     if [[ ${OPT_YES:-0} -eq 1 ]]; then
       PORT=$(random_free_port)
+      # ⚠️ random_free_port 的兜底端口 44321 从未校验过是否被占用
+      #    → 这里【必须】再验一次，否则会把一个占用端口写进 config.json，
+      #    直到 systemd 阶段才以「address already in use」失败。
+      [[ -n "$PORT" ]] || { tui_err "找不到空闲端口，部署中止。"; return 1; }
+      if port_in_use "$PORT"; then
+        tui_err "端口 $PORT 仍被占用，部署中止。"
+        return 1
+      fi
       tui_tip "已自动改用空闲端口：$PORT"
     else
-      local choice
       # 同上：用返回码取选中项，不要用 $(...) 捕获 stdout
       local choice=0 crc=0
       tui_menu "如何处理端口冲突？" \
@@ -5442,10 +6025,19 @@ deploy_wizard() {
         choice=$crc
       fi
       case $choice in
-        0) PORT=$(random_free_port); tui_tip "已改用端口 $PORT" ;;
+        0) PORT=$(random_free_port)
+            [[ -n "$PORT" ]] || { tui_err "找不到空闲端口，部署中止。"; return 1; }
+            if port_in_use "$PORT"; then
+              tui_err "端口 $PORT 仍被占用，部署中止。"
+              return 1
+            fi
+            tui_tip "已改用端口 $PORT" ;;
         1) PORT=$(tui_input "请输入新端口" "$PORT" "1-65535")
             # 用 10# 前缀：裸算术会把 "08" 当八进制，直接报「value too great for base」。
-            [[ "$PORT" =~ ^[0-9]+$ ]] && (( 10#PORT > 0 && 10#PORT < 65536 )) || { tui_err "端口非法"; return 1; } ;;
+            # ⚠️ 必须是 10#$PORT（带 $）：bash 不会在 10# 后解析【变量名】，
+            #    10#PORT 会被当成「以 10 为基的数字 PORT」→ 直接报
+            #    "value too great for base" → 用户手动指定的端口【必然】被判非法。
+            [[ "$PORT" =~ ^[0-9]+$ ]] && (( 10#$PORT > 0 && 10#$PORT < 65536 )) || { tui_err "端口非法"; return 1; } ;;
         *) tui_info "已取消部署"; return 1 ;;
       esac
     fi
