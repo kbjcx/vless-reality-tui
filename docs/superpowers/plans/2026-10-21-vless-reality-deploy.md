@@ -6999,7 +6999,7 @@ git commit -m "feat(menu): 管理菜单——查看、重启、日志、更新�
 - Modify: `lib/deploy.sh`（定点修订 P2）
 
 **Interfaces:**
-- Consumes: Task 3 `STATE_FILE` `OUT_DIR` `XRAY_CONFIG` `load_state`；Task 6 `have_cmd`；Task 2 `tui_confirm`
+- Consumes: Task 3 `STATE_FILE` `OUT_DIR` `XRAY_CONFIG` `load_state`；Task 3 `lib/core.sh` 的 `have_cmd`；Task 2 `tui_confirm`
 - Produces:
   - `uninstall.sh [--purge] [--yes]` → `0`/`1`
   - `uninstall.sh` 必须**可被 source 而不执行 main**（`UNINSTALL_SH_NO_MAIN=1` + `BASH_SOURCE[0] == $0` 双条件守卫），
@@ -7372,8 +7372,8 @@ rm -rf "$T11_TMP"
 bash test/unit.sh
 ```
 
-预期：FAIL —— `uninstall.sh: No such file or directory`（参数解析那几条红），
-且 `test/lib.sh` 里没有 `assert_not_contains` → 断言库那一条也红。
+预期：FAIL —— `uninstall.sh: No such file or directory` → **Task 11 整段断言全红**（实施者实测 58 红 / 632 绿），
+其中包含 `test/lib.sh` 里没有 `assert_not_contains` → 断言库那一条也红。
 ⚠️ 这一步的失败**必须真的红**（不是「0 条红」）：0 条红说明测试根本没跑起来，
 后面「实现后全绿」就没有意义了。
 
@@ -7856,8 +7856,12 @@ git commit -m "feat(uninstall): 停止服务、备份配置、撤销防火墙规
 **Files:**
 - Create: `build.sh`
 - Create: `dist/install.sh`（由 build.sh 生成）
+- Create: `.shellcheckrc`
 - Create: `.github/workflows/ci.yml`
 - Modify: `test/unit.sh`
+- Modify: `install.sh`（定点修订 P1 / P2）
+- Modify: `lib/tui.sh`（定点修订 P3 / P4）
+- Modify: `test/helpers/menu_tty.sh`（定点修订 P5）
 
 **Interfaces:**
 - Consumes: `lib/tui.sh` `lib/core.sh` `lib/client.sh` `lib/deploy.sh`
@@ -7865,25 +7869,118 @@ git commit -m "feat(uninstall): 停止服务、备份配置、撤销防火墙规
   - `build.sh` → 生成 `dist/install.sh`，退出码 `0`
   - `dist/install.sh` → 可独立执行的单文件安装脚本
   - `.github/workflows/ci.yml` → CI job
+- **提交模式是硬约束（CI 能不能过的关键，见 T12-4）**：
+  `build.sh` / `dist/install.sh` / `install.sh` 在 Git 索引里必须是 **100755**。
+  理由：CI 的校验是 `git diff --exit-code dist/install.sh`，而 GitHub runner 上
+  `core.fileMode=true` → 索引 100644 与工作区 755 不一致会被 `git diff` 报出模式差异
+  → **CI 每次都红**。本仓库本地的 `core.fileMode=false` 只是本地设置，clone 不会带到 runner。
+  顺带的好处：单文件分发物 clone 下来就是可执行的。
 
 **Step 1: 写失败的测试**
 
-追加到 `test/unit.sh`：
+追加到 `test/unit.sh` 的 `test_summary` **之前**：
 
 ```bash
-test_case "构建产物"
+# ── Task 12：构建产物、CI 与脚本可执行位 ─────────────────────────
+# ⚠️ 本段【不写任何会整块跳过的条件块】：
+#    build.sh 在本段开头【必定先跑一遍】→ dist/install.sh 必定存在 →
+#    断言条数与机器 / 网络 / 依赖状态【无关】。
+#    即使 build.sh 失败，后续断言也照样执行（只是变红）→ 条数恒定。
+#    （原计划把 4 条断言放在 `if [[ -f dist/install.sh ]]` 里，
+#      条件不成立时那 4 条不执行 → 条数会随 build.sh 成败漂移。）
 
-bash "$ROOT/build.sh" >/dev/null 2>&1
-assert_status 0 "$?" "build.sh 执行成功"
+test_case "Task 12：构建产物"
+
+# ⚠️ 用 out=$(...) 包起来再取 $?：rc 与输出同时拿到，
+#    build.sh 失败时能把它的报错直接打进断言消息。
+out=$(bash "$ROOT/build.sh" 2>&1); rc=$?
+assert_status 0 "$rc" "build.sh 执行成功"
+assert_contains "$out" "已生成" "build.sh 报告已生成产物"
 assert_true "$([[ -f "$ROOT/dist/install.sh" ]] && echo 0 || echo 1)" "生成 dist/install.sh"
 
-# 单文件产物必须自包含：不含 source lib/ 的相对引用
-if [[ -f "$ROOT/dist/install.sh" ]]; then
-  assert_eq 0 "$(grep -c 'source.*lib/' "$ROOT/dist/install.sh" || true)" "单文件产物不引用外部 lib/ 路径"
-  assert_eq 0 "$(bash -n "$ROOT/dist/install.sh" 2>&1; echo $?)" "单文件产物语法正确"
-  assert_contains "$(cat "$ROOT/dist/install.sh")" "tui_banner" "单文件产物包含 TUI 实现"
-  assert_contains "$(cat "$ROOT/dist/install.sh")" "render_server_config" "单文件产物包含配置渲染"
-fi
+# build.sh 本身的两条硬要求：
+#   ① 不用 `sed … | head -1`：head 命中即退出会让上游 sed 收到 SIGPIPE(141)，
+#      而 build.sh 有 `set -euo pipefail` → 管道 rc=141 → 构建中止
+#      （本仓库的既定约定见 lib/core.sh 的 port_occupant）；
+#   ② 必须 chmod +x 产物：分发物 clone 下来要能直接 ./install.sh。
+bsh=$(cat "$ROOT/build.sh")
+# ⚠️ 判据必须看【代码行】，不能做字面量查找：
+#    build.sh 自己的注释里就写着 "head -1"（为了说明为什么不能这么写），
+#    字面量查找会把【注释】当成【代码】→ 这条断言【恒红】，什么也证明不了
+#    （控制器实测：字面量判据 = 1，代码判据 = 0，而旧版 build.sh 才是真的用了它）。
+#    判据：行首不是注释（`^[^#]*`）的行里出现 "| head"。
+assert_eq "0" "$(grep -cE '^[^#]*\|[[:space:]]*head' "$ROOT/build.sh" 2>/dev/null || true)" \
+  "build.sh 不用提前退出的管道（head -1）"
+assert_contains "$bsh" 'chmod +x' "build.sh 把产物设为可执行"
+
+test_case "Task 12：单文件产物自包含"
+
+dist="$ROOT/dist/install.sh"
+# 单文件产物必须【不引用】外部 lib/ 路径 —— 否则「下载一个文件就能用」是假的
+assert_eq "0" "$(grep -c 'source.*lib/' "$dist" 2>/dev/null || true)" \
+  "单文件产物不引用外部 lib/ 路径"
+# set 行必须【恰好一条】：零条 → 产物没有 set -u → 未定义变量不报错；
+# 两条 → 后一条可能把 -u 关掉
+assert_eq "1" "$(grep -c '^set -uo pipefail$' "$dist" 2>/dev/null || true)" \
+  "单文件产物里恰好一条 set -uo pipefail"
+# shellcheck 注释也要剥掉（否则产物里留着「这个文件来自 lib/」的误导性注释）
+assert_eq "0" "$(grep -c 'shellcheck source=lib/' "$dist" 2>/dev/null || true)" \
+  "单文件产物里没有 shellcheck source 注释"
+# ROOT_DIR 必须由头部定义（install.sh 自己那行被剥掉了）
+assert_contains "$(cat "$dist" 2>/dev/null)" 'ROOT_DIR="$(cd --' \
+  "单文件产物自己定义 ROOT_DIR"
+# 四个模块都在
+# ⚠️ 用 tui_pad 而不是 tui_banner 做判据：tui_banner 在 install.sh 里也有【调用点】，
+#    只看 tui_banner 无法区分「lib/tui.sh 内联进来了」与「只是调用点被带进来了」；
+#    tui_pad 是 lib/tui.sh 【独有】的符号 → 判据唯一。
+assert_contains "$(cat "$dist" 2>/dev/null)" "tui_pad" "单文件产物包含 TUI 实现"
+assert_contains "$(cat "$dist" 2>/dev/null)" "render_server_config" "单文件产物包含配置渲染"
+# ⚠️ 判据用 client.sh【独有】的 render_client_config，不用 build_share_link：
+#    后者在 lib/deploy.sh 里也有【调用点】→ 只看这个名字分不清
+#    「client.sh 被内联进来了」与「只是调用点被带进来了」
+#    （与上面 tui_pad 不用 tui_banner 是同一条理由）。
+assert_contains "$(cat "$dist" 2>/dev/null)" "render_client_config" "单文件产物包含分享链接生成"
+
+test_case "Task 12：单文件产物可独立执行"
+
+out=$(bash "$dist" --help 2>&1); rc=$?
+assert_status 0 "$rc" "单文件产物 --help 退出码为 0"
+assert_contains "$out" "用法" "单文件产物 --help 给出用法"
+out=$(bash -n "$dist" 2>&1); rc=$?
+assert_status 0 "$rc" "单文件产物语法正确"
+
+test_case "Task 12：可执行位与用法文案（定点修订）"
+
+# ⚠️ 仓库里所有 .sh 的提交模式曾经是 100644（core.fileMode=false）→
+#    `./install.sh` 会 Permission denied → 用法文案必须写 `sudo bash install.sh`。
+inst=$(cat "$ROOT/install.sh")
+assert_not_contains "$inst" "sudo ./install.sh" "install.sh 的用法文案不写 sudo ./install.sh"
+assert_contains "$inst" "sudo bash install.sh" "install.sh 的用法文案写 sudo bash install.sh"
+# 产物里也必须改掉（产物是从 install.sh 派生的）
+assert_not_contains "$(cat "$dist" 2>/dev/null)" "sudo ./install.sh" \
+  "单文件产物的用法文案不写 sudo ./install.sh"
+
+test_case "Task 12：CI 与按键超时（定点修订）"
+
+assert_true "$([[ -f "$ROOT/.github/workflows/ci.yml" ]] && echo 0 || echo 1)" "CI 配置文件存在"
+cic=$(cat "$ROOT/.github/workflows/ci.yml" 2>/dev/null)
+assert_contains "$cic" "bash build.sh" "CI 校验 dist 与源码同步"
+assert_contains "$cic" "git diff --exit-code" "CI 用 git diff 判定产物是否脱节"
+assert_contains "$cic" "shellcheck" "CI 跑 ShellCheck"
+scrc=$(cat "$ROOT/.shellcheckrc" 2>/dev/null)
+assert_contains "$scrc" "SC1090" "shellcheck 豁免运行时 source（SC1090）"
+assert_contains "$scrc" "SC1091" "shellcheck 豁免找不到被 source 的文件（SC1091）"
+
+# lib/tui.sh 的两个按键超时必须【可被环境变量覆盖】：
+# 默认的 0.2 / 0.35 秒是【墙钟截止点】，机器繁忙时会把方向键读丢、
+# 把两位数输入截断 → CI 上随机红（GitHub runner 是共享机器，负载不可控）。
+# 改成 ${TUI_KEY_TIMEOUT:-0.2} 之后，测试 helper 可以把它放大到确定值。
+tuic=$(cat "$ROOT/lib/tui.sh")
+assert_contains "$tuic" '${TUI_KEY_TIMEOUT:-' "lib/tui.sh 的方向键超时可被环境变量覆盖"
+assert_contains "$tuic" '${TUI_DIGIT_TIMEOUT:-' "lib/tui.sh 的数字键超时可被环境变量覆盖"
+mh=$(cat "$ROOT/test/helpers/menu_tty.sh")
+assert_contains "$mh" "TUI_KEY_TIMEOUT" "菜单测试 helper 放大了方向键超时"
+assert_contains "$mh" "TUI_DIGIT_TIMEOUT" "菜单测试 helper 放大了数字键超时"
 ```
 
 **Step 2: 运行测试确认失败**
@@ -7892,7 +7989,10 @@ fi
 bash test/unit.sh
 ```
 
-预期：FAIL，`build.sh: No such file or directory`。
+预期：FAIL —— `bash: build.sh: No such file or directory`（`bash "$ROOT/build.sh"` 返回 127），
+且 `dist/install.sh` 不存在、`.github/workflows/ci.yml` 不存在 → 对应断言一并红。
+⚠️ 这一步的失败**必须真的红**（不是「0 条红」）：0 条红说明测试根本没跑起来，
+后面「实现后全绿」就没有意义了。
 
 **Step 3: 实现 `build.sh`**
 
@@ -7908,7 +8008,12 @@ set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 OUT="$ROOT/dist/install.sh"
-VERSION="$(sed -n "s/^APP_VERSION='\(.*\)'.*/\1/p" "$ROOT/lib/core.sh" | head -1)"
+# ⚠️ 不要用 `sed … | head -1`：head 命中即退出会让上游 sed 收到 SIGPIPE(141)，
+#    而本脚本有 `set -euo pipefail` → 整条管道的退出码变成 141 → 构建【中止】。
+#    （本仓库的既定约定见 lib/core.sh 的 port_occupant）
+#    改成不接管道，再用 bash 取首行。
+VERSION="$(sed -n "s/^APP_VERSION='\(.*\)'.*/\1/p" "$ROOT/lib/core.sh")"
+VERSION="${VERSION%%$'\n'*}"
 # 提取不到就报错退出：静默回落成 0.0.0 会让产物带着错误的版本号发布出去，
 # 而 CI 的 dist 同步校验只比对内容、不会发现版本号是错的。
 if [[ -z "$VERSION" ]]; then
@@ -7965,6 +8070,11 @@ HEADER
       "$ROOT/install.sh"
 } >"$tmp"
 
+# ⚠️ 产物必须以【100755】提交（Step 6 的 git update-index --chmod=+x）：
+#    CI 的校验是 `git diff --exit-code dist/install.sh`，而 GitHub runner 上
+#    core.fileMode=true → 索引模式（100644）与工作区模式（755）不一致
+#    会被 git diff 报出来 → CI 每次都红。
+#    顺带的好处：单文件分发物 clone 下来就是可执行的。
 chmod +x "$tmp" || { printf '无法设置可执行权限：%s\n' "$tmp" >&2; rm -f "$tmp"; exit 1; }
 mv -f "$tmp" "$OUT" || { printf '无法写入产物：%s\n' "$OUT" >&2; rm -f "$tmp"; exit 1; }
 printf '已生成 %s (v%s)\n' "$OUT" "$VERSION"
@@ -8040,9 +8150,289 @@ bash test/unit.sh
 **Step 6: 提交**
 
 ```bash
-git add build.sh dist/install.sh .github/workflows/ci.yml test/unit.sh
+git add build.sh dist/install.sh .shellcheckrc .github/workflows/ci.yml test/unit.sh
+git add install.sh lib/tui.sh test/helpers/menu_tty.sh
+# ⚠️ 必须显式设置可执行位（见 T12-4 / T12-5）：
+#    GitHub runner 上 core.fileMode=true → 索引模式与工作区模式不一致会被
+#    `git diff --exit-code dist/install.sh` 报出来 → CI 每次都红。
+#    本仓库本地的 core.fileMode=false 只是本地设置，clone 不会带到 runner。
+#    顺带的好处：单文件分发物 clone 下来就是可执行的。
+git update-index --chmod=+x build.sh
+git update-index --chmod=+x dist/install.sh
+git update-index --chmod=+x install.sh
 git commit -m "feat(build): 单文件构建脚本、dist 产物与 CI 流水线"
 ```
+
+#### 修订轮 1 的逐项发现与处置
+
+> 本节由**控制器**在 Task 12 派发前预扫（静态核对 + **实跑探针** + 决定性实验）之后写入。
+> 本节列的全是**计划缺陷**，责任方是控制器；Task 12 的代码块本身还没被实施过。
+>
+> 预扫对象：计划 `## Task 12` 段的 Step 1（测试）与 Step 3 / Step 4（实现）。
+> 沙箱底座 = `git archive HEAD` 整棵树（**Task 11 的实施提交**）。
+
+| # | 级别 | 发现 | 处置 |
+|---|---|---|---|
+| **T12-1** | **Important** | **Step 1 的条件块没有 else 侧的「已跳过/前提不成立」断言。** `if [[ -f "$ROOT/dist/install.sh" ]]; then … 4 条断言 … fi` —— 条件不成立时这 4 条**不执行** → 断言条数随「build.sh 是否成功」漂移。**违反全局约束** | Step 1 重写：把条件块**整个去掉** —— build.sh 在本段开头必定先跑一遍 → 产物必定存在 → 断言条数与机器/网络/依赖状态**无关**。即使 build.sh 失败，后续断言也照样执行（只是变红）→ 条数恒定 |
+| **T12-2** | **Important** | **`lib/tui.sh` 的两个按键超时在 CI 上会真实易抖。** `tui.sh:497` 的 `read -rsn2 -t 0.2`、`tui.sh:531` 的 `read -rsn1 -t 0.35` 是**墙钟截止点**（不是「等够字节数」的条件）→ 机器繁忙时：写端还没把字节送进管道，读端已等满 → 方向键读不到（回车选中高亮项而不是期望项）、两位数输入被截断、「编号」提示行一次都不打印 → 6 条断言随机变红。GitHub Actions 是**共享 runner**，负载不可控 → **CI 第一次跑就可能挂** | 采用**方案 A**（把两个超时提成**可被环境变量覆盖**的常量）：`lib/tui.sh` 改成 `${TUI_KEY_TIMEOUT:-0.2}` / `${TUI_DIGIT_TIMEOUT:-0.35}`；`test/helpers/menu_tty.sh` 把它们设成 2。**作为五处定点修订之一**（P3 / P4 / P5）。交互体验完全不变，CI 变确定性 |
+| **T12-3** | Minor | **Task 12 的测试会改写仓库工作树。** Step 1 里 `bash "$ROOT/build.sh"` 会把 `dist/install.sh` 写进工作树 → 跑一次单元测试 `git status` 就变脏 | 验收标准里写明「跑完测试后 `dist/install.sh` 处于已修改状态是**预期**的，提交前 `git add dist/install.sh`」；实施者不得因此误判为「有人改了工作树」 |
+| **T12-4** | **Critical** | **CI 的「dist 与源码同步校验」在 GitHub runner 上会【必然失败】。** 计划里 build.sh 结尾是 `chmod +x "$tmp"`（产物 755），CI 的校验是 `git diff --exit-code --stat dist/install.sh`。**runner 是 Linux，`core.fileMode=true`**（本仓库本地的 `core.fileMode=false` 是 Windows 侧的本地设置，**clone 不会把它带到 runner**）→ checkout 按索引模式铺文件、build.sh 再 `chmod +x` → **工作区 755 ≠ 索引 100644** → `git diff` 报出模式差异 → **rc≠0 → CI 每次都红**。<br>**实验证据**（`workspace/probe_t12_mode.sh`，core.fileMode=true 的临时仓库）：索引与工作区模式不一致时 `git diff --exit-code` **必然非空、rc≠0**（机制已证实）。<br>⚠️ 本机 MSYS 的 `chmod` 是**模拟的**（改不动真实模式），本地只能证实**机制**、无法端到端复现 runner 上的那一次 | **明确规定：`dist/install.sh` 必须以 100755 提交** —— Step 6 加 `git update-index --chmod=+x dist/install.sh`（`build.sh` 与 `install.sh` 同样加）。这**同时**是产品改进：单文件分发物 clone 下来就是可执行的 |
+| **T12-5** | Minor | **`install.sh` 本身的可执行位没处理**（仓库里所有 `.sh` 曾是 100644） | Step 6 的提交清单里加 `git update-index --chmod=+x install.sh`；README 统一 `sudo bash install.sh`（Task 13） |
+| **T12-6** | Minor | **`VERSION="$(sed -n … \| head -1)"` 是提前退出的管道。** 本仓库的既定约定（见 `lib/core.sh` 的 `port_occupant`）是「不要用 `\| head -1`」—— 上游可能收到 SIGPIPE(141)，而 build.sh 有 `set -euo pipefail` → 管道 rc=141 → **构建中止**。实测风险低（`sed` 只输出一行，一次 write 就进管道缓冲），但**与既定约定相悖** | Step 3 改成「不接管道 + 用 bash 取首行」：`VERSION="${VERSION%%$'\n'*}"` |
+| **T12-7** | Minor | **CI 的 bash -n 步骤没有排除 `dist/`**（ShellCheck 那步排除了） | 保持现状 —— dist 被 `bash -n` 检查是**好事**；Step 1 补一条「dist 产物也过 `bash -n`」的断言 |
+| **T12-8** | Minor | **`.shellcheckrc` 的豁免清单要覆盖新增文件。** Task 11 之后的 `uninstall.sh`（source lib/）、Task 13 之后的 `demo.sh`（source lib/）都需要 SC1090/SC1091 豁免（已有 ✓） | 无需改动；Step 1 补两条断言点名 `.shellcheckrc` 含 SC1090 / SC1091，且 CI 里确实有 `shellcheck` 步骤 |
+| **T12-9** | Minor | **CI 触发条件只覆盖 `main` / `master` 与 PR。** 本仓库的实施分支是 `feature/impl` → 推 feature 分支时 CI 不跑 | 与用户「GitHub 仓库分发」的诉求一致（合并到 main 后才需要 CI）；不改，但在 README 说明「CI 在 main / PR 上跑」 |
+| **T12-10** | **Important** | **`install.sh` 自己的用法文案全部写着 `sudo ./install.sh` —— 照着做会 Permission denied。** 涉及 6 处：`install.sh:5-9` 的用法注释（5 行）+ `install.sh:38` 的 `usage` 输出。**并且这个错误会随分发物流传**：`dist/install.sh` 是从 `install.sh` 派生的 → 单文件版的 `--help` 里也写着 `sudo ./install.sh`（已由控制器实跑产物证实） | 作为**定点修订 P1 / P2** 改掉 6 处；Step 1 补两条断言（`install.sh` 与产物里都不得再出现 `sudo ./install.sh`，且必须出现 `sudo bash install.sh`） |
+| **T12-11** | Minor | **`build.sh` 的 sed 剥离规则要逐条对上 `install.sh` 的实际文本。** 已核实：`install.sh` 里 `^set ` 只有第 11 行 `set -uo pipefail` 一条（`lib/*.sh` **一条都没有**）→ 与 `-e '/^set -uo pipefail$/d'` 精确匹配 ✓；`^ROOT_DIR=.*BASH_SOURCE` 一条 ✓；`^source "\$ROOT_DIR/lib/` 4 条 ✓；`^# shellcheck source=lib/` 4 条 ✓ | 无需改动；Step 1 补断言「产物里 `source.*lib/` 为 0 条」「产物里 `^set -uo pipefail$` **恰好 1 条**」「产物里没有 shellcheck source 注释」「产物自己定义 `ROOT_DIR`」—— 防止将来出现**两条** `set` 或**零条** |
+| **T12-12** | **Important** | **「build.sh 不用提前退出的管道（head -1）」这条断言写成【字面量查找】→ 它【恒红】。** 新 build.sh 里**为了说明为什么不能这么写**，注释中就写着 `` `sed … | head -1` `` 这几个字 → `grep -c 'head -1'` = 1 → 断言恒红，**什么也证明不了**。<br>**实跑证据**：控制器在修订轮沙箱（`C:\tmp\t12sbx`）跑套件 → **717 通过 + 1 红**，红的正是这一条；而该沙箱的 build.sh **根本没有用管道**（用的是 `VERSION="${VERSION%%$'\n'*}"`）→ 红灯是**假阳性**，不是真缺陷 | 判据改成**代码级**：`grep -cE '^[^#]*\|[[:space:]]*head'`（只看行首不是注释的行）。<br>**实测判别力**：新 build.sh = **0**（绿）、旧 build.sh = **1**（红）→ 判据既不恒红、又能抓住真违规。断言**文案不变**，验收标准第 8 条 A1 的点名也不变 |
+| **T12-13** | **Important** | **「单文件产物包含分享链接生成」用 `build_share_link` 做判据 → 分不清「client.sh 被内联」与「只是调用点被带进来」。** `build_share_link` 在 **lib/deploy.sh 里也有调用点**（`deploy.sh:745`、`deploy.sh:791`）→ 跳过 client.sh 的变异（A8）**抓不住**这条断言。<br>这正是本段自己写在 `tui_pad` 那条注释里的同一条理由（`tui_banner` 在 install.sh 里也有调用点）→ **同一类错误犯了第二次** | 判据换成 **client.sh【独有】**的符号 `render_client_config`（控制器实测：它在其它 lib 文件与 install.sh 里**一次都不出现**）。断言文案不变，验收标准第 8 条 A8 的描述同步改成「让产物里没有 `lib/client.sh`」 |
+| **T12-14** | Minor | **Task 11 的 Interfaces 把 `have_cmd` 归给了 Task 6，实际定义在 `lib/core.sh`（Task 3）。** 由 Task 11 的实施者如实报出 | 随本轮一并改正 Task 11 段的这一处**散文**（`Task 6 \`have_cmd\`` → `Task 3 \`lib/core.sh\` 的 \`have_cmd\``）。<br>⚠️ **一个字都不改 Task 11 的代码块** —— 那些块是已实施内容，控制器复核逐字节比对的就是它们 |
+| **T12-15** | Minor | **Task 11 的 Step 2 预期低估了红的范围。** 计划写「参数解析那几条红 + 断言库那一条」，实施者实测是 **58 红 / 632 绿**（`uninstall.sh` 不存在 → Task 11 整段断言全红） | 同上，随本轮改正 Task 11 段的 Step 2 预期**散文**（只改预期描述，不改代码块） |
+
+#### 控制器的实跑探针：计划里的 `build.sh` 一次都没被执行过 → 已实跑并通过 ✅
+
+`workspace/probe_t12_build.py`：从计划里**抽出** Step 3 的 `build.sh` 代码块 → 落进临时目录
+（复制 `lib/` 与 `install.sh`）→ 实跑 → 按计划 Step 1 的口径逐条核验产物。
+
+| 检查 | 结果 |
+|---|---|
+| `bash -n build.sh` | rc=0 ✓ |
+| 实跑 `bash build.sh` | rc=0，输出 `已生成 …/dist/install.sh (v1.0.0)` ✓ |
+| 产物大小 | **100 407 字节**（4 个 lib + 入口全部内联）✓ |
+| `grep -c 'source.*lib/'` | **0**（自包含 ✓） |
+| 产物里 `set -uo pipefail` | **恰好 1 条**（头部那一条 ✓） |
+| 产物里 `shellcheck source=lib/` 注释 | **0**（被 sed 剥掉 ✓） |
+| 产物里定义了 `ROOT_DIR` | ✓（头部重新定义，install.sh 自己那行被剥掉） |
+| `bash -n dist/install.sh` | rc=0 ✓ |
+| `dist/install.sh --help` | rc=0，输出正常 ✓ —— **但 help 里写着 `sudo ./install.sh`（坐实 T12-10）** |
+
+> **结论**：计划的 `build.sh` 设计**是对的**，Task 12 不需要改它的核心逻辑。
+
+#### 修订轮 1 的定点修订（五处，均须恰好命中 1 次）
+
+| 编号 | 文件 | 改什么 |
+|---|---|---|
+| **P1** | `install.sh` | 头部用法注释的 5 处 `sudo ./install.sh` → `sudo bash install.sh`，并补一段「为什么不能用 `./install.sh`」的说明 |
+| **P2** | `install.sh` | `usage()` 输出里的 1 处 `sudo ./install.sh` → `sudo bash install.sh` |
+| **P3** | `lib/tui.sh` | 方向键超时 `-t 0.2` → `-t "${TUI_KEY_TIMEOUT:-0.2}"` |
+| **P4** | `lib/tui.sh` | 数字键超时 `-t 0.35` → `-t "${TUI_DIGIT_TIMEOUT:-0.35}"` |
+| **P5** | `test/helpers/menu_tty.sh` | 导出 `TUI_KEY_TIMEOUT=2` / `TUI_DIGIT_TIMEOUT=2` |
+
+> **代价与补偿**：改了之后，`install.sh` / `lib/tui.sh` / `test/helpers/menu_tty.sh`
+> 不再与计划里对应任务的 Step 3 块逐字节一致 →
+> 因此本任务把这五处写成**可机械核对的精确文本替换**，验收标准里逐条点名，
+> 控制器复核时逐条核对。
+
+#### 修订轮 1 的定点修订的「改前 / 改后」原文
+
+下面 **五个**代码块对用 `text` 围栏而不是 `bash` —— 它们是**文件内部的片段**，
+单独 `bash -n` 必然报语法错。用 `text` 围栏可以让计划的语法自检脚本跳过它们，
+同时**原样**展示要替换的文本。
+
+> 「改前」文本必须在目标文件里**恰好命中 1 次**；改完后「改前」命中 **0** 次、
+> 「改后」命中 **1** 次。
+
+**P1 —— `install.sh` 的用法注释：`sudo ./install.sh` → `sudo bash install.sh`**
+
+- 目标文件：`install.sh`
+
+- 改前：
+
+```text
+# 用法:
+#   sudo ./install.sh              交互式向导
+#   sudo ./install.sh -y           全自动（用默认值）
+#   sudo ./install.sh --menu       进入管理菜单
+#   sudo ./install.sh --status     查看运行状态
+#   sudo ./install.sh --uninstall  卸载
+```
+
+- 改后：
+
+```text
+# 用法:
+#   sudo bash install.sh              交互式向导
+#   sudo bash install.sh -y           全自动（用默认值）
+#   sudo bash install.sh --menu       进入管理菜单
+#   sudo bash install.sh --status     查看运行状态
+#   sudo bash install.sh --uninstall  卸载
+#
+# ⚠️ 用 `bash install.sh` 而不是 `./install.sh`：
+#    仓库里的 .sh 提交模式是 100644（core.fileMode=false），
+#    新克隆的仓库里这个文件【不可执行】→ ./install.sh 会 Permission denied。
+```
+
+**P2 —— `install.sh` 的 `usage()` 输出：同上**
+
+- 目标文件：`install.sh`
+
+- 改前：
+
+```text
+  sudo ./install.sh [选项]
+```
+
+- 改后：
+
+```text
+  sudo bash install.sh [选项]
+```
+
+**P3 —— `lib/tui.sh` 的方向键超时：可被环境变量覆盖**
+
+- 目标文件：`lib/tui.sh`
+
+- 改前：
+
+```text
+      IFS= read -rsn2 -t 0.2 seq || true
+```
+
+- 改后：
+
+```text
+      # ⚠️ 超时必须【可被环境变量覆盖】：
+      #    0.2 秒是【墙钟截止点】，不是「等够 2 字节」的条件 →
+      #    机器繁忙时写端还没把字节送进管道，读端已经等满 → 方向键读不到 →
+      #    回车选中的是【高亮项(索引 0)】而不是期望的索引 → 断言随机变红。
+      #    GitHub Actions 是共享 runner，负载不可控 → CI 上必然会有随机红。
+      #    改成环境变量后，测试 helper（test/helpers/menu_tty.sh）可以把它放大到 2 秒，
+      #    交互体验完全不变，CI 变成确定性的。
+      IFS= read -rsn2 -t "${TUI_KEY_TIMEOUT:-0.2}" seq || true
+```
+
+**P4 —— `lib/tui.sh` 的数字键超时：可被环境变量覆盖**
+
+- 目标文件：`lib/tui.sh`
+
+- 改前：
+
+```text
+        IFS= read -rsn1 -t 0.35 more || more=''
+```
+
+- 改后：
+
+```text
+        # ⚠️ 同上：0.35 秒在繁忙机器上会把两位数输入（"10"）截成"1"，
+        #    并且「编号」提示行一次都不打印 → 断言随机变红。
+        IFS= read -rsn1 -t "${TUI_DIGIT_TIMEOUT:-0.35}" more || more=''
+```
+
+**P5 —— `test/helpers/menu_tty.sh`：把两个超时放大到 2 秒**
+
+- 目标文件：`test/helpers/menu_tty.sh`
+
+- 改前：
+
+```text
+# 必须在 tui_init 之后覆盖：tui_init 会按真实 TTY 把 TUI_TTY 置 0
+TUI_TTY=1
+```
+
+- 改后：
+
+```text
+# 必须在 tui_init 之后覆盖：tui_init 会按真实 TTY 把 TUI_TTY 置 0
+TUI_TTY=1
+# 把 lib/tui.sh 的两个按键读取超时放大到 2 秒：
+# 默认的 0.2 / 0.35 秒是【墙钟截止点】→ 机器繁忙时会把方向键读丢、
+# 把两位数输入截断 → 这些断言在 CI（共享 runner）上会【随机变红】。
+# 放大窗口不改变被测逻辑，只把「时序运气」从测试里拿掉。
+export TUI_KEY_TIMEOUT=2
+export TUI_DIGIT_TIMEOUT=2
+```
+
+
+#### 修订轮 1 的验收标准
+
+1. `build.sh` 的内容与下面 **Step 3 代码块逐字节一致**（新建文件）。
+2. `test/unit.sh` 里 Task 12 的插入段与上面 **Step 1 代码块逐字节一致**
+   （追加在 `test_summary` **之前**）。
+3. **五处定点修订**（P1 / P2 / P3 / P4 / P5）与上面写的**改后**文本逐字一致；
+   每处的**旧文本在改后文件里必须命中 0 次**、**新文本命中 1 次**。
+   **除这五处外，Task 8 / Task 2 / Task 2 的 Step 3 块一字未动**
+   （`install.sh` 与 `lib/tui.sh` 因此不再与计划里对应任务的块逐字节一致 ——
+   补偿方式就是这五条可机械核对的精确文本替换）。
+4. `build.sh` / `dist/install.sh` / `install.sh` 的提交模式是 **100755**：
+   `git ls-files -s build.sh dist/install.sh install.sh` 必须显示 `100755`。
+   ⚠️ **这一条是 CI 能不能过的关键**（见 T12-4）。
+5. `bash test/unit.sh` 全部通过、退出码 0。
+6. 断言总数必须恒定，且**连跑 4 次条数相同**。
+   ⚠️ **平台差是【三个数】**（构成见 Global Constraints）：
+   本机（Windows + MSYS）**718**、Debian **以 root 运行** **723**、
+   Debian **以非 root 运行** **725**（= GitHub Actions runner 的身份）。
+   （底座 **690** + Task 12 修订轮 1 的 **28**）
+   报告里必须写明「哪个平台 **+ 以什么身份运行**」。
+   ⚠️ 本轮**没有**新增平台相关断言（无 `stat -c '%a'`、无 `chmod 000` 的 `! -r`）
+   → 三个数与底座**同增同减**（各 +28）。
+   ⚠️ **「调用点」与「执行数」必须写清**：本轮 Task 12 段源码里有 **28** 个
+   `assert_*` 调用点，**全部执行**（本轮**没有任何条件块**）。
+7. **产物核验**（这四条是 Task 12 真正的产品断言）：
+   - `bash build.sh` 退出码 0，且输出含「已生成」；
+   - `dist/install.sh` **自包含**：`grep -c 'source.*lib/'` 为 **0**；
+   - `dist/install.sh` 里 `^set -uo pipefail$` **恰好 1 条**；
+   - `bash -n dist/install.sh` 退出码 0，且 `bash dist/install.sh --help` 退出码 0、
+     输出含「用法」。
+8. 红灯证据（**20 条变异**，每条都要贴出**变红的断言原文**）：
+   - A1 把 build.sh 的 `VERSION` 提取改回 `| head -1`
+     → 「build.sh 不用提前退出的管道（head -1）」必须变红；
+   - A2 去掉 build.sh 的 `chmod +x`
+     → 「build.sh 把产物设为可执行」必须变红；
+   - A3 让产物里出现 **两条** `set -uo pipefail`
+     → 「单文件产物里恰好一条 set -uo pipefail」必须变红；
+   - A4 让产物里 **没有** `set -uo pipefail`
+     → 同上必须变红；
+   - A5 让产物里残留 `source "$ROOT_DIR/lib/…"`
+     → 「单文件产物不引用外部 lib/ 路径」必须变红；
+   - A6 删掉产物头部定义的 `ROOT_DIR`
+     → 「单文件产物自己定义 ROOT_DIR」必须变红；
+   - A7 让产物里残留 `# shellcheck source=lib/…`
+     → 「单文件产物里没有 shellcheck source 注释」必须变红；
+   - A8 让产物里 **没有** `lib/client.sh`（跳过该文件）
+     → 「单文件产物包含分享链接生成」必须变红；
+   - A9 让产物里 **没有** `lib/deploy.sh`（跳过该文件）
+     → 「单文件产物包含配置渲染」必须变红；
+   - A10 让产物里 **没有** `lib/tui.sh`（跳过该文件）
+     → 「单文件产物包含 TUI 实现」必须变红；
+   - A11 把 install.sh 的用法注释改回 `sudo ./install.sh`
+     → 「install.sh 的用法文案不写 sudo ./install.sh」必须变红；
+   - A12 把 install.sh 里 **全部 6 处** `sudo bash install.sh` 改成别的说法
+     （改一处**不够**：剩下 5 处仍满足 `assert_contains` → 那条断言不会红）
+     → 「install.sh 的用法文案写 sudo bash install.sh」必须变红；
+   - A13 把 `lib/tui.sh` 的方向键超时改回 `-t 0.2`
+     → 「lib/tui.sh 的方向键超时可被环境变量覆盖」必须变红；
+   - A14 把 `lib/tui.sh` 的数字键超时改回 `-t 0.35`
+     → 「lib/tui.sh 的数字键超时可被环境变量覆盖」必须变红；
+   - A15 去掉 `menu_tty.sh` 的 `TUI_KEY_TIMEOUT`
+     → 「菜单测试 helper 放大了方向键超时」必须变红；
+   - A16 去掉 `menu_tty.sh` 的 `TUI_DIGIT_TIMEOUT`
+     → 「菜单测试 helper 放大了数字键超时」必须变红；
+   - A17 从 `.shellcheckrc` 去掉 SC1090
+     → 「shellcheck 豁免运行时 source（SC1090）」必须变红；
+   - A18 从 CI 里去掉 shellcheck 步骤
+     → 「CI 跑 ShellCheck」必须变红；
+   - A19 从 CI 里去掉 `git diff --exit-code`
+     → 「CI 用 git diff 判定产物是否脱节」必须变红；
+   - A20 让 `build.sh` 以非零码退出
+     → 「build.sh 执行成功」必须变红。
+   > ⚠️ **三条断言的判据是「代码级」的，不是字面量查找**（见 T12-12 / T12-13）：
+   > 「build.sh 不用提前退出的管道（head -1）」看的是**代码行**里有没有 `| head`
+   > （build.sh 自己的注释里就写着 `head -1` 字面量）；
+   > 「单文件产物包含分享链接生成」看的是 **client.sh 独有**的 `render_client_config`
+   > （`build_share_link` 在 lib/deploy.sh 里也有调用点 → 区分不出来）。
+9. ⚠️ **变异矩阵的纪律**：
+   - 变异串必须与被测文件的**实际文本逐字一致**，**命中次数 != 1 直接报错**（不静默跳过）；
+   - 每条变异跑出来的**断言总数必须仍等于基线**（证明探针健康）；
+   - 变红的断言**原文**必须与上面点名的**逐字对上**；
+   - 变异只在**沙箱副本**里做，**仓库工作区全程不被变异**。
+10. 未验证项必须**如实报告**，不得当作已验证：
+    - **GitHub Actions 上 CI 到底跑不跑得过**：本机没有 runner，
+      「`dist/install.sh` 必须是 100755」这条是**机制层面**的论证
+      （core.fileMode=true 时索引与工作区模式不一致必被 `git diff` 报出来，已实测），
+      **不是**在真实 runner 上跑出来的；
+    - **ShellCheck 本机没装** → `.shellcheckrc` 的豁免清单**未经真实 shellcheck 验证**；
+    - **真实 Debian 上的端到端部署**未验证。
 
 ---
 
