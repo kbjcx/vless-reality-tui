@@ -563,15 +563,29 @@ printf '' | bash "$ROOT/test/helpers/menu_tty.sh" "选择" "A" "B" "C" >/dev/nul
 assert_status 255 "$rc" "EOF 必须取消(255)"
 
 # 缓冲区提示行只能打印一次（printf 格式串 %s 个数必须等于实参个数）
-out=$(printf '1' | bash "$ROOT/test/helpers/menu_tty.sh" "选择" "A" "B" "C")
+# 必须用两位数 + 回车：单数字在 0.35s 窗口后立即选中，菜单只重绘一次且缓冲区
+# 始终为空 → 根本不会渲染提示行，计数恒 0，发现不了「打印两遍」这个 bug。
+# 两位数才会进入缓冲区并重绘一次提示行（旧代码这里会打印 2 遍）。
+out=$(printf '10\n' | bash "$ROOT/test/helpers/menu_tty.sh" "选择" "A" "B" "C")
 assert_eq "1" "$(printf '%s\n' "$out" | grep -c '编号')" "缓冲区提示行只打印一次"
 
 # 方向键下移后回车 → 选中第 2 项（索引 1）
 out=$( { printf '\033[B'; sleep 0.3; printf '\n'; } | bash "$ROOT/test/helpers/menu_tty.sh" "选择" "A" "B" "C" ); rc=$?
 assert_status 1 "$rc" "方向键下移后回车选中第 2 项(索引 1)"
 
-# 多位数：>=10 项时输入 10 应选中第 10 项（索引 9）
-out=$(printf '10' | bash "$ROOT/test/helpers/menu_tty.sh" "选择" 1 2 3 4 5 6 7 8 9 10 11); rc=$?
+# 方向键与回车【一次性写入】：方向键只剩 2 字节，-n2 正好读完，
+# 紧跟的回车不能被当成方向键序列的第 3 字节吞掉（-n3 会吞掉）
+out=$(printf '\033[B\n' | bash "$ROOT/test/helpers/menu_tty.sh" "选择" "A" "B" "C"); rc=$?
+assert_status 1 "$rc" "方向键后紧跟的回车不被方向键序列吞掉"
+
+# 方向键之后的数字键：-n3 会把 "2" 吞进方向键序列（方向键不生效且 "2" 丢失
+# → 选中第 1 项）；-n2 下 "2" 被当作数字直选 → 选中第 2 项(索引 1)
+out=$(printf '\033[B2\n' | bash "$ROOT/test/helpers/menu_tty.sh" "选择" "A" "B" "C"); rc=$?
+assert_status 1 "$rc" "方向键之后的数字键不被方向键序列吞掉"
+
+# 多位数：>=10 项时输入 10 并回车应选中第 10 项（索引 9）
+# 必须带回车：EOF 现在按 I2 判定为「取消」(255)，不是「确认」
+out=$(printf '10\n' | bash "$ROOT/test/helpers/menu_tty.sh" "选择" 1 2 3 4 5 6 7 8 9 10 11); rc=$?
 assert_status 9 "$rc" "多位数 10 选中第 10 项(索引 9)"
 
 # 直接按 q → 取消
