@@ -1,27 +1,18 @@
 #!/usr/bin/env bash
-# shellcheck shell=bash
-#
 # lib/core.sh — 环境探测与通用能力
-#
-# 提供：系统检测、公网 IP 探测、端口检查、随机密钥、状态持久化、
-#       URL 编码、软件包安装、路径常量等。
-
-# ─────────────────────────────────────────────────────────────
-# 路径常量
-# ─────────────────────────────────────────────────────────────
+# 本文件只放【纯函数】与【状态持久化】；网络探测类函数属于 Task 4。
 
 APP_NAME='VLESS + REALITY 部署工具'
-APP_VERSION='1.2.0'
+APP_VERSION='1.0.0'
 
 LIB_DIR="${LIB_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
 STATE_DIR="${STATE_DIR:-/etc/vless-reality}"
-STATE_FILE="$STATE_DIR/deploy.env"
+STATE_FILE="${STATE_FILE:-$STATE_DIR/deploy.env}"
 OUT_DIR="${OUT_DIR:-/root/vless-reality}"
 XRAY_BIN="${XRAY_BIN:-/usr/local/bin/xray}"
 XRAY_CONFIG="${XRAY_CONFIG:-/usr/local/etc/xray/config.json}"
 LOG_DIR="${LOG_DIR:-/var/log/xray}"
 
-# REALITY 伪装目标候选（要求支持 TLS 1.3 + H2，且与本机不同 ASN 效果更好）
 REALITY_TARGETS=(
   'www.microsoft.com'
   'dl.google.com'
@@ -32,10 +23,6 @@ REALITY_TARGETS=(
   'addons.mozilla.org'
 )
 
-# ─────────────────────────────────────────────────────────────
-# 通用工具
-# ─────────────────────────────────────────────────────────────
-
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 trim() {
@@ -45,60 +32,56 @@ trim() {
   printf '%s' "$s"
 }
 
-# URL 编码（优先用 python3，退化到 bash 实现）
 urlencode() {
   local s="$1"
   if have_cmd python3; then
     python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "$s" 2>/dev/null && return 0
   fi
-  local out='' i c
-  for ((i = 0; i < ${#s}; i++)); do
+  # 回退实现：必须按【字节】遍历，否则多字节字符只会编码首字节。
+  # local LC_ALL=C 让 ${#s} 与 ${s:i:1} 都按字节切分。
+  local out='' i c len
+  local LC_ALL=C
+  len=${#s}
+  for ((i = 0; i < len; i++)); do
     c=${s:$i:1}
     case "$c" in
       [a-zA-Z0-9.~_-]) out+="$c" ;;
-      *) out+=$(LC_ALL=C printf '%%%02X' "'$c") ;;
+      # 偏离说明（见 task-3-report.md）：brief 的写法统一用 printf '%%%02X' "'$c" 取字节值。
+      # 该形式依赖 bash 对「以 ' 开头的字符常量」的解释，实测 bash 5.3 能正确处理
+      # '' (39) 与 '\' (92)，但这属于未文档化的实现细节，bash 4.2 未必一致。
+      # 这里把这两个字节的数值写死，保证任意 bash 4.2+ 上结果一致（其余字节走原写法）。
+      "'")  out+='%27' ;;
+      '\')  out+='%5C' ;;
+      *) out+=$(printf '%%%02X' "'$c") ;;
     esac
   done
   printf '%s' "$out"
 }
 
-# 随机十六进制字符串（n 字节）
 random_hex() {
   local n="${1:-8}"
   if have_cmd openssl; then
-    openssl rand -hex "$n" 2>/dev/null | tr -d '\n'
-    return 0
+    # 偏离说明（见 task-3-report.md）：brief 写的是 tr -d '\n'，但只删 LF 不删 CR ——
+    # 某些 openssl 构建（含本开发机的 MSYS2 版本）输出的是 \r\n，
+    # 残留的 \r 会混进 SHORT_ID / 密钥，随后被原样写进 config.json
+    # （JSON 字符串里不允许裸控制字符）→ 直接让部署失败。
+    # Debian 自带的 openssl 只输出 \n，此处多删一个 \r 对其无影响。
+    openssl rand -hex "$n" 2>/dev/null | tr -d '\r\n'; return 0
   fi
-  od -An -tx1 -N "$n" /dev/urandom 2>/dev/null | tr -d ' \n'
+  od -An -tx1 -N "$n" /dev/urandom 2>/dev/null | tr -d ' \r\n'
 }
 
-# 读取文件并 trim（兼容无尾换行）
 read_file() {
   local f="$1"
   [[ -f "$f" ]] || return 1
-  local c
-  c=$(cat "$f" 2>/dev/null)
-  trim "$c"
+  trim "$(cat "$f" 2>/dev/null)"
 }
 
-# ─────────────────────────────────────────────────────────────
-# 系统检测
-# ─────────────────────────────────────────────────────────────
-
-require_root() {
-  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
-    tui_err "本操作需要 root 权限，请使用 sudo 重新执行。"
-    exit 1
-  fi
-}
-
-# 输出一行键值，供调用方 eval 或直接阅读
 detect_os() {
-  local id='' ver='' arch=''
-  if [[ -r /etc/os-release ]]; then
-    # shellcheck disable=SC1091
-    id=$(. /etc/os-release; printf '%s' "${ID:-}")
-    ver=$(. /etc/os-release; printf '%s' "${VERSION_ID:-}")
+  local os_release="${1:-/etc/os-release}" id='' ver='' arch=''
+  if [[ -r "$os_release" ]]; then
+    id=$(. "$os_release"; printf '%s' "${ID:-}")
+    ver=$(. "$os_release"; printf '%s' "${VERSION_ID:-}")
   fi
   case "$(uname -m)" in
     x86_64|amd64)  arch='amd64' ;;
@@ -111,141 +94,53 @@ detect_os() {
 }
 
 assert_debian() {
-  local id ver arch
-  IFS='|' read -r id ver arch <<<"$(detect_os)"
+  local id ver
+  IFS='|' read -r id ver _ <<<"$(detect_os)"
   if [[ "$id" != "debian" && "$id" != "raspbian" && "$id" != "ubuntu" ]]; then
     tui_err "当前系统为 ${id:-未知} ${ver:-}，本工具以 Debian 为目标系统。"
     tui_tip "Ubuntu 与 Debian 同源，一般可直接使用；其它发行版请自行核对 systemd 与防火墙差异。"
     return 1
   fi
-  tui_ok "系统检测：$id $ver ($arch)"
+  tui_ok "系统检测：$id $ver"
   return 0
 }
 
-# Debian 12+ 才有 nftables 默认规则集，这里只做提示
-is_modern_debian() {
-  local ver
-  ver=$(detect_os | cut -d'|' -f2)
-  [[ "$ver" =~ ^[0-9]+$ ]] && (( ver >= 12 ))
-}
-
-# ─────────────────────────────────────────────────────────────
-# 网络探测
-# ─────────────────────────────────────────────────────────────
-
-# 探测公网 IPv4/IPv6
-detect_public_ip() {
-  local ip
-  local urls=(
-    'https://api.ipify.org'
-    'https://ifconfig.me/ip'
-    'https://icanhazip.com'
-    'https://ipinfo.io/ip'
-    'https://myip.ipip.net'
-  )
-  for u in "${urls[@]}"; do
-    ip=$(curl -fsS --max-time 8 "$u" 2>/dev/null | tr -d '[:space:]')
-    if [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || "$ip" =~ ^[0-9a-fA-F:]+$ ]]; then
-      printf '%s' "$ip"
-      return 0
-    fi
+# 校验 SNI：必须是纯 DNS 主机名。
+# SNI 会【原样】进入服务端 config.json、客户端 client.json 与分享链接，
+# 不校验等于把用户输入直接拼进 JSON —— 引号/反斜杠会让 JSON 失效
+# （虽不会写坏已有配置：写入恒为「临时文件 → xray run -test → 原子替换」），
+# 但会直接让部署失败。因此在【输入口】拦住，而不是在渲染口做转义。
+validate_hostname() {
+  local host="$1" label len
+  [[ -n "$host" ]] || return 1
+  [[ ${#host} -le 253 ]] || return 1
+  [[ "$host" != *[[:space:]]* ]] || return 1
+  [[ "$host" != *'"'* ]] || return 1
+  [[ "$host" != *'\'* ]] || return 1
+  [[ "$host" == *.* ]] || return 1
+  # 尾点形式（"com."）在 DNS 里合法，但 SNI 永远不带尾点，
+  # 且会被原样写进 config.json 的 "target" → 必须拒绝。
+  if [[ "$host" == *. ]]; then return 1; fi
+  local -a labels
+  IFS='.' read -r -a labels <<<"$host"
+  ((${#labels[@]} > 0)) || return 1
+  for label in "${labels[@]}"; do
+    len=${#label}
+    [[ $len -ge 1 && $len -le 63 ]] || return 1
+    [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
   done
-  return 1
+  return 0
 }
 
-# 探测本机主 IP（用于挑选内网/出口地址）
-detect_local_ip() {
-  local ip
-  ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
-  [[ -z "$ip" ]] && ip=$(hostname -I 2>/dev/null | awk '{print $1}')
-  printf '%s' "$ip"
+# 把任意文本转成可被 shell 安全求值的单引号字面量。
+# 状态文件会被 load_state 用 `.`（source）引入执行，而 REMARK / SNI 来自
+# 用户输入（--name / --sni），不转义等于让其中的 $(...) / 反引号在下次
+# 读取状态时被执行。单引号包裹 + 内部单引号转义为 '\'' 是 POSIX 标准做法；
+# 换行也能安全保留（bash 的单引号字符串允许跨行）。
+state_quote() {
+  local v="$1"
+  printf "'%s'" "${v//\'/\'\\\'\'}"
 }
-
-# 端口是否已被占用
-port_in_use() {
-  local port="$1"
-  if have_cmd ss; then
-    ss -ltn "sport = :$port" 2>/dev/null | grep -q ":$port" && return 0
-    return 1
-  fi
-  if have_cmd netstat; then
-    netstat -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$port\$" && return 0
-    return 1
-  fi
-  return 1
-}
-
-# 找出占用该端口的服务名（若有）
-port_occupant() {
-  local port="$1"
-  if have_cmd ss; then
-    ss -ltnp "sport = :$port" 2>/dev/null | awk 'NR>1{print $NF}' | head -1
-    return 0
-  fi
-  printf ''
-}
-
-# 随机挑一个空闲高位端口
-random_free_port() {
-  local p
-  for _ in $(seq 1 40); do
-    p=$(( ( RANDOM % 20000 ) + 20000 ))
-    if ! port_in_use "$p"; then printf '%s' "$p"; return 0; fi
-  done
-  printf '%s' 44321
-}
-
-# 目标站点是否支持 TLS 1.3
-target_supports_tls13() {
-  local host="$1"
-  have_cmd openssl || return 1
-  local out
-  out=$(timeout 12 openssl s_client -connect "${host}:443" -servername "$host" -tls1_3 </dev/null 2>&1)
-  grep -qE 'TLSv1\.3|Cipher is (TLS_AES|TLS_CHACHA)' <<<"$out"
-}
-
-# 目标站点连通延迟（毫秒）
-target_latency_ms() {
-  local host="$1"
-  have_cmd curl || { printf '?'; return 0; }
-  local t
-  t=$(curl -o /dev/null -sS --max-time 10 -w '%{time_connect}' "https://${host}/" 2>/dev/null)
-  if [[ -z "$t" || "$t" == '0' || "$t" == '0.000000' ]]; then
-    printf '?'
-  else
-    awk -v t="$t" 'BEGIN{printf "%d", t*1000}'
-  fi
-}
-
-# ─────────────────────────────────────────────────────────────
-# 软件包
-# ─────────────────────────────────────────────────────────────
-
-apt_update_once() {
-  [[ -f /var/lib/vless-reality/apt-updated ]] && return 0
-  tui_run "更新软件源索引 (apt update)" apt-get update -y -o Acquire::Retries=3
-  if [[ $? -eq 0 ]]; then
-    mkdir -p /var/lib/vless-reality
-    touch /var/lib/vless-reality/apt-updated
-  fi
-}
-
-# ensure_packages pkg...
-ensure_packages() {
-  local missing=()
-  local p
-  for p in "$@"; do
-    have_cmd "$p" || missing+=("$p")
-  done
-  ((${#missing[@]} == 0)) && return 0
-
-  apt_update_once
-  tui_run "安装依赖：${missing[*]}" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
-}
-
-# ─────────────────────────────────────────────────────────────
-# 状态持久化
-# ─────────────────────────────────────────────────────────────
 
 save_state() {
   mkdir -p "$STATE_DIR"
@@ -253,19 +148,19 @@ save_state() {
   local tmp="$STATE_FILE.tmp"
   {
     printf '# %s v%s 部署状态（勿手工编辑）\n' "$APP_NAME" "$APP_VERSION"
-    printf 'DEPLOYED_AT=%s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')"
-    printf 'MODE=%s\n' "${MODE:-native}"
-    printf 'PORT=%s\n' "${PORT:-}"
-    printf 'UUID=%s\n' "${UUID:-}"
-    printf 'SNI=%s\n' "${SNI:-}"
-    printf 'TARGET=%s\n' "${TARGET:-}"
-    printf 'PRIVATE_KEY=%s\n' "${PRIVATE_KEY:-}"
-    printf 'PUBLIC_KEY=%s\n' "${PUBLIC_KEY:-}"
-    printf 'SHORT_ID=%s\n' "${SHORT_ID:-}"
-    printf 'SERVER_IP=%s\n' "${SERVER_IP:-}"
-    printf 'REMARK=%s\n' "${REMARK:-}"
-    printf 'FLOW=%s\n' "${FLOW:-xtls-rprx-vision}"
-    printf 'FINGERPRINT=%s\n' "${FINGERPRINT:-chrome}"
+    printf 'DEPLOYED_AT=%s\n' "$(state_quote "$(date '+%Y-%m-%d %H:%M:%S %Z')")"
+    printf 'MODE=%s\n' "$(state_quote "${MODE:-native}")"
+    printf 'PORT=%s\n' "$(state_quote "${PORT:-}")"
+    printf 'UUID=%s\n' "$(state_quote "${UUID:-}")"
+    printf 'SNI=%s\n' "$(state_quote "${SNI:-}")"
+    printf 'TARGET=%s\n' "$(state_quote "${TARGET:-}")"
+    printf 'PRIVATE_KEY=%s\n' "$(state_quote "${PRIVATE_KEY:-}")"
+    printf 'PUBLIC_KEY=%s\n' "$(state_quote "${PUBLIC_KEY:-}")"
+    printf 'SHORT_ID=%s\n' "$(state_quote "${SHORT_ID:-}")"
+    printf 'SERVER_IP=%s\n' "$(state_quote "${SERVER_IP:-}")"
+    printf 'REMARK=%s\n' "$(state_quote "${REMARK:-}")"
+    printf 'FLOW=%s\n' "$(state_quote "${FLOW:-xtls-rprx-vision}")"
+    printf 'FINGERPRINT=%s\n' "$(state_quote "${FINGERPRINT:-chrome}")"
   } >"$tmp"
   chmod 600 "$tmp"
   mv -f "$tmp" "$STATE_FILE"
@@ -280,15 +175,3 @@ load_state() {
 }
 
 state_exists() { [[ -f "$STATE_FILE" ]]; }
-
-# ─────────────────────────────────────────────────────────────
-# systemd
-# ─────────────────────────────────────────────────────────────
-
-# 读取服务运行用户（用于日志目录授权）
-service_run_user() {
-  local u
-  u=$(systemctl show xray -p User --value 2>/dev/null || printf '')
-  [[ -z "$u" || "$u" == '0' ]] && u='root'
-  printf '%s' "$u"
-}

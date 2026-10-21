@@ -7,6 +7,8 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/test/lib.sh"
 # shellcheck source=lib/tui.sh
 source "$ROOT/lib/tui.sh"
+# shellcheck source=lib/core.sh
+source "$ROOT/lib/core.sh"
 
 test_case "TUI 文本宽度与补白"
 
@@ -231,5 +233,205 @@ out=$(mktemp() { return 1; }; tui_run "回落可用" bash -c 'echo captured-ok; 
 rm -f "/tmp/.tui.$$" 2>/dev/null
 assert_status 3 "$rc" "mktemp 失败时命令仍被执行并透传退出码"
 assert_contains "$out" "captured-ok" "mktemp 失败时仍能捕获命令输出"
+
+test_case "core 纯函数"
+
+# ── have_cmd ────────────────────────────────────────────────
+assert_succeeds "have_cmd 对已存在的命令返回 0" have_cmd cat
+assert_fails    "have_cmd 对不存在的命令返回非 0" have_cmd no_such_cmd_zzz_123
+
+# ── trim ───────────────────────────────────────────────────
+assert_eq "hello world" "$(trim '  hello world  ')" "trim 去除首尾空白"
+assert_eq "hello" "$(trim $'\t hello \n')" "trim 去除制表符与换行"
+assert_eq "" "$(trim '   ')" "trim 全空白串 → 空串"
+assert_eq "a b" "$(trim '  a b  ')" "trim 只动首尾，不动内部空格"
+
+# ── urlencode ──────────────────────────────────────────────
+assert_eq "a%20b" "$(urlencode 'a b')" "urlencode 编码空格"
+assert_eq "%E4%B8%AD%E6%96%87" "$(urlencode '中文')" "urlencode 编码中文（必须按字节）"
+assert_eq "abc-123" "$(urlencode 'abc-123')" "urlencode 保留安全字符（连字符不编码）"
+assert_eq "abc123" "$(urlencode 'abc123')" "urlencode 保留字母与数字"
+assert_eq "a%27b" "$(urlencode "a'b")" "urlencode 编码单引号"
+assert_eq "a%5Cb" "$(urlencode 'a\b')" "urlencode 编码反斜杠"
+
+# python3 可用时必须优先走 python3 分支：用假 python3 探针验证【分支选择】
+# （本机 python3 是 Windows Store 占位符，恒失败，因此必须靠探针才能验证这条）
+out=$( python3() { printf 'FAKE-PY'; }; urlencode 'a b' )
+assert_eq "FAKE-PY" "$out" "urlencode 在 python3 可用时优先走 python3 分支"
+
+# 无 python3 时必须回退到纯 bash 实现，且结果与 python3 一致
+out=$( have_cmd() { return 1; }; urlencode 'a b' )
+assert_eq "a%20b" "$out" "urlencode 回退实现把空格编码为 %20"
+out=$( have_cmd() { return 1; }; urlencode '中文' )
+assert_eq "%E4%B8%AD%E6%96%87" "$out" "urlencode 回退实现按字节编码中文"
+out=$( have_cmd() { return 1; }; urlencode "a'b" )
+assert_eq "a%27b" "$out" "urlencode 回退实现把单引号编码为 %27"
+out=$( have_cmd() { return 1; }; urlencode 'a\b' )
+assert_eq "a%5Cb" "$out" "urlencode 回退实现把反斜杠编码为 %5C"
+
+# ── random_hex ─────────────────────────────────────────────
+assert_match_hex() {
+  local v="$1"
+  if [[ "$v" =~ ^[0-9a-f]+$ ]]; then assert_eq 0 0 "random_hex 输出为小写十六进制"; else assert_eq 0 1 "random_hex 输出为小写十六进制"; fi
+}
+assert_eq "16" "$(printf '%s' "$(random_hex 8)" | wc -c | tr -d ' ')" "random_hex 8 字节 = 16 个十六进制字符"
+assert_eq "8" "$(printf '%s' "$(random_hex 4)" | wc -c | tr -d ' ')" "random_hex 4 字节 = 8 个十六进制字符"
+assert_match_hex "$(random_hex 4)"
+# 无 openssl 时回退到 od
+out=$( have_cmd() { return 1; }; random_hex 8 )
+assert_eq "16" "$(printf '%s' "$out" | wc -c | tr -d ' ')" "random_hex 回退实现长度正确"
+assert_match_hex "$out"
+
+# ── read_file ──────────────────────────────────────────────
+rf=$(mktemp)
+printf '  hello world  \n' >"$rf"
+assert_eq "hello world" "$(read_file "$rf")" "read_file 读取并 trim 内容"
+printf 'no-newline-at-eof' >"$rf"
+assert_eq "no-newline-at-eof" "$(read_file "$rf")" "read_file 兼容无尾换行"
+rm -f "$rf"
+assert_fails "read_file 对不存在的文件返回非 0" read_file "$rf"
+
+# ── detect_os ─────────────────────────────────────────────
+# 必须能解析传入的 os-release 路径（默认 /etc/os-release 只是取值来源）
+fake_os=$(mktemp)
+cat >"$fake_os" <<'EOF'
+ID=debian
+VERSION_ID="12"
+EOF
+os_out=$(detect_os "$fake_os")
+assert_contains "$os_out" "debian|12|" "detect_os 解析 id|version|arch"
+assert_eq "3" "$(printf '%s' "$os_out" | awk -F'|' '{print NF}')" "detect_os 输出恰好三段"
+fake_os2=$(mktemp)
+printf 'NAME="Nothing"\n' >"$fake_os2"
+os_out2=$(detect_os "$fake_os2")
+# cut -f1,2 只输出被选中的字段（两个空字段之间只隔【一个】分隔符），
+# 所以这里按字段分别断言，失败时能直接看出是 ID 还是 VERSION_ID 没留空
+assert_eq "" "$(printf '%s' "$os_out2" | cut -d'|' -f1)" "detect_os 缺少 ID 时 id 字段留空"
+assert_eq "" "$(printf '%s' "$os_out2" | cut -d'|' -f2)" "detect_os 缺少 VERSION_ID 时 version 字段留空"
+rm -f "$fake_os" "$fake_os2"
+
+# ── assert_debian ─────────────────────────────────────────
+# 用覆盖 detect_os 的方式做【确定性】断言，不依赖开发机真实系统
+out=$( ( detect_os() { printf 'centos|7|amd64'; }; assert_debian ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "assert_debian 对非 Debian 系返回非 0"
+assert_contains "$out" "Debian" "assert_debian 对非 Debian 系给出提示"
+out=$( ( detect_os() { printf 'debian|12|amd64'; }; assert_debian ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "assert_debian 对 Debian 系返回 0"
+assert_contains "$out" "debian" "assert_debian 对 Debian 系输出检测结果"
+
+test_case "core SNI 主机名校验"
+
+# validate_hostname：SNI 会原样进入服务端/客户端 config.json 与分享链接，
+# 必须是纯 DNS 主机名，不允许引号、反斜杠、空白等会破坏 JSON 的字符。
+assert_succeeds "合法主机名 www.microsoft.com"  validate_hostname "www.microsoft.com"
+assert_succeeds "合法主机名 a-b.example.com"   validate_hostname "a-b.example.com"
+assert_fails    "空串不是合法主机名"            validate_hostname ""
+assert_fails    "无点号的单标签主机名不合法"     validate_hostname "localhost"
+assert_fails    "含双引号（会破坏 JSON）"        validate_hostname 'a"b.com'
+assert_fails    "含反斜杠（会破坏 JSON）"        validate_hostname 'a\b.com'
+assert_fails    "含空格"                        validate_hostname "a b.com"
+assert_fails    "含反斜杠命令替换"              validate_hostname 'a$(id).com'
+assert_fails    "标签以连字符开头"               validate_hostname "-a.com"
+assert_fails    "标签以连字符结尾"               validate_hostname "a-.com"
+assert_fails    "尾点形式（SNI 不带尾点）"        validate_hostname "com."
+
+# 追加的失败路径（每条都能单独把实现写错时的绿灯打红）
+assert_fails    "空标签（连续两个点）"            validate_hostname "a..b.com"
+assert_fails    "前导点"                        validate_hostname ".example.com"
+assert_fails    "含下划线（主机名标签不允许）"     validate_hostname "a_b.com"
+assert_succeeds "数字与全大写标签合法"            validate_hostname "Example-123.COM"
+
+# 长度边界：标签 ≤63、总长 ≤253
+l63="$(printf 'a%.0s' $(seq 1 63))"
+l61="$(printf 'b%.0s' $(seq 1 61))"
+assert_fails    "标签超长（64 字符）"            validate_hostname "${l63}a.com"
+assert_succeeds "标签恰好 63 字符合法"           validate_hostname "${l63}.com"
+assert_succeeds "总长恰好 253 字符合法"          validate_hostname "$l63.$l63.$l63.$l61"
+assert_fails    "总长 259 字符超限"             validate_hostname "$l63.$l63.$l63.$l63.com"
+
+test_case "core 状态持久化"
+
+# state_quote：状态文件会被 load_state 用 `.`（source）引入执行，
+# 写入的值必须是可被 shell 安全求值的单引号字面量。
+assert_eq "'443'"     "$(state_quote 443)"      "state_quote 产出单引号字面量"
+assert_eq "''"       "$(state_quote '')"        "state_quote 空值产出空字面量"
+assert_eq "'a'\''b'" "$(state_quote "a'b")"     "state_quote 转义内部单引号"
+assert_eq "'\$(id)'" "$(state_quote '$(id)')"   "state_quote 不让命令替换在字面量内生效"
+
+# state_quote 的产物必须能被 shell 安全求值：求值后逐字节等于原值
+sq_v=$'a b\'c$(id)`id`'
+sq_q="$(state_quote "$sq_v")"
+sq_back="$(eval "printf '%s' $sq_q")"
+assert_eq "$sq_v" "$sq_back" "state_quote 产物 eval 后逐字节还原"
+
+# save_state / load_state 往返：REMARK 来自用户输入（--name），
+# 写入后再读回必须逐字节一致，且其中的 $(...) 不得在读取时被执行。
+t_dir=$(mktemp -d)
+t_state="$t_dir/deploy.env"
+( STATE_DIR="$t_dir"; STATE_FILE="$t_state"; PORT=8443
+  REMARK='$(touch '"$t_dir"'/pwned)'; SNI="a'b"
+  save_state >/dev/null 2>&1 )
+back=$( ( STATE_FILE="$t_state"; REMARK=''; load_state >/dev/null 2>&1; printf '%s' "$REMARK" ) )
+assert_eq '$(touch '"$t_dir"'/pwned)' "$back" "load_state 读回的 REMARK 逐字节一致"
+assert_contains "$(cat "$t_state")" "REMARK='" "状态文件以单引号字面量保存 REMARK"
+[[ -e "$t_dir/pwned" ]]; rc=$?
+assert_false "$rc" "load_state 不得执行状态文件中的命令替换"
+
+# 全字段往返：每个字段都必须逐字节一致（含单引号与换行）
+( STATE_DIR="$t_dir"; STATE_FILE="$t_state"
+  MODE='native'; PORT=8443; UUID='u-1234'; SNI="a'b"; TARGET='www.microsoft.com'
+  PRIVATE_KEY='pk-abc'; PUBLIC_KEY='pub-xyz'; SHORT_ID='0123456789abcdef'
+  SERVER_IP='203.0.113.7'; REMARK=$'line1\nline2'; FLOW='xtls-rprx-vision'; FINGERPRINT='chrome'
+  save_state >/dev/null 2>&1 )
+back=$( ( STATE_FILE="$t_state"; load_state >/dev/null 2>&1
+  for k in MODE PORT UUID SNI TARGET PRIVATE_KEY PUBLIC_KEY SHORT_ID SERVER_IP REMARK FLOW FINGERPRINT; do
+    printf '%s=[%s]\n' "$k" "${!k}"
+  done ) )
+expected=$( printf 'MODE=[native]\nPORT=[8443]\nUUID=[u-1234]\nSNI=[%s]\nTARGET=[www.microsoft.com]\nPRIVATE_KEY=[pk-abc]\nPUBLIC_KEY=[pub-xyz]\nSHORT_ID=[0123456789abcdef]\nSERVER_IP=[203.0.113.7]\nREMARK=[%s]\nFLOW=[xtls-rprx-vision]\nFINGERPRINT=[chrome]\n' "a'b" $'line1\nline2' )
+assert_eq "$expected" "$back" "save_state/load_state 全字段往返逐字节一致"
+assert_contains "$(cat "$t_state")" "SNI='a'\''b'" "状态文件里的 SNI 以转义后的单引号字面量保存"
+assert_contains "$(cat "$t_state")" "DEPLOYED_AT='" "状态文件记录部署时间且为单引号字面量"
+if [[ -e "$t_state.tmp" ]]; then tmp_left=1; else tmp_left=0; fi
+assert_eq "0" "$tmp_left" "save_state 完成后不残留 .tmp 临时文件"
+
+( STATE_FILE="$t_state"; state_exists ); rc=$?
+assert_status 0 "$rc" "state_exists 对已存在的状态文件返回 0"
+( STATE_FILE="$t_dir/nope.env"; state_exists ); rc=$?
+assert_status 1 "$rc" "state_exists 对不存在的状态文件返回非 0"
+( STATE_FILE="$t_dir/nope.env"; load_state >/dev/null 2>&1 ); rc=$?
+assert_status 1 "$rc" "load_state 对不存在的状态文件返回非 0"
+rm -rf "$t_dir"
+
+test_case "core 常量与文件边界"
+
+assert_eq "1.0.0" "$APP_VERSION" "core.sh 的 APP_VERSION 统一为 1.0.0"
+assert_eq "/etc/vless-reality" "$STATE_DIR" "STATE_DIR 默认值"
+assert_eq "/etc/vless-reality/deploy.env" "$STATE_FILE" "STATE_FILE 默认跟随 STATE_DIR"
+assert_eq "/root/vless-reality" "$OUT_DIR" "OUT_DIR 默认值（客户端导出目录）"
+
+# bash 4.2/4.3 在 set -u 下展开空数组会报 unbound variable —— 用安全写法
+if [[ "${#REALITY_TARGETS[@]}" -ge 5 ]]; then tgt_ok=1; else tgt_ok=0; fi
+assert_eq "1" "$tgt_ok" "REALITY_TARGETS 至少提供 5 个候选目标"
+bad_targets=''
+for t in ${REALITY_TARGETS[@]+"${REALITY_TARGETS[@]}"}; do
+  validate_hostname "$t" || bad_targets+="$t "
+done
+assert_eq "" "$bad_targets" "REALITY_TARGETS 全部是合法主机名"
+
+# lib/core.sh 必须语法正确（静态检查，防回归）
+bash -n "$ROOT/lib/core.sh"; rc=$?
+assert_status 0 "$rc" "lib/core.sh 通过 bash -n 语法检查"
+
+# 文件存在且非空 —— 下面两条 grep 类断言的前提守卫（否则会退化成真空通过）
+if [[ -s "$ROOT/lib/core.sh" ]]; then core_nonempty=1; else core_nonempty=0; fi
+assert_eq "1" "$core_nonempty" "lib/core.sh 存在且非空"
+core_src="$(cat "$ROOT/lib/core.sh")"
+assert_contains "$core_src" "chmod 600" "core.sh 对状态文件设置 600 权限"
+assert_contains "$core_src" "chmod 700" "core.sh 对状态目录设置 700 权限"
+
+# 简报 Step 3 的「一律不保留」清单：这些函数不属于 core.sh
+# （require_root 属于 install.sh；其余网络探测类属于 Task 4）
+offenders="$(grep -nE '^[[:space:]]*(function[[:space:]]+)?(require_root|is_modern_debian|detect_public_ip|detect_local_ip|port_in_use|port_occupant|random_free_port|target_supports_tls13|target_latency_ms|apt_update_once|ensure_packages|service_run_user)[[:space:]]*(\(\))?[[:space:]]*[{]' "$ROOT/lib/core.sh" | tr '\n' ' ')"
+assert_eq "" "$offenders" "core.sh 不含属于 install.sh / Task 4 的越权函数"
 
 test_summary
