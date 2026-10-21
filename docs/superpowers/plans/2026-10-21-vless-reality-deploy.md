@@ -3060,6 +3060,61 @@ git commit -m "feat(deploy): 密钥解析跨版本兼容与服务端配置渲染
   - `enable_bbr` → `0`/`1`
   - `service_status` → 打印状态
 
+#### 修订轮 1 的逐项发现与处置
+
+> 本节由**控制器**在 Task 6 派发前预扫（沙箱实证）之后写入。
+> 本节列的全是**计划缺陷**，责任方是控制器；Task 6 的代码块本身还没被实施过。
+>
+> 沙箱底座 = `git archive a44b094` 整棵树 + Task 5 / Task 6 两个代码块
+> → 基线 248 项断言全绿、rc=0（干净基线）。
+
+| # | 级别 | 发现 | 处置 |
+|---|---|---|---|
+| T6-1 | **Important** | Task 6 产出 **8 个函数，其中 5 个一条断言都没有**：`install_xray`、`xray_version`、`setup_systemd`、`restart_service`、`service_status`。控制器逐个掏空后实测：五个全部 **0 条红、248 项全绿**。而它们恰好是「真正动系统」的那几个 —— 装内核、拉起服务、重启服务、看状态。回归了没有任何断言会红 | Step 1 补 5 组 mock 断言：`xray_version` 输出版本串；`install_xray` 的「已安装 → 返回 0 且给出提示」与「下载失败 → 返回非零且不得谎报已安装」；`setup_systemd` 的「服务未运行 → 返回非零 + 输出 xray 原始日志」与「正常运行 → 返回 0」；`restart_service` 的成功 / 失败两条；`service_status` 的状态与端口输出 |
+| T6-2 | **Important** | 两处**条件块没有 else 侧说明** → 断言条数随机器状态漂移：① `if [[ ! -x "$XRAY_BIN" ]]` —— 真实 Debian 上装好 xray 后这条**整条消失**；② `if ! have_cmd ufw && ! have_cmd nft && ! have_cmd iptables` —— 真实 Debian 一定有 iptables 或 nft → 这条**整条消失**。两条都违反全局约束 | ① 改成 1 换 1 配对：未安装 → `assert_fails`，已安装 → `assert_succeeds`（**两个分支都有意义**）；② else 侧登记一条「已跳过（用例前提不成立）」说明 |
+| T6-3 | **Minor** | `open_firewall` 的 ufw 检测是 `ufw status 2>/dev/null \| grep -q 'Status: active'` —— **管道 + `grep -q`**，与 Task 4 的 F4-1 同一个坑：`grep -q` 命中即退出 → 上游 ufw 收到 SIGPIPE(141) → `set -o pipefail` 下整条管道退出码变 141 → 条件判假 → **ufw 明明是 active 也不会走 ufw 分支**，静默降级到 iptables / nft 分支。`ufw status` 输出通常很小 → 实际触发概率低，但模式本身是错的 | Step 3 改成与 F4-1 同一手法：先把整段输出收进 `ufw_status` 变量，再对变量做 `*"Status: active"*` 匹配（链路上无早退管道） |
+| T6-4 | **Minor** | `service_status` 里 `active=$(systemctl is-active xray 2>/dev/null \|\| printf 'unknown')` —— `systemctl is-active` 在服务**停止**时会**输出 "inactive" 并返回非零** → `\|\| printf 'unknown'` 会把 unknown **追加**到后面 → 状态显示成两行（`inactive\nunknown`），界面上看着像出了两个状态 | Step 3 改成 `\|\| true` 保留 systemctl 的输出，只在它**一个字都没输出**时才回落到 `unknown` |
+| T6-5 | **Minor** | `setup_systemd` 里 `mkdir -p "$LOG_DIR"` 的退出码**没检查** → 目录建不出来时，后面仍然会打印「日志目录已授权给运行用户」→ **谎报**。目录建不出来意味着 xray 写不了日志，用户却以为一切正常 | Step 3 改成 `if ! mkdir -p "$LOG_DIR"; then tui_warn ...; else ... fi` |
+| T6-6 | **Minor** | 「enable_bbr 输出提及 bbr 状态」这条断言的措辞**不精确**：成功路径的输出（`已启用 bbr 拥塞控制与 fq 队列`）里也有 "bbr" → 断言的是「输出里含 bbr」而不是「明确说了内核不支持 bbr」。（控制器实测：去掉那句 `tui_warn` 确实会变红 → **判别力成立**，不是恒真；只是判据不够精确） | Step 1 改成点具体文案「未提供 bbr」 |
+| T6-7 | **Minor** | `install_xray` 下载 `https://github.com/XTLS/Xray-install/raw/main/install-release.sh` 并**以 root 执行**。这是 Xray 官方安装器的通行做法，但用的是 **`main` 分支**（内容可变）且**没有完整性校验** | 不改代码（这是 Xray 生态的通行做法，改成自建安装流程会超出本工具的范围），但**必须写进 README 的「验证状态声明」**：工具会以 root 执行一个从 GitHub `main` 分支下载的脚本，没有校验和校验 |
+| T6-8 | **Minor** | Task 6 **没有独立的验收标准段**（Task 3 / Task 4 / Task 5 都有） | 补一个 |
+
+> **控制器的自我记账**：本轮控制器在写「修订轮 1」时**先入为主**地认为
+> 「enable_bbr 输出提及 bbr 状态」是恒真断言（因为成功路径的输出里也有 bbr），
+> 差点把它当成一条缺陷写进去。**实测推翻了这个判断** —— 去掉那句 `tui_warn`
+> 之后输出里就没有 bbr 了，那条断言**确实会变红**，判别力成立。
+> 又一次印证：**「读代码觉得它有问题」必须用变异证伪或证实**，不能靠推理下结论。
+
+#### 修订轮 1 的验收标准
+
+1. `lib/deploy.sh` 的 Task 6 段与上面 **Step 3 代码块逐字节一致**（追加在 Task 5 段之后）。
+2. `test/unit.sh` 里 Task 6 的插入段与上面 **Step 1 代码块逐字节一致**
+   （追加在 `test_summary` **之前**）。
+3. `bash test/unit.sh` 全部通过、退出码 0。
+4. 断言总数必须恒定，且**连跑 4 次条数相同**。
+   平台差异：本机（Windows + MSYS）与 Debian/CI 的条数差 **4 条** ——
+   4 条权限相关行为断言在 MSYS 上被自动跳过（`chmod` 是模拟的）。
+   报告里必须写明是哪个平台的数字。
+   **注意**：本任务的两处条件块已改成 1 换 1 配对 → **条数不再随机器状态漂移**，
+   本机与 Debian/CI 的条数差**只剩**那 4 条权限断言。
+5. 红灯证据（至少这六条，每条都要贴出**变红的断言原文**）：
+   - 把 `install_xray` 整个换成 `install_xray() { return 0; }`
+     → 「install_xray 在已安装时返回 0」等必须变红；
+   - 把 `xray_version` 整个换成 `xray_version() { return 0; }`
+     → 「xray_version 输出 xray 的版本串」必须变红；
+   - 把 `setup_systemd` 整个换成 `setup_systemd() { return 0; }`
+     → 「setup_systemd 在服务未运行时返回非零」等必须变红；
+   - 把 `restart_service` 整个换成 `restart_service() { return 0; }`
+     → 「restart_service 在服务未运行时返回非零」必须变红；
+   - 把 `service_status` 整个换成 `service_status() { return 0; }`
+     → 「service_status 打印服务状态」必须变红；
+   - 把 `open_firewall` 里的 ufw 检测改回 `| grep -q` 形态
+     → 至少「open_firewall 的 ufw 分支调用了 ufw allow <port>/tcp」不能变红
+     （说明这条检测**不是靠那条断言钉住的**；它是 F4-1 同款的**低概率**缺陷，
+     本轮用**改实现**而不是加断言来处置）。
+6. `lib/core.sh`、`lib/tui.sh`、`test/lib.sh`、Task 5 段 **一字未动**。
+7. 计划文件实施者一个字都不许改。
+
 **Step 1: 写失败的测试**
 
 追加到 `test/unit.sh`：
@@ -3067,22 +3122,97 @@ git commit -m "feat(deploy): 密钥解析跨版本兼容与服务端配置渲染
 ```bash
 test_case "deploy 系统操作的可测分支"
 
-# 未安装 xray 时 xray_installed 必须返回非零退出码
+# ── xray_installed：未安装返回非零，已安装返回 0 ──────────────
+# 必须【1 换 1 配对】：真实 Debian 上装好 xray 后 `[[ ! -x "$XRAY_BIN" ]]` 为假
+# → 原来的写法会让这条断言【整条消失】→ 断言条数随机器状态漂移（见全局约束）。
 if [[ ! -x "$XRAY_BIN" ]]; then
   assert_fails "未安装时 xray_installed 返回非零" xray_installed
+else
+  assert_succeeds "已安装时 xray_installed 返回 0" xray_installed
 fi
 
-# enable_bbr 在不支持 bbr 的内核上必须安全失败而非崩溃；输出必须提及 bbr。
+# ── xray_version：必须输出 xray 的版本串 ──────────────
+# 用 shell 函数当假 xray（MSYS 的 chmod 位不可靠，造可执行脚本 + chmod +x 不稳）。
+out=$( ( XRAY_BIN=xrayv; xrayv() { printf 'Xray 1.8.0 (Xray, Penetrates Everything.) Custom\n'; }; xray_version 2>&1 ) )
+assert_contains "$out" "Xray 1.8.0" "xray_version 输出 xray 的版本串"
+
+# ── install_xray：已安装时不得重复安装 ──────────────
+out=$( ( XRAY_BIN=/nonexistent/xray; xray_installed() { return 0; }
+         xray_version() { printf 'Xray 1.8.0\n'; }; install_xray 2>&1 ) ); rc=$?
+assert_status 0 "$rc" "install_xray 在已安装时返回 0"
+assert_contains "$out" "已安装" "install_xray 在已安装时给出提示"
+
+# ── install_xray：下载安装脚本失败必须返回非零（不得谎报已安装）──
+# ensure_packages 与 curl 都必须 mock：前者会真的调 apt-get，后者会真的联网。
+out=$( ( XRAY_BIN=/nonexistent/xray; xray_installed() { return 1; }
+         ensure_packages() { return 0; }; curl() { return 22; }
+         install_xray 2>&1 ) ); rc=$?
+assert_status 1 "$rc" "install_xray 在下载安装脚本失败时返回非零"
+assert_contains "$out" "下载 Xray 安装脚本失败" "install_xray 下载失败时给出明确提示"
+assert_false "$out" "Xray 安装完成" "install_xray 下载失败时不得谎报『Xray 安装完成』"
+
+# ── setup_systemd：服务未运行时必须返回非零并输出 xray 的原始日志 ──────────────
+# systemctl / journalctl / tui_run 全部 mock：绝不能真的动宿主机的 systemd。
+out=$( ( have_cmd() { return 0; }; tui_run() { return 0; }
+         systemctl() { return 3; }
+         journalctl() { printf 'xray: Failed to start.\n'; }
+         service_run_user() { printf 'root'; }
+         setup_systemd 2>&1 ) ); rc=$?
+assert_status 1 "$rc" "setup_systemd 在服务未运行时返回非零"
+assert_contains "$out" "xray 服务未能启动" "setup_systemd 失败时给出明确提示"
+assert_contains "$out" "xray: Failed to start." "setup_systemd 失败时输出 xray 的原始日志"
+
+# ── setup_systemd：服务正常运行时返回 0 ──────────────
+out=$( ( have_cmd() { return 0; }; tui_run() { return 0; }
+         systemctl() { return 0; }
+         service_run_user() { printf 'root'; }
+         setup_systemd 2>&1 ) ); rc=$?
+assert_status 0 "$rc" "setup_systemd 在服务正常运行时返回 0"
+
+# ── restart_service：服务未运行时必须返回非零 ──────────────
+out=$( ( tui_run() { return 0; }; systemctl() { return 3; }
+         journalctl() { printf 'xray: Failed to start.\n'; }
+         restart_service 2>&1 ) ); rc=$?
+assert_status 1 "$rc" "restart_service 在服务未运行时返回非零"
+assert_contains "$out" "未处于运行状态" "restart_service 失败时给出明确提示"
+
+# ── restart_service：服务正常运行时返回 0 ──────────────
+out=$( ( tui_run() { return 0; }; systemctl() { return 0; }
+         restart_service 2>&1 ) ); rc=$?
+assert_status 0 "$rc" "restart_service 在服务正常运行时返回 0"
+
+# ── service_status：必须打印服务状态与端口监听情况 ──────────────
+out=$( ( have_cmd() { return 0; }
+         systemctl() { case "$1" in
+                         is-active)  printf 'active\n'; return 0 ;;
+                         is-enabled) printf 'enabled\n'; return 0 ;;
+                       esac; return 0; }
+         xray_version() { printf 'Xray 1.8.0\n'; }
+         port_in_use() { return 1; }
+         PORT=8443
+         service_status 2>&1 ) )
+assert_contains "$out" "服务状态" "service_status 打印服务状态"
+assert_contains "$out" "active" "service_status 显示服务是否在运行"
+assert_contains "$out" "8443" "service_status 显示端口监听情况"
+
+# ── enable_bbr 在不支持 bbr 的内核上必须安全失败而非崩溃 ──────────────
 # 必须 mock 掉 sysctl 走「不支持 bbr」分支：真实调用会写
 # /etc/sysctl.d/99-vless-reality-bbr.conf 并 `sysctl -p` 立即应用，
 # 那是单元测试不该有的主机副作用（CI 上会真的改掉运行内核的拥塞控制）。
+# 断言必须点【具体文案】而不是「提及 bbr」—— 成功路径的输出里也有 bbr，
+# 断言「提及 bbr」在两条路径上都成立 → 恒绿、没有判别力。
 out=$( ( sysctl() { printf 'cubic\n'; }; enable_bbr 2>&1 ) ) || true
-assert_contains "$out" "bbr" "enable_bbr 输出提及 bbr 状态"
+assert_contains "$out" "未提供 bbr" "enable_bbr 在内核不支持 bbr 时明确说明"
 
-# open_firewall 在无任何防火墙工具时必须明确告知而不是静默成功
+# ── open_firewall 在无任何防火墙工具时必须明确告知而不是静默成功 ──────────────
+# 必须【1 换 1 配对】：真实 Debian 上一定有 iptables 或 nft → 原来的写法会让
+# 这条断言【整条消失】→ 断言条数随机器状态漂移（见全局约束）。
 if ! have_cmd ufw && ! have_cmd nft && ! have_cmd iptables; then
   out=$(open_firewall 443 2>&1) || true
   assert_contains "$out" "防火墙" "无防火墙工具时给出明确提示"
+else
+  assert_eq "本机存在防火墙工具" "本机存在防火墙工具" \
+    "无防火墙工具的用例已跳过（本机存在 ufw / nft / iptables，用例前提不成立）"
 fi
 
 # open_firewall：ufw 分支必须真的调用 ufw allow 且把失败码传出去。
@@ -3187,11 +3317,16 @@ setup_systemd() {
   run_user=$(service_run_user)
   if [[ "$run_user" != "root" ]]; then
     svc_user="$run_user"
-    mkdir -p "$LOG_DIR"
-    if id "$svc_user" >/dev/null 2>&1; then
-      chown -R "$svc_user" "$LOG_DIR" 2>/dev/null || true
+    # mkdir 的退出码必须检查：失败时后面仍然会打印「日志目录已授权」→ 谎报。
+    # 目录建不出来时 xray 写不了日志，用户却以为一切正常。
+    if ! mkdir -p "$LOG_DIR"; then
+      tui_warn "无法创建日志目录 $LOG_DIR，xray 可能无法写入日志。"
+    else
+      if id "$svc_user" >/dev/null 2>&1; then
+        chown -R "$svc_user" "$LOG_DIR" 2>/dev/null || true
+      fi
+      tui_tip "日志目录已授权给运行用户 $svc_user"
     fi
-    tui_tip "日志目录已授权给运行用户 $svc_user"
   fi
   tui_ok "xray 服务已运行"
   return 0
@@ -3210,9 +3345,19 @@ restart_service() {
 
 open_firewall() {
   local port="$1"
-  if have_cmd ufw && ufw status 2>/dev/null | grep -q 'Status: active'; then
-    tui_run "放行端口 $port/tcp (ufw)" ufw allow "$port/tcp"
-    return $?
+  # ufw 的状态检测【不能】写成 `ufw status | grep -q ...`：
+  # grep -q 命中即退出 → 上游 ufw 收到 SIGPIPE(141) → set -o pipefail 下整条管道
+  # 的退出码变成 141 → 条件判假 → 【ufw 明明是 active 也不会走 ufw 分支】，
+  # 静默降级到 iptables / nft 分支（与 Task 4 的 F4-1 同一个坑）。
+  # 修法与 F4-1 一致：先把整段输出收进变量，再对变量做匹配
+  # （链路上没有任何会早退的管道 → 不可能有 SIGPIPE）。
+  if have_cmd ufw; then
+    local ufw_status
+    ufw_status=$(ufw status 2>/dev/null || printf '')
+    if [[ "$ufw_status" == *"Status: active"* ]]; then
+      tui_run "放行端口 $port/tcp (ufw)" ufw allow "$port/tcp"
+      return $?
+    fi
   fi
   if have_cmd iptables; then
     if iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; then
@@ -3281,8 +3426,15 @@ net.ipv4.tcp_slow_start_after_idle = 0'
 service_status() {
   if have_cmd systemctl; then
     local active enabled
-    active=$(systemctl is-active xray 2>/dev/null || printf 'unknown')
-    enabled=$(systemctl is-enabled xray 2>/dev/null || printf 'unknown')
+    # 必须用 `|| true` 而不是 `|| printf 'unknown'`：
+    # systemctl is-active 在服务停止时【会输出 "inactive" 并返回非零】，
+    # `|| printf 'unknown'` 会把 unknown 追加到后面 → 状态显示成两行
+    # （"inactive\nunknown"），界面上看着像出了两个状态。
+    # 正确做法是保留 systemctl 的输出，只在它【一个字都没输出】时才回落到 unknown。
+    active=$(systemctl is-active xray 2>/dev/null || true)
+    [[ -n "$active" ]] || active='unknown'
+    enabled=$(systemctl is-enabled xray 2>/dev/null || true)
+    [[ -n "$enabled" ]] || enabled='unknown'
     tui_kv "服务状态" "$active"
     tui_kv "开机自启" "$enabled"
     tui_kv "内核版本" "$(xray_version 2>/dev/null || printf '未安装')"
