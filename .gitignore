@@ -5,3 +5,6 @@ dist/*.new
 # 运行时生成
 *.log
 .env
+
+# SDD 隔离工作区
+.worktrees/
