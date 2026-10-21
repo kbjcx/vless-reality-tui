@@ -1,0 +1,7 @@
+# 构建临时产物
+dist/*.tmp
+dist/*.new
+
+# 运行时生成
+*.log
+.env

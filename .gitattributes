@@ -1,0 +1,9 @@
+# 强制 shell 脚本与文档使用 LF 行尾 —— CRLF 会导致 Debian 上
+# "bad interpreter: /usr/bin/env bash^M" 这类经典故障
+* text=auto eol=lf
+
+*.sh text eol=lf
+*.bash text eol=lf
+*.md  text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
