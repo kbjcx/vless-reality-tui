@@ -3193,4 +3193,138 @@ dto=$(sed -n 's/^export TUI_DIGIT_TIMEOUT=//p' "$ROOT/test/helpers/menu_tty.sh" 
 assert_true "$(awk -v v="${kto:-0}" 'BEGIN{print (v+0>0.2)?0:1}')" "菜单测试 helper 放大了方向键超时"
 assert_true "$(awk -v v="${dto:-0}" 'BEGIN{print (v+0>0.35)?0:1}')" "菜单测试 helper 放大了数字键超时"
 
+# ── Task 13：demo.sh、README 与集成测试 ─────────────────────────────
+# ⚠️ 本段【不写任何会整块跳过的条件块】：
+#    所有断言要么恒定执行、要么在前提不成立时【判红】→
+#    断言条数与机器 / 网络 / 依赖状态【无关】。
+
+test_case "Task 13：demo.sh 不触碰系统"
+
+# ⚠️ 必须给 demo.sh 接上 </dev/null：demo.sh 会调用 tui_menu / tui_input /
+#    tui_confirm，这三个在【非 TTY 分支里仍然 read stdin】。
+#    不接 /dev/null 时，本地交互式跑测试（stdin 是终端）会直接挂死。
+# ⚠️ 还必须加 timeout：demo.sh 若在某个分支里等输入不返回，
+#    整个测试套件会【挂住】—— CI 上表现为「超时失败」，
+#    且看不出是哪一条断言出的问题（这比红更糟）。
+out=$(timeout 30 bash "$ROOT/demo.sh" </dev/null 2>&1); rc=$?
+assert_status 0 "$rc" "demo.sh 正常退出"
+assert_contains "$out" "分享链接" "demo 展示分享链接样例"
+assert_eq 0 "$(grep -c 'systemctl ' <<<"$out")" "demo 不调用 systemctl"
+assert_eq 0 "$(grep -c 'apt-get' <<<"$out")" "demo 不调用 apt-get"
+# 只看输出不够：demo.sh 若把命令输出重定向到 /dev/null，上面的断言就漏掉了。
+# 再直接查一次 demo.sh 的源码。
+assert_eq 0 "$(grep -cE '^[^#]*(systemctl|apt-get|ufw|iptables|nft|rm -f|systemctl disable)' "$ROOT/demo.sh" || true)" \
+  "demo.sh 源码里不含任何改系统的命令"
+# ⚠️ demo.sh 依赖「没有 set -e」：tui_menu 在非 TTY 下返回 255（取消）、
+#    tui_input 在 EOF 下返回非零 —— 有了 set -e 就会在菜单那一步直接退出，
+#    demo 变成半截输出。谁加了一行 set -e，这条断言立刻变红。
+assert_eq 0 "$(grep -cE '^[[:space:]]*set -[a-z]*e' "$ROOT/demo.sh" || true)" \
+  "demo.sh 不含 set -e（否则 tui_menu 的 255 会让它半路退出）"
+
+test_case "Task 13：超宽内容不撑破边框"
+
+# ⚠️ 分享链接有 150+ 字符，而框内净宽只有 TUI_WIDTH-6（默认 74）→
+#    硬塞进框里会把右边框顶出去，框线合不拢（框线必须恰好等于 TUI_WIDTH 才合得拢）。
+#    也不能把链接折成多行：用户要从终端复制这一行，折行后粘到客户端是废链接。
+#    → 放不下时不开框，改用小节标题 + 整行输出；
+#      终端的【软换行】只是显示效果，不会在内容里插入字符 → 复制出来仍是完整的一行。
+tuilib=$(cat "$ROOT/lib/tui.sh")
+assert_contains "$tuilib" "tui_box_text" "lib/tui.sh 提供超宽内容的处理组件"
+
+# 窄内容：照常画框
+narrow=$(tui_box_text "标题" "短内容" 2>&1)
+assert_contains "$narrow" "╭" "窄内容照常画框"
+assert_contains "$narrow" "短内容" "窄内容的框里有内容"
+assert_contains "$narrow" "╰" "窄内容画出了下边框"
+# 「框线合得拢」的判据：框的【顶边】与【内容行】的显示宽度必须【相等】
+# （两者都应恰好等于 TUI_WIDTH）—— 不等就说明有内容把框撑破了。
+box_top=$(tui_box "标题" 2>&1)
+box_line=$(tui_box_line "短内容" 2>&1)
+top_w=$(tui_dwidth "$(tui_strip "$box_top" | tr -d '\n')")
+line_w=$(tui_dwidth "$(tui_strip "$box_line" | tr -d '\n')")
+assert_eq "$top_w" "$line_w" "框的顶边与内容行宽度一致（框线合得拢）"
+
+# 超宽内容：不能画框（画了框线就合不拢），但内容一个都不能少
+wide_text=$(printf 'x%.0s' {1..200})
+wide=$(tui_box_text "标题" "$wide_text" 2>&1)
+assert_not_contains "$wide" "╭" "超宽内容不画上边框（框线会合不拢）"
+assert_not_contains "$wide" "╰" "超宽内容不画下边框"
+assert_contains "$wide" "$wide_text" "超宽内容整行输出，内容一个不少"
+assert_contains "$wide" "标题" "超宽内容仍带小节标题"
+
+test_case "Task 13：两处分享链接展示都用 tui_box_text"
+
+dep=$(cat "$ROOT/lib/deploy.sh")
+assert_contains "$dep" 'tui_box_text "分享链接（可直接粘贴到客户端导入）" "$link"' \
+  "部署完成时用 tui_box_text 显示分享链接"
+assert_contains "$dep" 'tui_box_text "分享链接" "$link"' \
+  "管理菜单查看分享链接时用 tui_box_text"
+
+test_case "Task 13：README 的验证状态声明"
+
+rmd=$(cat "$ROOT/README.md" 2>/dev/null)
+assert_contains "$rmd" "验证状态声明" "README 里有「验证状态声明」小节"
+# 下面逐条点名：未验证项必须【逐条】列出，不能含糊成一句「仅供参考」。
+assert_contains "$rmd" "权限位" "声明里点名：权限位 600/700 未在 Debian 真机验证"
+assert_contains "$rmd" "Debian 真机" "声明里点名：Debian 真机端到端未验证"
+assert_contains "$rmd" "shellcheck" "声明里点名：shellcheck 未在本机运行"
+assert_contains "$rmd" "nft" "声明里点名：nft 的 handle 语义未实测"
+assert_contains "$rmd" "systemd" "声明里点名：真实 systemd 的启停未验证"
+assert_contains "$rmd" "REALITY" "声明里点名：REALITY 握手未验证"
+assert_contains "$rmd" "TLS 1.3" "声明里点名：单元套件含网络依赖断言（TLS 1.3 探测）"
+assert_contains "$rmd" "apt-get" "声明里点名：apt-get 安装 Xray-core 未验证"
+# 已验证的项也要列出来，读者才能自己判断哪些结论可信
+assert_contains "$rmd" "已验证" "README 同时列出已验证的项"
+# 快速开始：必须是「先下载再执行」，不用管道
+assert_contains "$rmd" "sudo bash install.sh" "README 给出 sudo bash install.sh 的用法"
+assert_contains "$rmd" "curl" "README 给出 curl 单文件方式的命令"
+
+test_case "Task 13：README 的必需小节一个都不能少"
+
+# ⚠️ Step 5 要求 README 有 12 个小节，但上面那组断言只覆盖了「验证状态声明」那一格 →
+#    实现者少写一半小节，测试照样全绿。→ 这里逐个小节点名。
+# ⚠️ 判据是【标题级】的：只认 markdown 的标题行，不认「正文里出现过这个词」——
+#    否则正文里随口提一句「目录结构」也算数，等于没断言。
+#    先把 ``` 围栏里的内容剔掉：代码块里以 # 开头的注释行不算标题。
+rmd_heads=$(awk 'BEGIN{inb=0} /^```/{inb=!inb; next} !inb && /^#+ /{print}' "$ROOT/README.md" 2>/dev/null || true)
+assert_true "$(grep -qE '^#+ .*(特性|特点)' <<<"$rmd_heads" && echo 0 || echo 1)" "README 有「特性」小节"
+assert_true "$(grep -qE '^#+ .*(目录结构|文件结构)' <<<"$rmd_heads" && echo 0 || echo 1)" "README 有「目录结构」小节"
+assert_true "$(grep -qE '^#+ .*(CLI|命令行)' <<<"$rmd_heads" && echo 0 || echo 1)" "README 有「CLI 参数」小节"
+assert_true "$(grep -qE '^#+ .*(部署向导|部署流程)' <<<"$rmd_heads" && echo 0 || echo 1)" "README 有「部署向导」小节"
+assert_true "$(grep -qE '^#+ .*管理菜单' <<<"$rmd_heads" && echo 0 || echo 1)" "README 有「管理菜单」小节"
+assert_true "$(grep -qE '^#+ .*(客户端|导入)' <<<"$rmd_heads" && echo 0 || echo 1)" "README 有「客户端导入」小节"
+assert_true "$(grep -qE '^#+ .*(常见问题|FAQ)' <<<"$rmd_heads" && echo 0 || echo 1)" "README 有「常见问题」小节"
+assert_true "$(grep -qE '^#+ .*卸载' <<<"$rmd_heads" && echo 0 || echo 1)" "README 有「卸载」小节"
+assert_true "$(grep -qE '^#+ .*(致谢|上游|Xray-install)' <<<"$rmd_heads" && echo 0 || echo 1)" "README 有「致谢与上游项目链接」小节"
+
+# 光有小节标题还不够，里面得真的说到这些点
+assert_contains "$rmd" "v2rayNG" "客户端导入说明里点名 v2rayN / v2rayNG"
+assert_contains "$rmd" "Clash" "客户端导入说明里点名 Clash Verge"
+assert_contains "$rmd" "BBR" "常见问题里点名 BBR"
+assert_contains "$rmd" "二维码" "常见问题里点名二维码缺失"
+# ⚠️ T6-7：计划在【两处】登记了「README 的验证状态声明必须点名这一条」
+#   （Task 6 修订轮的 T6-7、Task 10 修订轮的 T10-7）：
+#   工具会以 root 执行一个从 GitHub main 分支下载的脚本，没有校验和校验。
+#   这条【不能漏】—— 漏了等于用户不知道自己的机器上跑过一段未经校验的代码。
+assert_contains "$rmd" "校验和" "声明里点名：以 root 执行 GitHub main 分支脚本、无校验和校验（T6-7）"
+
+test_case "Task 13：设计稿的依赖图补上 core.sh → tui.sh（F-18）"
+
+# F-18 是 Task 1 修订轮登记的「留到 Task 13 收尾补设计稿」：
+#   设计稿 4.1 的依赖图漏了 core.sh → tui.sh 这条边
+#   （core.sh 会调用 tui.sh 的 tui_err / tui_tip / tui_ok）。
+design_doc="$ROOT/docs/superpowers/specs/2026-10-21-vless-reality-deploy-design.md"
+assert_true "$(grep -qF 'core.sh ──> tui.sh' "$design_doc" 2>/dev/null && echo 0 || echo 1)" \
+  "设计稿 4.1 的依赖图补上了 core.sh → tui.sh 边（F-18）"
+
+test_case "Task 13：集成测试脚本"
+
+assert_true "$([[ -f "$ROOT/test/integration-debian.sh" ]] && echo 0 || echo 1)" "集成测试脚本存在"
+assert_status 0 "$(bash -n "$ROOT/test/integration-debian.sh" 2>&1; echo $?)" "集成测试脚本语法正确"
+itg=$(cat "$ROOT/test/integration-debian.sh" 2>/dev/null)
+assert_contains "$itg" "docker" "集成测试用 docker 起容器"
+assert_contains "$itg" "test/unit.sh" "集成测试在容器里跑单元测试"
+assert_contains "$itg" "build.sh" "集成测试在容器里构建单文件"
+assert_contains "$itg" "dist/install.sh" "集成测试在容器里验证单文件产物"
+
 test_summary

@@ -229,6 +229,26 @@ tui_box_end() {
   printf '  %s%s%s%s\n' "$C_ACCENT" "$B_BL" "$(tui_repeat "$B_H" $rw)" "$B_BR$C_RESET"
 }
 
+# 一个带标题的内容块：内容【放得下】就画框，【放不下】就整行输出。
+# ⚠️ 为什么需要它：分享链接有 150+ 字符，而框内净宽只有 TUI_WIDTH-6（默认 74）→
+#    硬塞进框里会把右边框顶出去，框线合不拢
+#    （框线必须恰好等于 TUI_WIDTH 才对得齐，见 tui_box / tui_box_end 的注释）。
+#    也不能把链接折成多行：用户要从终端复制这一行，折行后粘到客户端是废链接。
+#    → 放不下时不开框，改用小节标题 + 整行输出；
+#      终端的【软换行】只是显示效果，不会在内容里插入字符 → 复制出来仍是完整的一行。
+tui_box_text() {
+  local title="$1" text="$2" cw
+  cw=$(tui_content_width)
+  if (( $(tui_dwidth "$text") <= cw )); then
+    tui_box "$title"
+    tui_box_line "$text"
+    tui_box_end
+    return 0
+  fi
+  tui_section "$title"
+  printf '  %s%s%s\n' "$C_WHITE" "$text" "$C_RESET"
+}
+
 tui_panel() {
   local title="$1"; shift
   local cw rw n vw entry k v

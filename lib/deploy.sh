@@ -759,9 +759,10 @@ deploy_wizard() {
     "客户端配置|$OUT_DIR/client.json" \
     "二维码|$OUT_DIR/qrcode.png"
 
-  tui_box "分享链接（可直接粘贴到客户端导入）"
-  tui_box_line "$link"
-  tui_box_end
+  # 用 tui_box_text 而不是 tui_box/tui_box_line：分享链接有 150+ 字符，
+  # 框内净宽只有 TUI_WIDTH-6 → 硬塞进框里会把右边框顶出去（框线合不拢）；
+  # 也不能折行（用户要复制这一行，折行后粘到客户端是废链接）。
+  tui_box_text "分享链接（可直接粘贴到客户端导入）" "$link"
 
   if [[ -f "$OUT_DIR/qrcode.txt" ]]; then
     tui_section "终端二维码"
@@ -798,9 +799,8 @@ menu_show_client() {
     "公钥 pbk|$PUBLIC_KEY" \
     "ShortID sid|$SHORT_ID" \
     "备注|$REMARK"
-  tui_box "分享链接"
-  tui_box_line "$link"
-  tui_box_end
+  # 同上：分享链接超出框宽 → 用 tui_box_text 整行输出（不撑破边框、也不折行）。
+  tui_box_text "分享链接" "$link"
   if [[ -f "$OUT_DIR/qrcode.txt" ]]; then
     tui_section "终端二维码"
     cat "$OUT_DIR/qrcode.txt"

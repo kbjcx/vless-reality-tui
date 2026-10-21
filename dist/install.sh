@@ -247,6 +247,26 @@ tui_box_end() {
   printf '  %s%s%s%s\n' "$C_ACCENT" "$B_BL" "$(tui_repeat "$B_H" $rw)" "$B_BR$C_RESET"
 }
 
+# 一个带标题的内容块：内容【放得下】就画框，【放不下】就整行输出。
+# ⚠️ 为什么需要它：分享链接有 150+ 字符，而框内净宽只有 TUI_WIDTH-6（默认 74）→
+#    硬塞进框里会把右边框顶出去，框线合不拢
+#    （框线必须恰好等于 TUI_WIDTH 才对得齐，见 tui_box / tui_box_end 的注释）。
+#    也不能把链接折成多行：用户要从终端复制这一行，折行后粘到客户端是废链接。
+#    → 放不下时不开框，改用小节标题 + 整行输出；
+#      终端的【软换行】只是显示效果，不会在内容里插入字符 → 复制出来仍是完整的一行。
+tui_box_text() {
+  local title="$1" text="$2" cw
+  cw=$(tui_content_width)
+  if (( $(tui_dwidth "$text") <= cw )); then
+    tui_box "$title"
+    tui_box_line "$text"
+    tui_box_end
+    return 0
+  fi
+  tui_section "$title"
+  printf '  %s%s%s\n' "$C_WHITE" "$text" "$C_RESET"
+}
+
 tui_panel() {
   local title="$1"; shift
   local cw rw n vw entry k v
@@ -1979,9 +1999,10 @@ deploy_wizard() {
     "客户端配置|$OUT_DIR/client.json" \
     "二维码|$OUT_DIR/qrcode.png"
 
-  tui_box "分享链接（可直接粘贴到客户端导入）"
-  tui_box_line "$link"
-  tui_box_end
+  # 用 tui_box_text 而不是 tui_box/tui_box_line：分享链接有 150+ 字符，
+  # 框内净宽只有 TUI_WIDTH-6 → 硬塞进框里会把右边框顶出去（框线合不拢）；
+  # 也不能折行（用户要复制这一行，折行后粘到客户端是废链接）。
+  tui_box_text "分享链接（可直接粘贴到客户端导入）" "$link"
 
   if [[ -f "$OUT_DIR/qrcode.txt" ]]; then
     tui_section "终端二维码"
@@ -2018,9 +2039,8 @@ menu_show_client() {
     "公钥 pbk|$PUBLIC_KEY" \
     "ShortID sid|$SHORT_ID" \
     "备注|$REMARK"
-  tui_box "分享链接"
-  tui_box_line "$link"
-  tui_box_end
+  # 同上：分享链接超出框宽 → 用 tui_box_text 整行输出（不撑破边框、也不折行）。
+  tui_box_text "分享链接" "$link"
   if [[ -f "$OUT_DIR/qrcode.txt" ]]; then
     tui_section "终端二维码"
     cat "$OUT_DIR/qrcode.txt"

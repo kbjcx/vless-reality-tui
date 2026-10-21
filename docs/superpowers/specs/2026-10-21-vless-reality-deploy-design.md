@@ -60,6 +60,7 @@ install.sh ──> deploy.sh ──> core.sh
       │ └────────> tui.sh
       ├────────> client.sh ──> core.sh
       └────────> tui.sh
+core.sh ──> tui.sh
 ```
 
 **硬约束**：`lib/tui.sh` 不依赖任何其它模块，不含任何业务逻辑。
