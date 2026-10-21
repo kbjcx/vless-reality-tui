@@ -7,4 +7,4 @@ dist/*.new
 .env
 
 # SDD 隔离工作区
-.worktrees/
+.worktrees
