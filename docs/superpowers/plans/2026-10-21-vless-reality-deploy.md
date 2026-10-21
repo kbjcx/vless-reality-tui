@@ -115,10 +115,11 @@ assert_status() {
 assert_true()  { if [[ "$1" == "0" ]]; then assert_eq 0 0 "${2:-为真}"; else assert_eq 0 1 "${2:-为真}"; fi; }
 assert_false() { if [[ "$1" == "0" ]]; then assert_eq 0 1 "${2:-为假}"; else assert_eq 0 0 "${2:-为假}"; fi; }
 
-# 以【退出码】断言：直接把命令作为参数传入。
-# 布尔型函数（返回 0/1 退出码而非打印值）必须用这两个，否则会误判。
-assert_succeeds() { local m="${2:-命令应以 0 退出}"; if "$@" >/dev/null 2>&1; then assert_eq 0 0 "$m"; else assert_eq 0 1 "$m"; fi; }
-assert_fails()    { local m="${2:-命令应以非 0 退出}"; if "$@" >/dev/null 2>&1; then assert_eq 0 1 "$m"; else assert_eq 0 0 "$m"; fi; }
+# 以【退出码】断言：用法为 assert_succeeds "描述" <命令> [参数...]
+# 描述必须是【第一个】参数——若放在末尾，"$@" 会把描述一起当作命令参数执行，
+# 被测命令会收到多余的参数，导致测试「因错误的原因通过或失败」。
+assert_succeeds() { local m="$1"; shift; if "$@" >/dev/null 2>&1; then assert_eq 0 0 "$m"; else assert_eq 0 1 "$m"; fi; }
+assert_fails()    { local m="$1"; shift; if "$@" >/dev/null 2>&1; then assert_eq 0 1 "$m"; else assert_eq 0 0 "$m"; fi; }
 
 test_summary() {
   printf '\n  ────────────────────────────────\n'
@@ -159,6 +160,35 @@ assert_eq "-----"      "$(tui_repeat '-' 5)"   "重复字符"
 
 assert_eq "hello" "$(tui_strip $'\033[32mhello\033[0m')" "剥离 ANSI 序列"
 
+test_case "TUI 框线几何"
+
+# 框线必须合得拢：每一个非空行的显示宽度都等于 TUI_WIDTH
+assert_box_widths() {
+  local label="$1" text="$2" bad=0 line
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    [[ "$(tui_dwidth "$line")" == "$TUI_WIDTH" ]] || bad=1
+  done <<<"$text"
+  assert_eq "0" "$bad" "$label 每行显示宽度均为 TUI_WIDTH"
+}
+
+TUI_WIDTH=80
+assert_box_widths "banner" "$(tui_banner '标题' '副标题')"
+assert_box_widths "box"    "$(tui_box '框标题'; tui_box_line '内容行'; tui_box_end)"
+assert_box_widths "panel"  "$(tui_panel '面板' '键|值' '更长的键|更长的值内容')"
+
+# 带 ANSI 的字符串按纯文本宽度计算（否则对带色文本补白会错位）
+assert_eq "4" "$(tui_dwidth $'\033[32m中文\033[0m')" "tui_dwidth 忽略 ANSI 序列"
+
+test_case "TUI Unicode 降级"
+
+# TUI_ASCII=1 时必须降级为 ASCII 制表符
+assert_eq "ok" "$( ( export TUI_ASCII=1; tui_init; [[ "$B_H" == '-' && "$B_V" == '|' ]] && echo ok || echo bad ) )" \
+  "TUI_ASCII=1 时降级为 ASCII 制表符"
+# 显式 TUI_UNICODE=1 时必须保留 Unicode
+assert_eq "ok" "$( ( export TUI_UNICODE=1; tui_init; [[ "$B_H" == '─' ]] && echo ok || echo bad ) )" \
+  "TUI_UNICODE=1 时保留 Unicode 制表符"
+
 test_summary
 ```
 
@@ -179,7 +209,8 @@ bash test/unit.sh
 ```bash
 #!/usr/bin/env bash
 # lib/tui.sh — 零依赖 TUI 组件库
-# 硬约束：本文件不得包含任何业务逻辑、文件写入（tui_run 捕获输出除外）或系统调用。
+# 硬约束：本文件不得包含任何业务逻辑、文件写入或系统调用。
+# （Task 2 的 tui_run 需要 mktemp 捕获命令输出，是这条约束的唯一例外。）
 
 TUI_TTY=0; TUI_COLOR=0; TUI_WIDTH=80; TUI_UNICODE=1
 
@@ -193,6 +224,28 @@ I_MARK='●'; I_ARROW='▸'; I_OK='✔'; I_ERR='✖'; I_WARN='▲'; I_INFO='ℹ'
 tui_init() {
   [[ -t 1 && -t 0 ]] && TUI_TTY=1
   [[ "${TERM:-dumb}" != "dumb" && -t 1 && -z "${NO_COLOR:-}" ]] && TUI_COLOR=1
+
+  # Unicode 能力判定（设计稿要求：Unicode 不可用时降级为 ASCII 制表符）
+  #   - TUI_ASCII=1 / TUI_UNICODE=1 显式覆盖优先
+  #   - locale 含 UTF-8 → Unicode
+  #   - 三个 locale 变量都未设置 → 默认 Unicode（现代终端均可显示）
+  #   - 其它情况（如 LANG=C）→ 降级 ASCII
+  local loc="${LC_ALL:-${LC_CTYPE:-${LANG:-}}}"
+  if [[ -n "${TUI_ASCII:-}" ]]; then
+    TUI_UNICODE=0
+  elif [[ -n "${TUI_UNICODE:-}" ]]; then
+    TUI_UNICODE=1
+  elif [[ "$loc" == *UTF-8* || "$loc" == *utf8* || "$loc" == *UTF8* ]]; then
+    TUI_UNICODE=1
+  elif [[ -z "$loc" ]]; then
+    TUI_UNICODE=1
+  else
+    TUI_UNICODE=0
+  fi
+  if [[ $TUI_UNICODE -eq 0 ]]; then
+    B_TL='+'; B_TR='+'; B_BL='+'; B_BR='+'; B_H='-'; B_V='|'
+    I_MARK='*'; I_ARROW='>'; I_OK='[OK]'; I_ERR='[X]'; I_WARN='[!]'; I_INFO='[i]'; I_TIP='>'
+  fi
 
   local cols
   cols=$(tput cols 2>/dev/null || printf '80')
@@ -217,18 +270,85 @@ tui_repeat() {
   printf '%s' "$out"
 }
 
+# 显示宽度：CJK / 全角字符按 2 列，其余按 1 列。
+#
+# 实现要点（都是踩过的坑，勿简化）：
+#   1. 必须【按字节】解码 UTF-8 后比较码点，不能依赖 locale：
+#      ${#s} 在 C locale 下是字节数、否则是字符数；
+#      case 区间 [$'\u1100'-...] 的匹配结果依赖 locale 排序规则。
+#      方案：显式 `local LC_ALL=C`（与 lib/core.sh 的 urlencode 同一手法）后按字节解码，
+#      保证在任何 locale（含 LANG 未设置的服务器、Git Bash 默认的 C locale）下结果一致。
+#   2. 必须校验序列长度与续字节（0x80-0xBF），否则截断序列会越界读、
+#      把残缺字节静默解成伪码点，导致宽度静默失真。
+#   3. 必须跳过 ANSI 转义序列（ESC [ ... 终止字节），否则对带色字符串补白会错位。
 tui_dwidth() {
-  local s="$1" w=0 i ch
-  for ((i = 0; i < ${#s}; i++)); do
-    ch=${s:$i:1}
-    case "$ch" in
-      [$'\u1100'-$'\u115F'] | [$'\u2E80'-$'\u303E'] | [$'\u3041'-$'\u33FF'] | \
-      [$'\u3400'-$'\u4DBF'] | [$'\u4E00'-$'\u9FFF'] | [$'\uA000'-$'\uA4CF'] | \
-      [$'\uAC00'-$'\uD7A3'] | [$'\uF900'-$'\uFAFF'] | [$'\uFE30'-$'\uFE6F'] | \
-      [$'\uFF00'-$'\uFF60'] | [$'\uFFE0'-$'\uFFE6'])
-        w=$((w + 2)) ;;
-      *) w=$((w + 1)) ;;
-    esac
+  local s="$1" w=0 i len b1 b2 b3 b4 cp n j
+  local LC_ALL=C
+  len=${#s}
+  i=0
+  while (( i < len )); do
+    printf -v b1 '%d' "'${s:$i:1}"
+
+    # 跳过 ANSI 转义序列：ESC [ 参数... 终止字节(0x40-0x7E)
+    if (( b1 == 27 )) && (( i + 1 < len )); then
+      printf -v b2 '%d' "'${s:$((i+1)):1}"
+      if (( b2 == 91 )); then   # '['
+        j=$(( i + 2 ))
+        while (( j < len )); do
+          printf -v b3 '%d' "'${s:$j:1}"
+          if (( b3 >= 0x40 && b3 <= 0x7E )); then
+            i=$(( j + 1 ))
+            break
+          fi
+          j=$(( j + 1 ))
+        done
+        (( j >= len )) && i=$len
+        continue
+      fi
+    fi
+
+    if (( b1 < 0x80 )); then
+      cp=$b1; n=1
+    elif (( b1 >= 0xC2 && b1 <= 0xDF )); then
+      if (( i + 1 >= len )); then
+        cp=$b1; n=1
+      else
+        printf -v b2 '%d' "'${s:$((i+1)):1}"
+        if (( (b2 & 0xC0) != 0x80 )); then cp=$b1; n=1
+        else cp=$(( (b1 & 0x1F) << 6 | (b2 & 0x3F) )); n=2; fi
+      fi
+    elif (( b1 >= 0xE0 && b1 <= 0xEF )); then
+      if (( i + 2 >= len )); then
+        cp=$b1; n=1
+      else
+        printf -v b2 '%d' "'${s:$((i+1)):1}"
+        printf -v b3 '%d' "'${s:$((i+2)):1}"
+        if (( (b2 & 0xC0) != 0x80 || (b3 & 0xC0) != 0x80 )); then cp=$b1; n=1
+        else cp=$(( (b1 & 0x0F) << 12 | (b2 & 0x3F) << 6 | (b3 & 0x3F) )); n=3; fi
+      fi
+    elif (( b1 >= 0xF0 && b1 <= 0xF4 )); then
+      if (( i + 3 >= len )); then
+        cp=$b1; n=1
+      else
+        printf -v b2 '%d' "'${s:$((i+1)):1}"
+        printf -v b3 '%d' "'${s:$((i+2)):1}"
+        printf -v b4 '%d' "'${s:$((i+3)):1}"
+        if (( (b2 & 0xC0) != 0x80 || (b3 & 0xC0) != 0x80 || (b4 & 0xC0) != 0x80 )); then cp=$b1; n=1
+        else cp=$(( (b1 & 0x07) << 18 | (b2 & 0x3F) << 12 | (b3 & 0x3F) << 6 | (b4 & 0x3F) )); n=4; fi
+      fi
+    else
+      cp=$b1; n=1
+    fi
+    i=$(( i + n ))
+
+    if (( (cp >= 0x1100 && cp <= 0x115F) || (cp >= 0x2E80 && cp <= 0x303E) || (cp >= 0x3041 && cp <= 0x33FF) ||
+          (cp >= 0x3400 && cp <= 0x4DBF) || (cp >= 0x4E00 && cp <= 0x9FFF) || (cp >= 0xA000 && cp <= 0xA4CF) ||
+          (cp >= 0xAC00 && cp <= 0xD7A3) || (cp >= 0xF900 && cp <= 0xFAFF) || (cp >= 0xFE30 && cp <= 0xFE6F) ||
+          (cp >= 0xFF00 && cp <= 0xFF60) || (cp >= 0xFFE0 && cp <= 0xFFE6) )); then
+      w=$(( w + 2 ))
+    else
+      w=$(( w + 1 ))
+    fi
   done
   printf '%s' "$w"
 }
@@ -240,59 +360,94 @@ tui_pad() {
   printf '%s' "$s"
 }
 
+# 去除 ANSI 序列后的纯文本。
+# 注意：GNU sed 不认正则里的 \033（\0 是 NUL，后面只剩字面 "33"），必须把真实 ESC
+# 字节放进模式里（ANSI-C 引用 $'...'），否则在 GNU sed / Debian 上完全剥不掉。
 tui_strip() {
-  printf '%s' "$1" | sed -e 's/\033\[[0-9;]*m//g'
+  printf '%s' "$1" | sed -e $'s/\033\\[[0-9;]*m//g'
+}
+
+# 边框几何：内容行统一为 "  │ " + 内容(TUI_WIDTH-6) + " │"，
+# 上下边框为 "  ╭" + 横线(TUI_WIDTH-4) + "╮"，
+# 带标题的顶边框为 "  ╭ " + 标题 + " " + 横线(TUI_WIDTH-6-标题宽) + "╮"。
+# 这样每一种行渲染出来都恰好等于 TUI_WIDTH，框线才合得拢。
+tui_content_width() {
+  local w=$((TUI_WIDTH - 6))
+  (( w < 10 )) && w=10
+  printf '%s' "$w"
+}
+
+tui_border_len() {
+  local n="$1"
+  (( n < 0 )) && n=0
+  printf '%s' "$n"
 }
 
 tui_banner() {
-  local title="$1" subtitle="${2:-}" inner=$((TUI_WIDTH - 2))
+  local title="$1" subtitle="${2:-}"
+  local cw rw
+  cw=$(tui_content_width)
+  rw=$(tui_border_len $((TUI_WIDTH - 4)))
   printf '\n'
-  printf '  %s%s%s%s%s\n' "$C_CYAN" "$B_TL" "$(tui_repeat "$B_H" $((inner - 2)))" "$B_TR" "$C_RESET"
-  printf '  %s%s%s %s%s%s%s%s\n' "$C_CYAN" "$B_V" "$C_RESET" "$C_BOLD$C_WHITE" \
-    "$(tui_pad "$title" $((inner - 4)))" "$C_RESET" "$C_CYAN$B_V" "$C_RESET"
-  [[ -n "$subtitle" ]] && printf '  %s%s%s %s%s%s%s%s\n' "$C_CYAN" "$B_V" "$C_RESET" "$C_GRAY" \
-    "$(tui_pad "$subtitle" $((inner - 4)))" "$C_RESET" "$C_CYAN$B_V" "$C_RESET"
-  printf '  %s%s%s%s%s\n' "$C_CYAN" "$B_BL" "$(tui_repeat "$B_H" $((inner - 2)))" "$B_BR" "$C_RESET"
+  printf '  %s%s%s%s%s\n' "$C_CYAN" "$B_TL" "$(tui_repeat "$B_H" $rw)" "$B_TR" "$C_RESET"
+  printf '  %s%s%s %s%s%s %s%s%s\n' "$C_CYAN" "$B_V" "$C_RESET" "$C_BOLD$C_WHITE" \
+    "$(tui_pad "$title" $cw)" "$C_RESET" "$C_CYAN$B_V" "$C_RESET"
+  if [[ -n "$subtitle" ]]; then
+    printf '  %s%s%s %s%s%s %s%s%s\n' "$C_CYAN" "$B_V" "$C_RESET" "$C_GRAY" \
+      "$(tui_pad "$subtitle" $cw)" "$C_RESET" "$C_CYAN$B_V" "$C_RESET"
+  fi
+  printf '  %s%s%s%s%s\n' "$C_CYAN" "$B_BL" "$(tui_repeat "$B_H" $rw)" "$B_BR" "$C_RESET"
 }
 
 tui_section() {
-  local title="$1"
+  local title="$1" rw
+  rw=$(tui_border_len $((TUI_WIDTH - 4)))
   printf '\n  %s%s%s %s%s%s\n' "$C_ACCENT" "$I_MARK" "$C_RESET" "$C_BOLD" "$title" "$C_RESET"
-  printf '  %s%s%s\n' "$C_GRAY" "$(tui_repeat "$B_H" $((TUI_WIDTH - 4)))" "$C_RESET"
+  printf '  %s%s%s\n' "$C_GRAY" "$(tui_repeat "$B_H" $rw)" "$C_RESET"
 }
 
 tui_box() {
-  local title="${1:-}"
+  local title="${1:-}" rw n
+  rw=$(tui_border_len $((TUI_WIDTH - 4)))
   printf '\n'
   if [[ -n "$title" ]]; then
+    n=$(tui_border_len $((TUI_WIDTH - 6 - $(tui_dwidth "$title"))))
     printf '  %s%s %s%s%s %s%s%s\n' "$C_ACCENT" "$B_TL" "$C_BOLD" "$title" "$C_RESET" \
-      "$C_ACCENT" "$(tui_repeat "$B_H" $((TUI_WIDTH - 6 - $(tui_dwidth "$title"))))" "$B_TR$C_RESET"
+      "$C_ACCENT" "$(tui_repeat "$B_H" $n)" "$B_TR$C_RESET"
   else
-    printf '  %s%s%s%s\n' "$C_ACCENT" "$B_TL" "$(tui_repeat "$B_H" $((TUI_WIDTH - 4)))" "$B_TR$C_RESET"
+    printf '  %s%s%s%s\n' "$C_ACCENT" "$B_TL" "$(tui_repeat "$B_H" $rw)" "$B_TR$C_RESET"
   fi
 }
 
 tui_box_line() {
-  local text="$1" color="${2:-$C_WHITE}"
-  printf '  %s%s%s %s%s%s\n' "$C_ACCENT" "$B_V" "$C_RESET" "$color" \
-    "$(tui_pad "$text" $((TUI_WIDTH - 6)))" "$C_RESET"
+  local text="$1" color="${2:-$C_WHITE}" cw
+  cw=$(tui_content_width)
+  printf '  %s%s%s %s%s%s %s%s%s\n' "$C_ACCENT" "$B_V" "$C_RESET" "$color" \
+    "$(tui_pad "$text" $cw)" "$C_RESET" "$C_ACCENT$B_V" "$C_RESET"
 }
 
 tui_box_end() {
-  printf '  %s%s%s%s\n' "$C_ACCENT" "$B_BL" "$(tui_repeat "$B_H" $((TUI_WIDTH - 4)))" "$B_BR$C_RESET"
+  local rw
+  rw=$(tui_border_len $((TUI_WIDTH - 4)))
+  printf '  %s%s%s%s\n' "$C_ACCENT" "$B_BL" "$(tui_repeat "$B_H" $rw)" "$B_BR$C_RESET"
 }
 
 tui_panel() {
   local title="$1"; shift
-  local inner=$((TUI_WIDTH - 4)) entry k v
+  local cw rw n vw entry k v
+  cw=$(tui_content_width)
+  rw=$(tui_border_len $((TUI_WIDTH - 4)))
+  n=$(tui_border_len $((TUI_WIDTH - 6 - $(tui_dwidth "$title"))))
+  vw=$((cw - 19)); (( vw < 1 )) && vw=1
   printf '\n  %s%s %s%s%s %s%s%s\n' "$C_ACCENT" "$B_TL" "$C_BOLD" "$title" "$C_RESET" \
-    "$C_ACCENT" "$(tui_repeat "$B_H" $((inner - 4 - $(tui_dwidth "$title"))))" "$B_TR$C_RESET"
+    "$C_ACCENT" "$(tui_repeat "$B_H" $n)" "$B_TR$C_RESET"
   for entry in "$@"; do
     k="${entry%%|*}"; v="${entry#*|}"
-    printf '  %s%s%s %s%s%s %s%s%s\n' "$C_ACCENT" "$B_V" "$C_RESET" "$C_GRAY" \
-      "$(tui_pad "$k" 18)" "$C_RESET" "$C_WHITE" "$v" "$C_RESET"
+    printf '  %s%s%s %s%s%s%s %s%s%s %s%s%s\n' "$C_ACCENT" "$B_V" "$C_RESET" "$C_GRAY" \
+      "$(tui_pad "$k" 18)" "$C_RESET" "$C_WHITE" "$(tui_pad "$v" $vw)" "$C_RESET" \
+      "$C_ACCENT$B_V" "$C_RESET"
   done
-  printf '  %s%s%s%s\n' "$C_ACCENT" "$B_BL" "$(tui_repeat "$B_H" $inner)" "$B_BR$C_RESET"
+  printf '  %s%s%s%s\n' "$C_ACCENT" "$B_BL" "$(tui_repeat "$B_H" $rw)" "$B_BR$C_RESET"
 }
 
 tui_info() { printf '  %s%s%s %s\n' "$C_INFO" "$I_INFO" "$C_RESET" "$1"; }
@@ -1312,7 +1467,7 @@ test_case "deploy 系统操作的可测分支"
 
 # 未安装 xray 时 xray_installed 必须返回非零退出码
 if [[ ! -x "$XRAY_BIN" ]]; then
-  assert_fails xray_installed "未安装时 xray_installed 返回非零"
+  assert_fails "未安装时 xray_installed 返回非零" xray_installed
 fi
 
 # enable_bbr 在不支持 bbr 的内核上必须安全失败而非崩溃；输出必须提及 bbr
