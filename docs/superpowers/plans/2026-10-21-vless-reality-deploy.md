@@ -601,6 +601,15 @@ printf 'q' | bash "$ROOT/test/helpers/menu_tty.sh" "选择" "A" "B" "C" >/dev/nu
 assert_status 255 "$rc" "直接按 q 返回 255"
 ```
 
+> **实施说明（Task 2 已完成，以 `test/unit.sh` 为准）**：上面的 Step 1 是本任务的**原始规格**。
+> 经 3 轮修复（每轮都有独立评审），`test/unit.sh` 最终为 **52 条断言全部通过**，
+> 相对上面的原始规格**额外**增加了：缓冲区提示行格式串 `%s` 占位符个数的**静态校验**
+> （含「匹配不到格式串就算失败」的封口，避免 `assert_eq 0 0` 恒真通过）、
+> `tui_confirm` 两个分支的 stdout 字节数断言、`tui_run` 临时文件不可用时的降级路径断言。
+> 逐条改动与实测证据见
+> `.superpowers/sdd/2026-10-21-vless-reality-deploy/task-2-report.md`。
+> **本任务后续不再修改**；若要改 `lib/tui.sh`，先读该报告。
+
 同时创建四个 helper（`test/helpers/`）：
 
 `test/helpers/menu_noninteractive.sh`：
@@ -851,11 +860,14 @@ tui_menu() {
       fi
     done
     if [[ -n "$buf" ]]; then
-      # 格式串的 %s 个数必须与实参个数严格相等（6 ↔ 6）：
-      # 多一个 %s 会让 bash printf 复用一次格式串，把提示行打印两遍，
-      # 而重绘统一按 n+1 行回退 → 缓冲区非空时每次重绘少算一行，
-      # 光标逐行下移、ESC[J 清不到上一行残留，菜单整体错位一行。
-      # 少一个 %s 则结尾的颜色重置丢失，终端会残留灰色。
+      # 格式串的 %s 个数必须与实参个数严格相等（6 ↔ 6）。两种错法的机理不同：
+      #   * 占位符【多于】实参：bash 只把缺的补成空串、并不会重复打印，
+      #     但尾部那个空填充位会【静默吃掉新加的实参】——新加的内容落在结尾
+      #     $C_RESET 的【后面】，行尾因此没有重置收尾，终端会残留该颜色。
+      #   * 实参【多于】占位符（例如少写一个 %s）：bash 会【复用】格式串，
+      #     提示行被打印两遍；重绘统一按 n+1 行回退 → 缓冲区非空时每次重绘
+      #     少算一行，光标逐行下移、ESC[J 清不到上一行残留，菜单整体错位一行；
+      #     同时第一遍的结尾颜色重置被顶掉，终端也会残留灰色。
       # 另外数字必须在光标【之前】：渲染成 "10_"，不是 "_10"。
       printf '     %s编号: %s%s%s_  %s↑↓ 移动 · Enter 确认 · q 取消%s\n' \
         "$C_GRAY" "$C_ACCENT$C_BOLD" "$buf" "$C_RESET" "$C_GRAY" "$C_RESET"
@@ -1096,6 +1108,20 @@ bash test/unit.sh
 预期：FAIL，`lib/core.sh: No such file or directory`。
 
 **Step 3: 实现 `lib/core.sh`**
+
+> ⚠️ **本任务是【整体重写】`lib/core.sh`，不是在其上追加。**
+> 仓库里当前已存在一份早期草稿（`lib/core.sh`，约 295 行），它与本计划**冲突**，
+> 下列内容**一律不保留**：
+> - `require_root()` —— 按计划的「函数归属唯一」，`require_root` 属于 `install.sh`
+>   （计划 Task 8）。core.sh 里再定义一份，两个文件都被 source 时后加载者会覆盖前者。
+> - `is_modern_debian()` —— 计划中没有这个函数，不要保留。
+> - `port_in_use()` 里的 `netstat` 回退分支 —— 属于 Task 4，本任务不写。
+> - `APP_VERSION='1.2.0'` —— 计划统一为 `1.0.0`。
+> - `detect_os()` 不接受 `os_release_path` 参数的旧写法 —— 计划要求接受该参数（可测）。
+> - 草稿里的 `detect_public_ip` / `detect_local_ip` / `port_in_use` / `port_occupant` /
+>   `random_free_port` / `target_supports_tls13` / `target_latency_ms` /
+>   `apt_update_once` / `ensure_packages` / `service_run_user` —— 属于 Task 4，
+>   本任务不写，Task 4 再按计划追加。
 
 创建 `lib/core.sh`（本任务只写纯函数与状态部分，网络探测在 Task 4 追加）：
 
