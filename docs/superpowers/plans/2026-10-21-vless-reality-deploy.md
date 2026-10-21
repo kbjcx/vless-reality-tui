@@ -8499,6 +8499,7 @@ export TUI_DIGIT_TIMEOUT=2
 - Modify: `lib/tui.sh`（定点修订 P1：新增 `tui_box_text`）
 - Modify: `lib/deploy.sh`（定点修订 P2 / P3：分享链接改用 `tui_box_text`）
 - Modify: `docs/superpowers/specs/2026-10-21-vless-reality-deploy-design.md`（定点修订 P4：4.1 依赖图补 `core.sh → tui.sh` 边）
+- Modify: `dist/install.sh`（**重新生成**：P1–P3 改了 `lib/` → 产物必须同步，见 T13-12）
 
 **Interfaces:**
 - Consumes: `lib/tui.sh` `lib/core.sh`
@@ -8879,8 +8880,14 @@ bash test/unit.sh
 **Step 7: 提交**
 
 ```bash
+# ⚠️ 提交前必须先重新生成单文件产物：P1–P3 改了 lib/tui.sh 与 lib/deploy.sh，
+#    dist/install.sh 是 build.sh 从它们内联出来的 → 不重新生成就会「脱节」：
+#    ① 单元套件每跑一次都会自己执行 bash build.sh → 不提交它，git status 永远不干净；
+#    ② CI 的「dist 与源码同步校验」步骤（bash build.sh + git diff --exit-code --stat dist/install.sh）
+#       会直接红。见 T13-12。
+bash build.sh
 git add demo.sh README.md test/integration-debian.sh test/unit.sh lib/tui.sh lib/deploy.sh \
-  docs/superpowers/specs/2026-10-21-vless-reality-deploy-design.md
+  docs/superpowers/specs/2026-10-21-vless-reality-deploy-design.md dist/install.sh
 # ⚠️ 必须显式设置可执行位（见 T13-7）：仓库本地的 core.fileMode=false，
 #    新克隆的仓库里 .sh 全是 100644 → demo.sh 与集成脚本直接 ./ 跑会 Permission denied。
 git update-index --chmod=+x demo.sh
@@ -9066,6 +9073,16 @@ core.sh ──> tui.sh
 > P4 的新文本**多了一行**（依赖图多一条边），前文没有前缀关系，
 > 所以统一判据成立：**改前命中 0 次、改后命中 1 次**。
 
+### 修订轮 2：实施者如实报出的计划缺陷（追认）
+
+| # | 级别 | 发现 | 处置 |
+|---|---|---|---|
+| **T13-12** | **Important** | **Task 13 的 Step 7 提交清单漏了 `dist/install.sh`。** P1 / P2 / P3 改了 `lib/tui.sh` 与 `lib/deploy.sh`，而 `dist/install.sh` 是 `build.sh` 从它们**内联**出来的 → 产物必然与源码脱节。后果有三条：<br>① **单元套件每跑一次都会自己执行 `bash build.sh`**（见 `test/unit.sh` 的 Task 12 段）→ 不把产物提交进去，`git status --porcelain` **永远不干净**；<br>② CI 的「dist 与源码同步校验」步骤（`bash build.sh` + `git diff --exit-code --stat dist/install.sh`）会**直接红**；<br>③ 计划自身的「单文件产物与开发版不漂移」不变量被打破。<br>**实施者在报告里如实指出这一点并选择了提交产物**，控制器核实后认定该处置正确 | Step 7 的提交清单**补上 `dist/install.sh`**，并在提交前显式加上 `bash build.sh`；Files 块补一条 `Modify: dist/install.sh` |
+| **T13-13** | **Important** | **验收标准第 5 条对 **P1 / P4** 自相矛盾（与 Task 12 的 T12-18 同一类）。** 原文要求「每处的**旧文本在改后文件里必须命中 0 次**」—— 但 **P1** 的新文本是旧文本的**严格超集**（`tui_box_end` 的函数体被原样保留在改后文本里），**P4** 同理（依赖图的前 4 行原样保留，只是多了一行）→ 改完后旧文本必然还命中 **1** 次 → **这条对 P1 / P4 不可能成立**。<br>**实施者如实报出了这个矛盾**，没有偷偷改计划，也没有改代码去凑 | 验收标准第 5 条补上 **P1 / P4 的例外条款**：新文本命中 1 次；**P2 / P3 的旧文本命中 0 次**；**P1 / P4 的旧文本命中 1 次**（它就在新文本里） |
+
+> 两次都**只改散文**，Task 13 的**代码块一个字未动** —— 那些块已是实施完毕的内容，
+> 控制器复核时逐字节比对的就是它们。
+
 #### 修订轮 1 的验收标准
 
 1. `demo.sh` 的内容与上面 **Step 3 代码块逐字节一致**（新建文件）。
@@ -9077,7 +9094,12 @@ core.sh ──> tui.sh
    + 「已验证」清单 + 整体验证边界（缺一条都算不合格）。
    报告里要贴出 README 的**小节标题清单**供核对。
 5. **四处定点修订**（P1 / P2 / P3 / P4）与上面写的**改后**文本逐字一致；
-   每处的**旧文本在改后文件里必须命中 0 次**、**新文本命中 1 次**。
+   每处的**新文本命中 1 次**；**P2 / P3 的旧文本在改后文件里必须命中 0 次**。
+   ⚠️ **P1 与 P4 是例外**：它们的「新文本」是「旧文本」的**严格超集**
+   （P1 的 `tui_box_end` 函数体被原样保留在改后文本里；
+   P4 的依赖图前 4 行也原样保留，只是多了一行 `core.sh ──> tui.sh`）
+   → 改完后旧文本必然还命中 **1** 次 → 「旧文本命中 0 次」对 P1 / P4 **不可能成立**。
+   **P1 / P4 的正确判据是：旧文本命中 1 次（它就在新文本里）、新文本命中 1 次。**
    **除这四处外，Task 1 / Task 2 / Task 9 / Task 10 的 Step 3 块一字未动**
    （`lib/tui.sh` 与 `lib/deploy.sh` 因此不再与计划里对应任务的块逐字节一致 ——
    补偿方式就是这四条可机械核对的精确文本替换）。
