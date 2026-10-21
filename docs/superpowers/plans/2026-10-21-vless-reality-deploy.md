@@ -1499,6 +1499,22 @@ if [[ -n "$bad_dir" ]]; then
   assert_status 0 "$rc" "load_state 对带副作用的合法状态文件仍视为可读"
   assert_eq "1" "$(wc -l < "$bad_dir/sidefx" 2>/dev/null | tr -d ' ')" \
     "load_state 只把状态文件执行一次（不得用子 shell 探测导致双执行）"
+  # 第三态「不可读」：权限问题，报『不可读』而不是笼统失败。
+  # 本平台（Windows + MSYS）chmod 000 只会把 mode 变成 444、文件仍然可读 →
+  # 该分支在这台机器上不可达，断言自动跳过；
+  # 在 Debian / CI（以非 root 运行）下会真正执行。
+  unread_dir=$(mktemp -d 2>/dev/null)
+  if [[ -n "$unread_dir" ]]; then
+    printf 'PORT=443\n' > "$unread_dir/unreadable.env"
+    chmod 000 "$unread_dir/unreadable.env" 2>/dev/null
+    if [[ ! -r "$unread_dir/unreadable.env" ]]; then
+      out=$( ( STATE_FILE="$unread_dir/unreadable.env"; load_state ) 2>&1 ); rc=$?
+      assert_status 1 "$rc" "load_state 对不可读的状态文件返回非零"
+      assert_contains "$out" "状态文件不可读" \
+        "load_state 对不可读的状态文件报『不可读』而不是笼统失败"
+    fi
+  fi
+  rm -rf "$unread_dir"
 else
   assert_eq "mktemp -d 能创建唯一临时目录" "失败（mktemp -d 返回空路径）" \
     "load_state 失败路径用例前提：mktemp -d 必须能创建唯一临时目录"
@@ -1620,7 +1636,7 @@ rm -rf "$perm_dir"
 
 | 编号 | 类别 | 处置 | 落在哪 |
 |---|---|---|---|
-| F-2 | **Important** | `save_state` 与 `export_client_artifacts` 的**调用方**忽略返回码：状态没落盘 / 物料没导出，流程却一路走到「部署完成」面板。Task 9 `deploy_wizard` 两处都要 `|| { tui_err ...; return 1; }`（Task 10 `menu_rotate_keys` 在修复轮 1 已加） | Task 9 代码块 |
+| F-2 | **Important** | `save_state` 与 `export_client_artifacts` 的**调用方**忽略返回码：状态没落盘 / 物料没导出，流程却一路走到「部署完成」面板。Task 9 `deploy_wizard` 两处都要 `|| { tui_err ...; return 1; }`（Task 10 `menu_rotate_keys` 的 `save_state` 守卫在修复轮 1 已加；它的 `export_client_artifacts` 守卫由 Task 10 修订补上 —— 本轮复评发现当时只加了前者） | Task 9 代码块 + Task 10 代码块 |
 | F-3 | **Important** | `load_state` 用「子 shell 静默探测」做语法检查 → 状态文件被**执行两次**（探测一次、正式读一次），副作用会双发且第一次对调用方不可见。改用 `bash -n`（只解析不执行），并补一条断言证明状态文件**只被执行一次** | Step 3 代码块 + 新增断言 |
 | F-4 | Minor | `load_state` 把「读不到」与「格式错」混为一谈：文件存在但不可读（权限问题）也报「格式错误」，把人带偏。改为三态分开报：不存在 / 不可读 / 格式错误 | Step 3 代码块 + 新增断言 |
 | F-5 | Minor | M-7 的「python 分支 vs 回退分支」断言在 python3 缺失或**存在但功能异常**（某些系统上 python3 只是个占位存根：`command -v` 找得到、一执行就失败）的机器上**恒真** —— 两侧其实都是回退分支。补「功能可用守卫」+「确定性 mock python3 基准」 | 新增断言 |
@@ -1764,6 +1780,41 @@ else
 fi
 ```
 
+#### 修复轮 2 的独立复评结论（PASS，限定范围）
+
+独立复评（新的评审者，只读核对）结论：**PASS（限定范围）**，未发现阻塞项。
+限定范围：Debian 真机端到端未验（计划已声明）；F-4 的「不可读」态在本平台不可达
+（已补条件断言，在 Debian / CI 非 root 下会真正执行）；F-2 需带入 Task 9 / Task 10。
+
+复评自己做的关键实验（比控制器更严格，做了控制器没做的「坏 python3 存根模拟」）：
+
+| 探针 | 环境 | 结果 |
+|---|---|---|
+| E0 | 坏 python3 存根，未变异，mock 基准 | 156 全绿 ✓ |
+| E1 | 坏 python3 存根 + `%27`→`%39` + **旧基准**（真实分支） | M-7 的对比断言**仍然绿** → **恒真缺陷的直接实证** |
+| E2 | 坏 python3 存根 + `%27`→`%39` + **新基准**（mock） | M-7 的对比断言**变红** → 新基准有判别力 |
+
+E1/E2 是本轮最关键的证据：**同一个变异体，在旧基准下恒绿、在新基准下变红**。
+
+复评的 7 条非阻塞发现及其处置：
+
+| # | 位置 | 处置 |
+|---|---|---|
+| 1 | 计划 Task 13 README 第 2 条把「本机 python3 状态」写成事实，与同提交新增的「状态是可变的」自相矛盾 | 已改：改成写「两层覆盖（mock 基准层 / 真实分支层）」，不把任何机器的现状写成事实 |
+| 2 | 计划验收标准第 5 条写「删掉分支 → 两条断言变红」，实测只 1 条 | 已改：写明只 1 条并解释原因（`bash -n` 对不存在文件返回 127 → 落到「格式错误」分支 → 仍 `return 1`） |
+| 3 | 报告 §3 表格的「计划预期」列把变体 B 写成「1 条变红」，与计划原文「两条」不符，报告未提这个分歧 | 交实施者更正报告 |
+| 4 | 报告未记录**控制器**在计划侧做的更正提交（`98344cf`），提交清单止于 `d5609bd` | 交实施者更正报告 |
+| 5 | F-4 第三态「不可读」无断言覆盖；本平台不可达（MSYS `chmod 000` → mode 444 且仍可读） | 已补条件断言（真机上真正执行）+ 断言条数说明精确化 |
+| 6 | 计划 F-2 表格行「Task 10 menu_rotate_keys 在修复轮 1 已加」表述过宽 | 已改准确表述；Task 10 的 `export_client_artifacts` 守卫由 Task 10 修订补上 |
+| 7 | 报告 §9「复现方式」仍写「期望：全部通过：130 项断言」 | 交实施者更正报告 |
+
+复评另确认了 `lib/tui.sh` 的两处时间窗口（`tui.sh:497` 的 `read -rsn2 -t 0.2`、
+`tui.sh:531` 的 `read -rsn1 -t 0.35`）**确实是**那次偶发「失败 1 项」的机制：
+注入超过窗口的延迟后，对应断言会由绿变红。复评独立压测 **64 次（40 顺序 + 24 并发负载）
+0 失败**，实施者压测 325+ 次也未复现。判定：**不构成本轮阻塞项**
+（两处都在 Task 1/2 范围、Task 3 无一条断言依赖时序），
+但对 Task 12 的 CI 是真实的易抖性风险 —— 已在账本记为 Task 12 的待评估项。
+
 #### 修复轮 2 的验收标准
 
 1. `lib/core.sh` 与本计划 Task 3 的 **Step 3 代码块逐字节一致**（`diff` 为空）。
@@ -1771,11 +1822,20 @@ fi
    且 Task 1/2 的 52 条旧断言**一行未删**。
 3. `bash test/unit.sh` 全部通过、退出码 0；断言总数由 149 增至 **156**
    （T3-8 +2、F-3 +2、F-4 +2、F-5 的 M-7 块 3 → 4 条即 +1）。
+   **注意 156 是「本机实测值」**：其中 4 条是**权限相关行为断言**
+   （状态文件 600 / 状态目录 700 / 「不可读」态 2 条），在 Windows + MSYS 上
+   会被**自动跳过**（MSYS 的 chmod 是模拟的，且 root/Windows 上文件恒可读）；
+   在 Debian / CI（以非 root 运行）上它们会真正执行，届时总数为 **160**。
+   所以「断言总数」在不同平台本就不同 —— 报告里要写明是哪个平台的数字。
 4. `lib/tui.sh` **一字未动**。
 5. 红灯证据（至少给出这五条）：
    - 把 `load_state` 的 `bash -n` 换回子 shell 探测 → F-3 的「只执行一次」断言变红
      （副作用计数从 1 变成 2）；
-   - 把 `load_state` 的「不存在 / 不可读」分支去掉 → F-4 的两条断言变红；
+   - 把 `load_state` 的「不存在 / 不可读」分支去掉 → **只有 1 条断言变红**
+     （F-4 的「报『不存在』」那条），**不是 2 条**：删掉分支后流程落到
+     `bash -n`，而 `bash -n` 对不存在的文件返回 127 且 stderr 非空 →
+     走「格式错误」分支 → 仍然 `return 1` → 「返回非零」那条**依然是绿的**。
+     （本条是复评实测出来的，原先计划写「两条变红」是事实错误。）
    - 把 `load_state` 换回旧写法（`[[ -f ]] || return 1` + 静默探测）→
      F-4 的「状态文件不存在」提示断言变红；
    - 把 `lib/core.sh` 回退实现里的 `out+='%27'` 改成 `out+='%39'`（即把回退实现弄错）
@@ -3345,7 +3405,14 @@ do_deploy() {
   setup_systemd || { tui_err "systemd 配置失败，部署中止"; return 1; }
 
   tui_step "⑤ 放行防火墙端口 $PORT/tcp"
-  open_firewall "$PORT" || tui_warn "防火墙放行未成功，请手工确认"
+  # 防火墙放行失败【不中止】部署（用户可能用云安全组/云防火墙管端口），
+  # 但必须把失败状态带进最终的「部署完成」面板 ——
+  # 否则用户看到「部署完成」就以为端口通了，实际客户端连不上。
+  FIREWALL_OK=1
+  if ! open_firewall "$PORT"; then
+    tui_warn "防火墙放行未成功，请手工确认"
+    FIREWALL_OK=0
+  fi
 
   tui_step "⑥ 网络调优"
   enable_bbr || tui_tip "已跳过网络调优（非致命）"
@@ -3454,12 +3521,19 @@ deploy_wizard() {
 
   local link
   link=$(build_share_link "$UUID" "$SERVER_IP" "$PORT" "$SNI" "$PUBLIC_KEY" "$SHORT_ID" "$REMARK")
+  # 生成为空说明参数不全（缺 UUID/公钥/地址）→ 空的分享链接框用户会直接复制走，
+  # 粘到客户端就是一条废链接。必须报错退出。
+  [[ -n "$link" ]] || { tui_err "分享链接生成为空，部署结果不可用。"; return 1; }
+  # 防火墙那一行必须如实反映 do_deploy ⑤ 的结果。
+  local fw_row="已放行 $PORT/tcp"
+  [[ "${FIREWALL_OK:-1}" -eq 1 ]] || fw_row="放行失败，请手工放行 $PORT/tcp"
   tui_panel "部署完成" \
     "地址|$SERVER_IP:$PORT" \
     "UUID|$UUID" \
     "SNI|$SNI" \
     "公钥 pbk|$PUBLIC_KEY" \
     "ShortID sid|$SHORT_ID" \
+    "防火墙|$fw_row" \
     "客户端配置|$OUT_DIR/client.json" \
     "二维码|$OUT_DIR/qrcode.png"
 
@@ -3501,6 +3575,7 @@ git commit -m "feat(wizard): 部署向导——参数确认、目标探测与六
 
 **Files:**
 - Modify: `lib/deploy.sh`（追加 `menu_*` 与 `management_menu`）
+- Modify: `install.sh`（删除 `management_menu` / `deploy_wizard` 的占位实现）
 - Modify: `test/unit.sh`
 - Create: `test/helpers/menu_management.sh`
 
@@ -3560,6 +3635,8 @@ menu_show_client() {
   load_state || return 1
   local link
   link=$(build_share_link "$UUID" "$SERVER_IP" "$PORT" "$SNI" "$PUBLIC_KEY" "$SHORT_ID" "$REMARK")
+  # 生成为空说明参数有问题（缺 UUID/公钥/地址）→ 必须报错，不能展示一片空白。
+  [[ -n "$link" ]] || { tui_err "分享链接生成为空，状态文件可能不完整。"; return 1; }
   tui_panel "当前节点" \
     "地址|$SERVER_IP:$PORT" \
     "UUID|$UUID" \
@@ -3587,12 +3664,20 @@ menu_logs() {
 }
 
 menu_update_xray() {
-  ensure_packages curl ca-certificates
+  # 依赖装不上就必须停在这里：继续往下走会下载安装脚本、失败，
+  # 报出来的却是「下载失败」——错误信息与真实原因无关。
+  ensure_packages curl ca-certificates || { tui_err "依赖安装失败，无法更新 Xray。"; return 1; }
   local installer
-  installer=$(mktemp)
+  # mktemp 可能失败（磁盘满 / 目录不可写）→ 拿到空路径后 curl -o "" 会失败，
+  # 而且 rm -f "" 会报 "cannot remove ''"。必须先守卫。
+  installer=$(mktemp 2>/dev/null)
+  if [[ -z "$installer" ]]; then
+    tui_err "无法创建临时文件，更新中止。"
+    return 1
+  fi
   curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o "$installer" || {
     tui_err "下载安装脚本失败"; rm -f "$installer"; return 1; }
-  chmod +x "$installer"
+  chmod +x "$installer" || { tui_err "无法设置安装脚本权限"; rm -f "$installer"; return 1; }
   tui_run "更新 Xray 内核" bash "$installer" install
   local rc=$?
   rm -f "$installer"
@@ -3601,9 +3686,14 @@ menu_update_xray() {
 }
 
 menu_tune() {
-  open_firewall "$PORT" || true
-  enable_bbr || true
+  # 不能用 `|| true` 吞掉失败：防火墙没放行、BBR 没开，
+  # 用户却只看到 service_status 的输出 → 以为调优成功了。
+  # 两个动作互相独立，所以各自报错、最后统一返回。
+  local rc=0
+  open_firewall "$PORT" || { tui_err "防火墙放行失败，请检查 ufw/iptables/nft。"; rc=1; }
+  enable_bbr || { tui_warn "BBR 未启用（内核不支持或权限不足），不影响部署可用性。"; }
   service_status
+  return $rc
 }
 
 menu_rotate_keys() {
@@ -3625,11 +3715,20 @@ menu_rotate_keys() {
   rm -f "$cfg"
   save_state || { tui_err "状态保存失败"; return 1; }
   restart_service || return 1
-  export_client_artifacts "$OUT_DIR" "$UUID" "$SERVER_IP" "$PORT" "$SNI" "$PUBLIC_KEY" "$SHORT_ID" "$REMARK"
+  # 物料导出失败必须报错：否则「密钥已轮换」这条提示会让人以为
+  # client.json / link.txt 已经是新的，实际还是旧的（甚至根本没生成）。
+  export_client_artifacts "$OUT_DIR" "$UUID" "$SERVER_IP" "$PORT" "$SNI" "$PUBLIC_KEY" "$SHORT_ID" "$REMARK" \
+    || { tui_err "客户端物料导出失败，密钥已轮换但客户端文件未更新。"; return 1; }
   tui_ok "密钥已轮换，请使用新的分享链接更新客户端"
 }
 
 menu_uninstall() {
+  # 单文件分发版（dist/install.sh）里没有 uninstall.sh → exec 会失败并让菜单崩掉。
+  if [[ ! -x "$ROOT_DIR/uninstall.sh" ]]; then
+    tui_warn "当前目录没有 uninstall.sh（单文件分发版不含卸载脚本）。"
+    tui_tip "请手动执行：systemctl disable --now xray && rm -f $XRAY_CONFIG"
+    return 1
+  fi
   exec "$ROOT_DIR/uninstall.sh"
 }
 
@@ -3688,7 +3787,7 @@ bash test/unit.sh
 **Step 5: 提交**
 
 ```bash
-git add lib/deploy.sh test/unit.sh test/helpers/
+git add lib/deploy.sh install.sh test/unit.sh test/helpers/
 git commit -m "feat(menu): 管理菜单——查看、重启、日志、更新、轮换密钥与卸载"
 ```
 
@@ -3781,23 +3880,56 @@ fi
 
 tui_section "备份并移除配置"
 if [[ -f "$XRAY_CONFIG" ]]; then
-  mkdir -p "$OUT_DIR/backup"
-  cp -f "$XRAY_CONFIG" "$OUT_DIR/backup/config.json.$(date +%Y%m%d%H%M%S)"
-  rm -f "$XRAY_CONFIG"
-  tui_ok "配置已备份并移除：$OUT_DIR/backup/"
+  # 备份失败时【绝不能】继续删原配置：否则用户的服务端配置直接丢失、
+  # 且没有任何可回滚的副本。备份失败就停在这里，让用户自己决定。
+  if ! mkdir -p "$OUT_DIR/backup"; then
+    tui_err "无法创建备份目录：$OUT_DIR/backup"
+    tui_err "为避免丢失配置，未删除原配置：$XRAY_CONFIG"
+    exit 1
+  fi
+  backup_file="$OUT_DIR/backup/config.json.$(date +%Y%m%d%H%M%S)"
+  if ! cp -f "$XRAY_CONFIG" "$backup_file"; then
+    tui_err "备份配置失败：$XRAY_CONFIG"
+    tui_err "为避免丢失配置，未删除原配置。请检查 $OUT_DIR 的剩余空间与权限。"
+    exit 1
+  fi
+  if ! rm -f "$XRAY_CONFIG"; then
+    tui_err "备份已保存到 $backup_file，但原配置删除失败：$XRAY_CONFIG"
+    exit 1
+  fi
+  tui_ok "配置已备份并移除：$backup_file"
 fi
 
 tui_section "撤销防火墙规则"
+# 必须用 load_state（Task 3 提供的唯一读状态入口），不要直接 `. "$STATE_FILE"`：
+#   ① 直接 source 会把状态文件【执行】一遍（Task 3 修复轮 2 刚把这条改掉）；
+#   ② 没有语法检查，状态文件损坏时报错与真实原因无关；
+#   ③ load_state 能区分「读不到」与「格式错」。
 PORT=''
-[[ -f "$STATE_FILE" ]] && PORT=$(. "$STATE_FILE"; printf '%s' "${PORT:-}")
+if [[ -f "$STATE_FILE" ]]; then
+  load_state || tui_warn "状态文件读取失败，无法确定端口（防火墙规则可能残留）。"
+  PORT="${PORT:-}"
+fi
 if [[ -n "$PORT" ]]; then
   if have_cmd ufw && ufw status 2>/dev/null | grep -q 'Status: active'; then
-    ufw delete allow "$PORT/tcp" >/dev/null 2>&1 && tui_ok "已撤销 ufw 规则 $PORT/tcp" || true
+    # 失败必须有提示：静默跳过会让人以为规则已撤销，实际还开着。
+    if ufw delete allow "$PORT/tcp" >/dev/null 2>&1; then
+      tui_ok "已撤销 ufw 规则 $PORT/tcp"
+    else
+      tui_warn "ufw 规则 $PORT/tcp 撤销失败（可能本来就没有该规则）。"
+    fi
   elif have_cmd iptables; then
+    # 必须数一数真删了几条：循环一次都没进也报「已撤销」就是谎报成功。
+    local ipt_removed=0
     while iptables -C INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null; do
       iptables -D INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || break
+      ipt_removed=$((ipt_removed + 1))
     done
-    tui_ok "已撤销 iptables 规则 $PORT/tcp"
+    if (( ipt_removed > 0 )); then
+      tui_ok "已撤销 iptables 规则 $PORT/tcp（$ipt_removed 条）"
+    else
+      tui_warn "未找到 iptables 规则 $PORT/tcp（可能本来就没有）。"
+    fi
   elif have_cmd nft; then
     nft list table inet filter >/dev/null 2>&1 && {
       local_rule=$(nft list chain inet filter input 2>/dev/null | grep -n "tcp dport $PORT" | head -1 | cut -d: -f1)
@@ -3903,7 +4035,21 @@ set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 OUT="$ROOT/dist/install.sh"
 VERSION="$(sed -n "s/^APP_VERSION='\(.*\)'.*/\1/p" "$ROOT/lib/core.sh" | head -1)"
-[[ -n "$VERSION" ]] || VERSION='0.0.0'
+# 提取不到就报错退出：静默回落成 0.0.0 会让产物带着错误的版本号发布出去，
+# 而 CI 的 dist 同步校验只比对内容、不会发现版本号是错的。
+if [[ -z "$VERSION" ]]; then
+  printf '无法从 lib/core.sh 提取 APP_VERSION，构建中止。\n' >&2
+  exit 1
+fi
+
+# 先确认 4 个源文件都在：缺文件时 sed 会报一句晦涩的 "No such file or directory"，
+# 没人看得出是哪个文件缺了。
+for f in tui.sh core.sh client.sh deploy.sh; do
+  if [[ ! -f "$ROOT/lib/$f" ]]; then
+    printf '缺少源文件：lib/%s\n' "$f" >&2
+    exit 1
+  fi
+done
 
 mkdir -p "$ROOT/dist"
 tmp="$OUT.tmp"
@@ -3990,7 +4136,11 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq shellcheck
-          shellcheck --severity=warning install.sh uninstall.sh build.sh demo.sh lib/*.sh test/*.sh test/helpers/*.sh
+          # 用 find 而不是写死文件名：写死 uninstall.sh / demo.sh 的话，
+          # 在这两个文件还没创建的提交上跑 CI 必然失败（shellcheck 找不到文件就退出非零）。
+          # dist/ 是构建产物，不重复检查。
+          find . -name '*.sh' -not -path './.git/*' -not -path './.worktrees/*' \
+               -not -path './dist/*' -print0 | xargs -0 -r shellcheck --severity=warning
 
       - name: 单元测试
         run: bash test/unit.sh
@@ -4052,6 +4202,10 @@ assert_status 0 "$?" "demo.sh 正常退出"
 assert_contains "$out" "分享链接" "demo 展示分享链接样例"
 assert_eq 0 "$(grep -c 'systemctl ' <<<"$out")" "demo 不调用 systemctl"
 assert_eq 0 "$(grep -c 'apt-get' <<<"$out")" "demo 不调用 apt-get"
+# 只看输出不够：demo.sh 若把命令输出重定向到 /dev/null，上面的断言就漏掉了。
+# 再直接查一次 demo.sh 的源码。
+assert_eq 0 "$(grep -cE '^[^#]*(systemctl|apt-get|ufw|iptables|nft|rm -f|systemctl disable)' "$ROOT/demo.sh" || true)" \
+  "demo.sh 源码里不含任何改系统的命令"
 ```
 
 **Step 2: 运行测试确认失败**
@@ -4161,7 +4315,8 @@ docker exec "$CNAME" bash -c 'bash build.sh' || { echo "构建失败"; exit 1; }
 
 echo "==> 非交互部署（--yes）"
 docker exec "$CNAME" bash -c 'bash dist/install.sh --yes --port 443 --sni www.microsoft.com --name it-test' || {
-  echo "部署失败（容器内 systemd 不可用时属预期，需在真机或 privileged 容器验证）"
+  echo "==> [SKIPPED] 容器内端到端部署未通过：普通容器没有 systemd，属预期。"
+  echo "==>          这一段必须在真机或 --privileged 容器里验证；本仓库的 CI 不覆盖它。"
 }
 
 echo "==> 集成测试结束"
@@ -4186,12 +4341,16 @@ echo "==> 集成测试结束"
      它的 `chmod` 是**模拟**的（`stat -c '%a'` 恒为 644），所以
      「状态文件 600 / 状态目录 700 / 客户端导出目录 700 / 客户端物料文件 600」
      这些权限位断言在开发机上会**自动跳过**，只有 Debian 真机上才会真正执行。
-  2. **`urlencode` 的 python3 分支的覆盖范围** —— 开发机的 `python3` 是
-     WindowsApps 别名下的 Python 3.15.0，功能正常，因此 python 分支与回退分支的
-     逐字节一致性**在开发机上已被真实执行并验证**（单元测试里的「真实 python3 分支」
-     对比用例走的就是它）。但 **python3 是可选依赖**：目标机若没装 python3，
-     该分支不会被执行，那时靠的是回退分支 + 一条用**独立算法**算出来的
-     mock 基准交叉验证（两条路径算出同一个串才算通过）。
+  2. **`urlencode` 的 python3 分支的覆盖范围** —— python3 是**可选依赖**，
+     所以这一项分两层写清楚：
+     (a) **mock 基准层**（任何机器都会执行）：一条用**独立算法**（按字节取十六进制码）
+         算出来的 mock python3，与回退分支的结果**逐字节比对** ——
+         两条独立路径算出同一个串才算通过，因此不依赖 python3 是否存在；
+     (b) **真实分支层**（受「功能可用守卫」控制）：只有
+         `python3 -c 'import sys,urllib.parse'` 成功时才拿真实 python3 的输出
+         与回退分支对比；不可用时登记一条说明（**不断言失败**）。
+     → 目标机若没装 python3，只有 (a) 生效；(b) 是否执行取决于目标机。
+     （开发机上 python3 的可用性是**会变的** —— 本条不把任何机器的现状写成既定事实。）
   3. **`detect_os` 对真实 `/etc/os-release` 未验证** —— 单元测试只用临时构造的
      os-release 文件（含 CRLF 变体），没有对真实系统文件跑过。
   4. **`assert_debian` 的真机判定未验证** —— 单元测试覆盖的是构造出来的假 os-release；
