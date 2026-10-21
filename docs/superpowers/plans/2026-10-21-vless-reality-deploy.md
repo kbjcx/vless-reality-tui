@@ -3363,6 +3363,86 @@ git commit -m "feat(deploy): 密钥解析跨版本兼容与服务端配置渲染
 6. `lib/core.sh`、`lib/tui.sh`、`test/lib.sh`、Task 5 段 **一字未动**。
 7. 计划文件实施者一个字都不许改。
 
+#### 修订轮 2 的逐项发现与处置
+
+> 本节由**控制器**在 Task 6 修订轮 1 的**副本端到端预演**之后写入。
+> 修订轮 1 把「5 个函数零断言」补上了，但它**新写的块自己**留下了 12 个问题
+> —— 全部是**测试侧**缺口，**Step 3 代码块一字不改**。
+>
+> 本轮的全部发现都来自**变异实测**，不是读代码推理：
+> 「断言有没有判别力，只能靠变异证明」。
+
+| # | 级别 | 发现 | 处置 |
+|---|---|---|---|
+| T6-9 | **Important** | **T6-3 的修法（ufw 检测先收进变量再匹配）没有任何断言钉住。** 控制器把实现改回 `ufw status \| grep -q 'Status: active'` → **0 条红**。原因：「管道 + `grep -q`」在**小输出**下不会触发 SIGPIPE —— mock 的 `ufw` 只输出一行 → 写不进管道缓冲 → 上游收不到 SIGPIPE(141) → 运行期**根本复现不出差异**。真实 `ufw status` 要超过管道缓冲（约 8KB）且是否触发取决于时序 → 不能写成依赖时序的运行期断言 | Step 1 补**源码静态断言**（与 Task 4 的 F4-1 **完全同款**）：① 剥掉整行注释后，`open_firewall` 函数体内不得出现同时含 `ufw status` 与 `grep -q` 的行；② 正向钉住修法：必须含 `ufw_status=$(ufw status`。⚠️ 静态断言**只针对含 `ufw status` 的行** —— `open_firewall` 里另有**一处合法**的 `nft list chain ... \| grep -q`（那是「内容里有没有这条规则」的查询，命中与否两条路都走到 then/else，退出码 1 与 141 后果相同 → 不属于 F4-1 同款缺陷），全函数一刀切会误伤 |
+| T6-10 | **Important** | **T6-5 的修法（`mkdir -p` 的退出码检查）所在的分支根本没被执行到。** mock 的 `service_run_user` 恒返回 `root` → `run_user != "root"` 分支永远进不去 → 控制器把 mkdir 的检查去掉 → **0 条红** | Step 1 补两组：① `service_run_user` 返回**非 root** + `mkdir` 返回非零 → 必须返回 0、必须给出「无法创建日志目录」警告、**不得**打印「日志目录已授权」；② 非 root + mkdir 成功 → 必须给出授权提示 |
+| T6-11 | Important | `install_xray` 的**成功路径**零覆盖（下载成功 + 安装成功 → 返回 0 + 提示「Xray 安装完成」）。控制器变异：删掉那句 `tui_ok` → 0 条红 | Step 1 补。⚠️ mock 的 `xray_installed` 必须用**计数器**：install_xray 开头查一次（判断是否已安装）、末尾还要再查一次（判断是否装上了）→ 固定返回值只能覆盖其中一种情形 |
+| T6-12 | Important | `install_xray` 的 **mktemp 空值守卫**零覆盖 → 变异：删掉守卫 → 0 条红 | Step 1 补：mock `mktemp` 返回非零 → 必须返回非零 + 提示「无法创建临时文件」（不得把错误指向「网络」） |
+| T6-13 | Important | `setup_systemd` 的**「没有 systemctl」分支**零覆盖 → 变异：删掉那个 `tui_err` → 0 条红 | Step 1 补：mock `have_cmd` 对 systemctl 返回非零 → 必须返回非零 + 提示「systemd 不可用」 |
+| T6-14 | Important | `open_firewall` 的 **iptables 分支**零覆盖 → 变异：把整个分支删掉 → 0 条红 | Step 1 补 3 条：规则不存在 → 必须调用 `iptables -I … --dport <端口>`；规则已存在 → 必须识别并提示；分支必须带上门口号 |
+| T6-15 | Important | `open_firewall` 的 **nftables 分支**零覆盖 → 变异：把整个分支删掉 → 0 条红 | Step 1 补 3 条：必须返回 0、必须走到 nftables 分支、必须带上门端口号 |
+| T6-16 | Minor | `enable_bbr` 的**内核参数【应用】失败**分支零覆盖（`sysctl -p` 与 `--system` 都失败）。原来只测了「配置写不进去」，没测「配置写进去了但应用失败」→ 变异：删掉它 → 0 条红 | Step 1 补 2 条：必须返回非零 + 提示「内核参数应用失败」 |
+| T6-17 | Minor | `enable_bbr` 的「可用算法」提示零覆盖 → 变异：删掉那行 → 0 条红 | Step 1 补 1 条 |
+| T6-18 | Minor | `service_status` 的「开机自启」零覆盖 → 变异：删掉那行 → 0 条红 | Step 1 补 1 条 |
+| T6-19 | **Important** | **控制器自己写的断言里有一处恒真。** 新 Step 1 写的是 `assert_false "$out" "Xray 安装完成" "install_xray 下载失败时不得谎报『Xray 安装完成』"`。控制器回 `test/lib.sh` 核对签名才发现：**`assert_false "$1" "$msg"` 的语义是「退出码非 0」，根本没有「子串不存在」这个语义** → 三参用法把第 2 个参数当成了描述 → 那条断言**恒真**。控制器变异：把实现改成会打印「Xray 安装完成」→ 那条断言**依然绿**（真正变红的是另一条「给出明确提示」） | Step 1 改成显式写法：`if [[ "$out" == *"Xray 安装完成"* ]]; then lied=1; else lied=0; fi` + `assert_eq "0" "$lied" "…"`。**教训：断言辅助函数的签名必须回 `test/lib.sh` 核对，不能凭名字猜** —— 同一个项目里已经因为「点名错了断言」栽了两次（F4-16 / T5-12），这次是第三次栽在「辅助函数语义」上 |
+| T6-20 | **Important** | **防火墙三条分支的判据全是恒真的。** 控制器探针实测（把整个分支删掉再看哪些断言还活着）：<br>① 删掉整个 **ufw** 分支 → 2 条红，但「ufw 分支调用了 ufw allow」那条**仍然绿** —— 判据是 `"8443/tcp"`，而兜底提示「请自行放行端口：8443/tcp」里也有它；<br>② 删掉整个 **iptables** 分支 → 只有「识别出规则已存在」那条红，「被走到」「带上了端口」两条**仍然绿** —— 判据 `"iptables"` 在兜底提示「未检测到 ufw / iptables / nftables」里也有；<br>③ 删掉整个 **nftables** 分支 → **0 条红** —— 三条断言**全部恒真** | Step 1 三条判据全部改成点**该分支独有的 tui_run 标题**：`放行端口 8443/tcp (ufw)` / `(iptables)` / `(nftables)`；并各补一条「**不得退化成『未检测到防火墙』**」（判据是输出里不得出现「未检测到 ufw」）。⚠️ 这类「字样在别的分支里也出现」的陷阱，靠读代码**看不出来** —— 必须把分支整个删掉再测 |
+| T6-21 | Minor | **两条退出码断言在对应缺陷下是恒绿的。** 探针实测：① 删掉 `install_xray` 的 mktemp 空值守卫 → 退出码**仍然是 1**（因为后面 `curl -o ""` 失败 → 走「下载失败」分支 → 也是返回 1）→ 「返回非零」那条绿，真正变红的是「给出明确提示」；② 删掉 `setup_systemd` 的「没有 systemctl」分支 → 退出码**仍然是 0** → 「返回非零」那条**恒绿**，变红的是「给出明确提示」 | 验收标准第 5 条里这两条**改点名**：「install_xray 在 mktemp 失败时**给出明确提示**」、「setup_systemd 在没有 systemctl 时**给出明确提示**」。⚠️ 这是本项目**第四次**栽在「点名的断言不是实际变红的那一条」上（F4-16 → T5-12 → T6-19 → T6-21）—— **点名的断言必须与预演结果里实际变红的那一条逐字对上** |
+
+> **控制器的自我记账（第 4 条）**：本轮的新块在**第一次沙箱基线**时又犯了 3 个错，
+> 全都是「照抄进计划之前没在沙箱里跑一遍基线」造成的：
+> ① 静态断言写成了「全函数一刀切查 `| grep -q`」→ 会误伤 nft 那处合法的用法；
+> ② `install_xray` 的成功路径 mock 用了固定返回值 → 覆盖不到「末尾那次检查」；
+> ③ `assert_false` 的三参误用（就是 T6-19）。
+> 修法不变：**新写的断言块必须先在沙箱里跑一遍基线**，不能直接派发。
+
+#### 修订轮 2 的验收标准
+
+1. `lib/deploy.sh` 的 Task 6 段与上面 **Step 3 代码块逐字节一致**（追加在 Task 5 段之后）。
+   **本轮 Step 3 一字未改** → md5 仍是 `a0e8b499e7015b753996092fdd0e0f50`（185 行）。
+2. `test/unit.sh` 里 Task 6 的插入段与上面 **Step 1 代码块逐字节一致**
+   （追加在 `test_summary` **之前**）。
+3. `bash test/unit.sh` 全部通过、退出码 0。
+4. 断言总数必须恒定，且**连跑 4 次条数相同**。
+   平台差异：本机（Windows + MSYS）与 Debian/CI 的条数差 **4 条** ——
+   4 条权限相关行为断言在 MSYS 上被自动跳过（`chmod` 是模拟的）。
+   报告里必须写明是哪个平台的数字。
+   **预期条数**：本机 **309**、Debian/CI **313**
+   （底座 197 + Task 5 修订轮 2 的 63 + Task 6 修订轮 2 的 49）。
+   Task 6 段自身的断言数：修订轮 1 是 24 条 → 本轮 49 条。
+5. 红灯证据（**至少这 12 条**，每条都要贴出**变红的断言原文**）：
+   - 把 `open_firewall` 的 ufw 检测改回 `| grep -q` 形态
+     → 「open_firewall 的 ufw 状态检测不得把 grep -q 直接接在管道上（SIGPIPE 会把 141 带进退出码）」必须变红；
+   - 把 `open_firewall` 里 `ufw_status=$(ufw status …)` 那行删掉
+     → 「open_firewall 的 ufw 状态检测必须先把输出收进变量再匹配」必须变红；
+   - 把 `setup_systemd` 里 `mkdir -p` 的退出码检查去掉
+     → 「setup_systemd 在 mkdir 失败时不得谎报『日志目录已授权』」必须变红；
+   - 把 `install_xray` 成功路径的 `tui_ok "Xray 安装完成…"` 删掉
+     → 「install_xray 成功时提示安装完成」必须变红；
+   - 把 `install_xray` 成功路径的 `return 0` 改成 `return 1`
+     → 「install_xray 在下载与安装都成功时返回 0」必须变红；
+   - 把 `install_xray` 的 mktemp 空值守卫删掉
+     → 「install_xray 在 mktemp 失败时**给出明确提示**」必须变红
+     （⚠️ **不是**「返回非零」那条 —— 删掉守卫后退出码**仍然是 1**
+      （后面 `curl -o ""` 失败 → 走「下载失败」分支 → 也是返回 1）→ 那条恒绿）；
+   - 把 `setup_systemd` 的「没有 systemctl」那个 `tui_err` + `return 1` 删掉
+     → 「setup_systemd 在没有 systemctl 时**给出明确提示**」必须变红
+     （⚠️ **不是**「返回非零」那条 —— 删掉后退出码**仍然是 0** → 那条恒绿）；
+   - 把 `open_firewall` 的整个 iptables 分支删掉
+     → 「open_firewall 的 iptables 分支被走到（必须真的调用 iptables -I）」必须变红；
+   - 把 `open_firewall` 的整个 nftables 分支删掉
+     → 「open_firewall 的 nftables 分支被走到（必须真的插入 nft 规则）」必须变红；
+   - 把 `enable_bbr` 的「内核参数应用失败」分支删掉
+     → 「enable_bbr 在内核参数应用失败时返回非零」必须变红；
+   - 把 `enable_bbr` 的「可用算法」提示删掉
+     → 「enable_bbr 在内核不支持 bbr 时提示可用算法」必须变红；
+   - 把 `service_status` 的「开机自启」那行删掉
+     → 「service_status 显示开机自启状态」必须变红。
+   ⚠️ **点名的断言必须与预演结果里【实际变红的那一条】逐字对上**，不能只看「红了几条」。
+   ⚠️ 「正向断言（期望码 0）」在把函数换成 `return 0` 时**不会变红** ——
+   真正变红的是它的**反向断言**。
+6. `lib/core.sh`、`lib/tui.sh`、`test/lib.sh`、Task 5 段 **一字未动**。
+7. 计划文件实施者一个字都不许改。
+
 **Step 1: 写失败的测试**
 
 追加到 `test/unit.sh`：
@@ -3397,7 +3477,11 @@ out=$( ( XRAY_BIN=/nonexistent/xray; xray_installed() { return 1; }
          install_xray 2>&1 ) ); rc=$?
 assert_status 1 "$rc" "install_xray 在下载安装脚本失败时返回非零"
 assert_contains "$out" "下载 Xray 安装脚本失败" "install_xray 下载失败时给出明确提示"
-assert_false "$out" "Xray 安装完成" "install_xray 下载失败时不得谎报『Xray 安装完成』"
+# 注意：assert_false 的语义是「退出码非 0」，【没有】「子串不存在」这个语义。
+# 三参用法会把第 2 个参数当成描述 → 这条断言恒真（控制器核对 test/lib.sh 后发现）。
+# 「子串必须不存在」必须自己判断再断言。
+if [[ "$out" == *"Xray 安装完成"* ]]; then lied=1; else lied=0; fi
+assert_eq "0" "$lied" "install_xray 下载失败时不得谎报『Xray 安装完成』"
 
 # ── setup_systemd：服务未运行时必须返回非零并输出 xray 的原始日志 ──────────────
 # systemctl / journalctl / tui_run 全部 mock：绝不能真的动宿主机的 systemd。
@@ -3442,6 +3526,7 @@ out=$( ( have_cmd() { return 0; }
 assert_contains "$out" "服务状态" "service_status 打印服务状态"
 assert_contains "$out" "active" "service_status 显示服务是否在运行"
 assert_contains "$out" "8443" "service_status 显示端口监听情况"
+assert_contains "$out" "开机自启" "service_status 显示开机自启状态"
 
 # ── enable_bbr 在不支持 bbr 的内核上必须安全失败而非崩溃 ──────────────
 # 必须 mock 掉 sysctl 走「不支持 bbr」分支：真实调用会写
@@ -3451,6 +3536,7 @@ assert_contains "$out" "8443" "service_status 显示端口监听情况"
 # 断言「提及 bbr」在两条路径上都成立 → 恒绿、没有判别力。
 out=$( ( sysctl() { printf 'cubic\n'; }; enable_bbr 2>&1 ) ) || true
 assert_contains "$out" "未提供 bbr" "enable_bbr 在内核不支持 bbr 时明确说明"
+assert_contains "$out" "可用算法" "enable_bbr 在内核不支持 bbr 时提示可用算法"
 
 # ── open_firewall 在无任何防火墙工具时必须明确告知而不是静默成功 ──────────────
 # 必须【1 换 1 配对】：真实 Debian 上一定有 iptables 或 nft → 原来的写法会让
@@ -3469,7 +3555,9 @@ out=$( ( have_cmd() { case "$1" in ufw) return 0 ;; iptables|nft) return 1 ;; *)
             ufw() { printf 'Status: active\n'; }
             tui_run() { printf '%s\n' "$*"; return 0; }
             open_firewall 8443 2>&1 ) )
-assert_contains "$out" "8443/tcp" "open_firewall 的 ufw 分支调用了 ufw allow <port>/tcp"
+assert_contains "$out" "放行端口 8443/tcp (ufw)" "open_firewall 的 ufw 分支被走到（必须真的调用 ufw allow）"
+if [[ "$out" == *"未检测到 ufw"* ]]; then bailed=1; else bailed=0; fi
+assert_eq "0" "$bailed" "open_firewall 不得退化成『未检测到防火墙』（ufw 分支）"
 out=$( ( have_cmd() { case "$1" in ufw) return 0 ;; iptables|nft) return 1 ;; *) return 1 ;; esac; }
             ufw() { printf 'Status: active\n'; }
             tui_run() { return 7; }
@@ -3490,11 +3578,133 @@ if [[ -n "$bbr_dir" ]]; then
   assert_status 1 "$rc" "enable_bbr 在无法写入 sysctl 配置时返回非零"
   if [[ "$out" == *"已启用 bbr"* ]]; then lied=1; else lied=0; fi
   assert_eq "0" "$lied" "enable_bbr 写失败时不得谎报『已启用 bbr』"
+
+  # ── 内核参数【应用】失败（sysctl -p / --system 都失败）必须返回非零 ──────────────
+  # 原来只测了「配置写不进去」，没测「配置写进去了但内核参数应用失败」
+  # → 那条分支根本没被执行到（控制器第二轮变异实证：删掉它，0 条红）。
+  out=$( ( sysctl() { case "$1" in
+                        -n) printf 'bbr cubic\n' ;;
+                        *) return 1 ;;
+                      esac; }
+              VLESS_REALITY_SYSCTL_CONF="$bbr_dir/99-bbr.conf"; enable_bbr 2>&1 ) ); rc=$?
+  assert_status 1 "$rc" "enable_bbr 在内核参数应用失败时返回非零"
+  assert_contains "$out" "内核参数应用失败" "enable_bbr 在 sysctl 应用失败时给出明确报错"
 else
   assert_eq "mktemp -d 能创建唯一临时目录" "失败（mktemp -d 返回空路径）" \
     "enable_bbr 用例前提：mktemp -d 必须能创建唯一临时目录"
 fi
 rm -rf "$bbr_dir"
+# ── T6-9（F4-1 同款）：open_firewall 的 ufw 状态检测不得把 grep -q 直接接在管道上 ──────────────
+# 为什么必须是【源码静态断言】而不是运行期断言：
+# 「管道 + grep -q」在【小输出】下不会触发 SIGPIPE —— mock 的 ufw 只输出一行
+# → 写不进管道缓冲 → 上游不会收到 SIGPIPE(141) → 运行期根本复现不出差异。
+# 控制器第二轮变异实证：把 ufw 检测改回 `| grep -q` 形态 → 0 条红。
+# 真实 `ufw status` 的输出要超过管道缓冲（约 8KB）且是否触发取决于时序
+# → 不能写成依赖时序的运行期断言。权威判据是这条静态断言（与 Task 4 的 F4-1 同款）。
+open_firewall_body="$(awk '/^open_firewall\(\) *\{/,/^\}/' "$ROOT/lib/deploy.sh")"
+[[ -n "$open_firewall_body" ]]; assert_true "$?" \
+  "deploy.sh 里必须存在 open_firewall 函数（下面那条静态断言的前提）"
+# 检查前必须先去掉整行注释：函数的说明性注释里会写「不能写成 ufw status | grep -q」
+# 这类字样 —— 那是【说明】不是【代码】，不去掉会把自己判成违规（Task 4 实测踩过）。
+open_firewall_code="$(printf '%s\n' "$open_firewall_body" | grep -v '^[[:space:]]*#')"
+assert_eq "" "$(printf '%s\n' "$open_firewall_code" | grep -n 'ufw status.*grep[ \t]*-q' | tr '\n' ' ')" \
+  "open_firewall 的 ufw 状态检测不得把 grep -q 直接接在管道上（SIGPIPE 会把 141 带进退出码）"
+# 正向钉住修法本身：必须先把输出收进变量，再对变量做匹配。
+# open_firewall 里【另有】一处合法的 `nft list chain ... | grep -q`（那是「内容里
+# 有没有这条规则」的查询，命中与否两条路都走到 then/else，退出码 1 与 141 后果相同
+# → 不属于 F4-1 同款缺陷）→ 所以上面那条只针对含 "ufw status" 的行，不误伤。
+assert_contains "$open_firewall_code" 'ufw_status=$(ufw status' \
+  "open_firewall 的 ufw 状态检测必须先把输出收进变量再匹配"
+
+# ── T6-10：setup_systemd 的「运行用户不是 root」分支之前根本没被执行到 ──────────────
+# 原来的 mock 里 service_run_user 恒返回 root → `run_user != "root"` 分支永远进不去
+# → mkdir 的退出码检查就永远测不到（控制器第二轮变异实证：删掉它，0 条红）。
+out=$( ( have_cmd() { return 0; }; tui_run() { return 0; }
+         systemctl() { return 0; }
+         service_run_user() { printf 'xray'; }
+         mkdir() { return 1; }
+         setup_systemd 2>&1 ) ); rc=$?
+assert_status 0 "$rc" "setup_systemd 在日志目录创建失败时仍正常返回（只是警告）"
+assert_contains "$out" "无法创建日志目录" "setup_systemd 在 mkdir 失败时给出明确警告"
+if [[ "$out" == *"日志目录已授权"* ]]; then lied=1; else lied=0; fi
+assert_eq "0" "$lied" "setup_systemd 在 mkdir 失败时不得谎报『日志目录已授权』"
+
+# ── setup_systemd：非 root 运行用户 + 目录创建成功 → 必须给出授权提示 ──────────────
+out=$( ( have_cmd() { return 0; }; tui_run() { return 0; }
+         systemctl() { return 0; }
+         service_run_user() { printf 'xray'; }
+         mkdir() { return 0; }
+         id() { return 0; }
+         chown() { return 0; }
+         setup_systemd 2>&1 ) ); rc=$?
+assert_status 0 "$rc" "setup_systemd 在非 root 运行用户下正常返回"
+assert_contains "$out" "日志目录已授权给运行用户 xray" "setup_systemd 在目录创建成功时给出授权提示"
+
+# ── setup_systemd：没有 systemctl 时必须明确报错 ──────────────
+out=$( ( have_cmd() { case "$1" in systemctl) return 1 ;; *) return 0 ;; esac; }
+         setup_systemd 2>&1 ) ); rc=$?
+assert_status 1 "$rc" "setup_systemd 在没有 systemctl 时返回非零"
+assert_contains "$out" "systemd 不可用" "setup_systemd 在没有 systemctl 时给出明确提示"
+
+# ── install_xray：下载与安装都成功时必须返回 0 并提示完成 ──────────────
+# xray_installed 的 mock 必须【前一次调用返回「未安装」、后一次返回「已安装」】——
+# install_xray 开头查一次（判断是否已安装），末尾还要再查一次（判断是否装上了）。
+# 用计数器实现，不能用固定返回值。
+out=$( ( XRAY_BIN=/nonexistent/xray
+         _calls=0
+         xray_installed() { _calls=$((_calls + 1)); [[ $_calls -ge 2 ]]; }
+         ensure_packages() { return 0; }
+         curl() { return 0; }
+         tui_run() { return 0; }
+         xray_version() { printf 'Xray 1.8.0\n'; }
+         install_xray 2>&1 ) ); rc=$?
+assert_status 0 "$rc" "install_xray 在下载与安装都成功时返回 0"
+assert_contains "$out" "Xray 安装完成" "install_xray 成功时提示安装完成"
+
+# ── install_xray：mktemp 失败时必须给出明确提示，不得把错误指向「网络」 ──────────────
+out=$( ( XRAY_BIN=/nonexistent/xray
+         xray_installed() { return 1; }
+         ensure_packages() { return 0; }
+         mktemp() { return 1; }
+         curl() { return 0; }
+         install_xray 2>&1 ) ); rc=$?
+assert_status 1 "$rc" "install_xray 在 mktemp 失败时返回非零"
+assert_contains "$out" "无法创建临时文件" "install_xray 在 mktemp 失败时给出明确提示"
+
+# ── open_firewall：iptables 分支 ──────────────
+# 判据必须点【该分支独有的东西】：「iptables」这三个字在兜底提示
+# （「未检测到 ufw / iptables / nftables」）里也出现、「8443」在
+# 「请自行放行端口：8443/tcp」里也出现 → 用它们当判据是**恒真的**
+# （控制器探针实测：把整个 iptables 分支删掉，只有「识别出规则已存在」那条变红，
+#   「被走到」「带上了端口」两条仍然绿）。
+out=$( ( have_cmd() { case "$1" in iptables) return 0 ;; ufw|nft) return 1 ;; *) return 1 ;; esac; }
+            iptables() { return 1; }
+            tui_run() { printf '%s\n' "$*"; return 0; }
+            open_firewall 8443 2>&1 ) )
+assert_contains "$out" "放行端口 8443/tcp (iptables)" "open_firewall 的 iptables 分支被走到（必须真的调用 iptables -I）"
+if [[ "$out" == *"未检测到 ufw"* ]]; then bailed=1; else bailed=0; fi
+assert_eq "0" "$bailed" "open_firewall 不得退化成『未检测到防火墙』（iptables 分支）"
+out=$( ( have_cmd() { case "$1" in iptables) return 0 ;; ufw|nft) return 1 ;; *) return 1 ;; esac; }
+            iptables() { return 0; }
+            tui_run() { printf '%s\n' "$*"; return 0; }
+            open_firewall 8443 2>&1 ) )
+assert_contains "$out" "iptables 规则已存在" "open_firewall 的 iptables 分支识别出规则已存在"
+
+# ── open_firewall：nftables 分支 ──────────────
+# nft 的 list 子命令返回非零 → 规则不存在 → 走 tui_run 插入规则的分支。
+# ⚠️ 这三条断言原先全是**恒真的**：把整个 nftables 分支删掉，0 条红
+# （控制器探针实测）—— 因为「nftables」「8443」在兜底提示里也出现。
+out=$( ( have_cmd() { case "$1" in nft) return 0 ;; ufw|iptables) return 1 ;; *) return 1 ;; esac; }
+            nft() { case "$1" in
+                      list) return 1 ;;
+                      *) return 0 ;;
+                    esac; }
+            tui_run() { printf '%s\n' "$*"; return 0; }
+            open_firewall 8443 2>&1 ) )
+assert_contains "$out" "放行端口 8443/tcp (nftables)" "open_firewall 的 nftables 分支被走到（必须真的插入 nft 规则）"
+if [[ "$out" == *"未检测到 ufw"* ]]; then bailed=1; else bailed=0; fi
+assert_eq "0" "$bailed" "open_firewall 不得退化成『未检测到防火墙』（nftables 分支）"
+
 ```
 
 **Step 2: 运行测试确认失败**
