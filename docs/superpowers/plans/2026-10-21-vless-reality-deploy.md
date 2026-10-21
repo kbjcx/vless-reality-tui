@@ -8217,7 +8217,7 @@ git commit -m "feat(build): 单文件构建脚本、dist 产物与 CI 流水线"
 |---|---|
 | `bash -n build.sh` | rc=0 ✓ |
 | 实跑 `bash build.sh` | rc=0，输出 `已生成 …/dist/install.sh (v1.0.0)` ✓ |
-| 产物大小 | **100 407 字节**（4 个 lib + 入口全部内联）✓ |
+| 产物大小 | **100 407 字节**（4 个 lib + 入口全部内联）✓ —— ⚠️ 这是**修订轮 1 之前**的数；P1–P4 让 `install.sh` 与 `lib/tui.sh` 变大 → 实施后的产物是 **102 110 字节**（不是缺陷） |
 | `grep -c 'source.*lib/'` | **0**（自包含 ✓） |
 | 产物里 `set -uo pipefail` | **恰好 1 条**（头部那一条 ✓） |
 | 产物里 `shellcheck source=lib/` 注释 | **0**（被 sed 剥掉 ✓） |
@@ -8387,7 +8387,12 @@ export TUI_DIGIT_TIMEOUT=2
 2. `test/unit.sh` 里 Task 12 的插入段与上面 **Step 1 代码块逐字节一致**
    （追加在 `test_summary` **之前**）。
 3. **五处定点修订**（P1 / P2 / P3 / P4 / P5）与上面写的**改后**文本逐字一致；
-   每处的**旧文本在改后文件里必须命中 0 次**、**新文本命中 1 次**。
+   每处的**新文本命中 1 次**；**P1–P4 的旧文本在改后文件里必须命中 0 次**。
+   ⚠️ **P5 是个例外**：它的「新文本」是「旧文本」的**严格超集**
+   （新 = 旧 + 追加几行）→ 改完后旧文本必然还命中 **1** 次
+   （「旧文本命中 0 次」对 P5 **不可能成立**）。
+   P5 的正确判据是：**旧文本命中 1 次**（它就在新文本里）、**新文本命中 1 次**。
+   （这条例外由 Task 12 的实施者如实报出，控制器据此改正计划。）
    **除这五处外，Task 8 / Task 2 的 Step 3 块一字未动**
    （`install.sh` 与 `lib/tui.sh` 因此不再与计划里对应任务的块逐字节一致 ——
    补偿方式就是这五条可机械核对的精确文本替换）。
@@ -8491,6 +8496,9 @@ export TUI_DIGIT_TIMEOUT=2
 - Create: `README.md`
 - Create: `test/integration-debian.sh`
 - Modify: `test/unit.sh`
+- Modify: `lib/tui.sh`（定点修订 P1：新增 `tui_box_text`）
+- Modify: `lib/deploy.sh`（定点修订 P2 / P3：分享链接改用 `tui_box_text`）
+- Modify: `docs/superpowers/specs/2026-10-21-vless-reality-deploy-design.md`（定点修订 P4：4.1 依赖图补 `core.sh → tui.sh` 边）
 
 **Interfaces:**
 - Consumes: `lib/tui.sh` `lib/core.sh`
@@ -8501,16 +8509,24 @@ export TUI_DIGIT_TIMEOUT=2
 
 **Step 1: 写失败的测试**
 
-追加到 `test/unit.sh`：
+追加到 `test/unit.sh` 的 `test_summary` **之前**：
 
 ```bash
-test_case "demo.sh 不触碰系统"
+# ── Task 13：demo.sh、README 与集成测试 ─────────────────────────────
+# ⚠️ 本段【不写任何会整块跳过的条件块】：
+#    所有断言要么恒定执行、要么在前提不成立时【判红】→
+#    断言条数与机器 / 网络 / 依赖状态【无关】。
 
-# 必须给 demo.sh 接上 </dev/null：demo.sh 会调用 tui_menu / tui_input /
-# tui_confirm，这三个在【非 TTY 分支里仍然 read stdin】。
-# 不接 /dev/null 时，本地交互式跑测试（stdin 是终端）会直接挂死。
-out=$(bash "$ROOT/demo.sh" </dev/null 2>&1)
-assert_status 0 "$?" "demo.sh 正常退出"
+test_case "Task 13：demo.sh 不触碰系统"
+
+# ⚠️ 必须给 demo.sh 接上 </dev/null：demo.sh 会调用 tui_menu / tui_input /
+#    tui_confirm，这三个在【非 TTY 分支里仍然 read stdin】。
+#    不接 /dev/null 时，本地交互式跑测试（stdin 是终端）会直接挂死。
+# ⚠️ 还必须加 timeout：demo.sh 若在某个分支里等输入不返回，
+#    整个测试套件会【挂住】—— CI 上表现为「超时失败」，
+#    且看不出是哪一条断言出的问题（这比红更糟）。
+out=$(timeout 30 bash "$ROOT/demo.sh" </dev/null 2>&1); rc=$?
+assert_status 0 "$rc" "demo.sh 正常退出"
 assert_contains "$out" "分享链接" "demo 展示分享链接样例"
 assert_eq 0 "$(grep -c 'systemctl ' <<<"$out")" "demo 不调用 systemctl"
 assert_eq 0 "$(grep -c 'apt-get' <<<"$out")" "demo 不调用 apt-get"
@@ -8518,6 +8534,117 @@ assert_eq 0 "$(grep -c 'apt-get' <<<"$out")" "demo 不调用 apt-get"
 # 再直接查一次 demo.sh 的源码。
 assert_eq 0 "$(grep -cE '^[^#]*(systemctl|apt-get|ufw|iptables|nft|rm -f|systemctl disable)' "$ROOT/demo.sh" || true)" \
   "demo.sh 源码里不含任何改系统的命令"
+# ⚠️ demo.sh 依赖「没有 set -e」：tui_menu 在非 TTY 下返回 255（取消）、
+#    tui_input 在 EOF 下返回非零 —— 有了 set -e 就会在菜单那一步直接退出，
+#    demo 变成半截输出。谁加了一行 set -e，这条断言立刻变红。
+assert_eq 0 "$(grep -cE '^[[:space:]]*set -[a-z]*e' "$ROOT/demo.sh" || true)" \
+  "demo.sh 不含 set -e（否则 tui_menu 的 255 会让它半路退出）"
+
+test_case "Task 13：超宽内容不撑破边框"
+
+# ⚠️ 分享链接有 150+ 字符，而框内净宽只有 TUI_WIDTH-6（默认 74）→
+#    硬塞进框里会把右边框顶出去，框线合不拢（框线必须恰好等于 TUI_WIDTH 才合得拢）。
+#    也不能把链接折成多行：用户要从终端复制这一行，折行后粘到客户端是废链接。
+#    → 放不下时不开框，改用小节标题 + 整行输出；
+#      终端的【软换行】只是显示效果，不会在内容里插入字符 → 复制出来仍是完整的一行。
+tuilib=$(cat "$ROOT/lib/tui.sh")
+assert_contains "$tuilib" "tui_box_text" "lib/tui.sh 提供超宽内容的处理组件"
+
+# 窄内容：照常画框
+narrow=$(tui_box_text "标题" "短内容" 2>&1)
+assert_contains "$narrow" "╭" "窄内容照常画框"
+assert_contains "$narrow" "短内容" "窄内容的框里有内容"
+assert_contains "$narrow" "╰" "窄内容画出了下边框"
+# 「框线合得拢」的判据：框的【顶边】与【内容行】的显示宽度必须【相等】
+# （两者都应恰好等于 TUI_WIDTH）—— 不等就说明有内容把框撑破了。
+box_top=$(tui_box "标题" 2>&1)
+box_line=$(tui_box_line "短内容" 2>&1)
+top_w=$(tui_dwidth "$(tui_strip "$box_top" | tr -d '\n')")
+line_w=$(tui_dwidth "$(tui_strip "$box_line" | tr -d '\n')")
+assert_eq "$top_w" "$line_w" "框的顶边与内容行宽度一致（框线合得拢）"
+
+# 超宽内容：不能画框（画了框线就合不拢），但内容一个都不能少
+wide_text=$(printf 'x%.0s' {1..200})
+wide=$(tui_box_text "标题" "$wide_text" 2>&1)
+assert_not_contains "$wide" "╭" "超宽内容不画上边框（框线会合不拢）"
+assert_not_contains "$wide" "╰" "超宽内容不画下边框"
+assert_contains "$wide" "$wide_text" "超宽内容整行输出，内容一个不少"
+assert_contains "$wide" "标题" "超宽内容仍带小节标题"
+
+test_case "Task 13：两处分享链接展示都用 tui_box_text"
+
+dep=$(cat "$ROOT/lib/deploy.sh")
+assert_contains "$dep" 'tui_box_text "分享链接（可直接粘贴到客户端导入）" "$link"' \
+  "部署完成时用 tui_box_text 显示分享链接"
+assert_contains "$dep" 'tui_box_text "分享链接" "$link"' \
+  "管理菜单查看分享链接时用 tui_box_text"
+
+test_case "Task 13：README 的验证状态声明"
+
+rmd=$(cat "$ROOT/README.md" 2>/dev/null)
+assert_contains "$rmd" "验证状态声明" "README 里有「验证状态声明」小节"
+# 下面逐条点名：未验证项必须【逐条】列出，不能含糊成一句「仅供参考」。
+assert_contains "$rmd" "权限位" "声明里点名：权限位 600/700 未在 Debian 真机验证"
+assert_contains "$rmd" "Debian 真机" "声明里点名：Debian 真机端到端未验证"
+assert_contains "$rmd" "shellcheck" "声明里点名：shellcheck 未在本机运行"
+assert_contains "$rmd" "nft" "声明里点名：nft 的 handle 语义未实测"
+assert_contains "$rmd" "systemd" "声明里点名：真实 systemd 的启停未验证"
+assert_contains "$rmd" "REALITY" "声明里点名：REALITY 握手未验证"
+assert_contains "$rmd" "TLS 1.3" "声明里点名：单元套件含网络依赖断言（TLS 1.3 探测）"
+assert_contains "$rmd" "apt-get" "声明里点名：apt-get 安装 Xray-core 未验证"
+# 已验证的项也要列出来，读者才能自己判断哪些结论可信
+assert_contains "$rmd" "已验证" "README 同时列出已验证的项"
+# 快速开始：必须是「先下载再执行」，不用管道
+assert_contains "$rmd" "sudo bash install.sh" "README 给出 sudo bash install.sh 的用法"
+assert_contains "$rmd" "curl" "README 给出 curl 单文件方式的命令"
+
+test_case "Task 13：README 的必需小节一个都不能少"
+
+# ⚠️ Step 5 要求 README 有 12 个小节，但上面那组断言只覆盖了「验证状态声明」那一格 →
+#    实现者少写一半小节，测试照样全绿。→ 这里逐个小节点名。
+# ⚠️ 判据是【标题级】的：只认 markdown 的标题行，不认「正文里出现过这个词」——
+#    否则正文里随口提一句「目录结构」也算数，等于没断言。
+#    先把 ``` 围栏里的内容剔掉：代码块里以 # 开头的注释行不算标题。
+rmd_heads=$(awk 'BEGIN{inb=0} /^```/{inb=!inb; next} !inb && /^#+ /{print}' "$ROOT/README.md" 2>/dev/null || true)
+assert_true "$(grep -qE '^#+ .*(特性|特点)' <<<"$rmd_heads" && echo 0 || echo 1)" "README 有「特性」小节"
+assert_true "$(grep -qE '^#+ .*(目录结构|文件结构)' <<<"$rmd_heads" && echo 0 || echo 1)" "README 有「目录结构」小节"
+assert_true "$(grep -qE '^#+ .*(CLI|命令行)' <<<"$rmd_heads" && echo 0 || echo 1)" "README 有「CLI 参数」小节"
+assert_true "$(grep -qE '^#+ .*(部署向导|部署流程)' <<<"$rmd_heads" && echo 0 || echo 1)" "README 有「部署向导」小节"
+assert_true "$(grep -qE '^#+ .*管理菜单' <<<"$rmd_heads" && echo 0 || echo 1)" "README 有「管理菜单」小节"
+assert_true "$(grep -qE '^#+ .*(客户端|导入)' <<<"$rmd_heads" && echo 0 || echo 1)" "README 有「客户端导入」小节"
+assert_true "$(grep -qE '^#+ .*(常见问题|FAQ)' <<<"$rmd_heads" && echo 0 || echo 1)" "README 有「常见问题」小节"
+assert_true "$(grep -qE '^#+ .*卸载' <<<"$rmd_heads" && echo 0 || echo 1)" "README 有「卸载」小节"
+assert_true "$(grep -qE '^#+ .*(致谢|上游|Xray-install)' <<<"$rmd_heads" && echo 0 || echo 1)" "README 有「致谢与上游项目链接」小节"
+
+# 光有小节标题还不够，里面得真的说到这些点
+assert_contains "$rmd" "v2rayNG" "客户端导入说明里点名 v2rayN / v2rayNG"
+assert_contains "$rmd" "Clash" "客户端导入说明里点名 Clash Verge"
+assert_contains "$rmd" "BBR" "常见问题里点名 BBR"
+assert_contains "$rmd" "二维码" "常见问题里点名二维码缺失"
+# ⚠️ T6-7：计划在【两处】登记了「README 的验证状态声明必须点名这一条」
+#   （Task 6 修订轮的 T6-7、Task 10 修订轮的 T10-7）：
+#   工具会以 root 执行一个从 GitHub main 分支下载的脚本，没有校验和校验。
+#   这条【不能漏】—— 漏了等于用户不知道自己的机器上跑过一段未经校验的代码。
+assert_contains "$rmd" "校验和" "声明里点名：以 root 执行 GitHub main 分支脚本、无校验和校验（T6-7）"
+
+test_case "Task 13：设计稿的依赖图补上 core.sh → tui.sh（F-18）"
+
+# F-18 是 Task 1 修订轮登记的「留到 Task 13 收尾补设计稿」：
+#   设计稿 4.1 的依赖图漏了 core.sh → tui.sh 这条边
+#   （core.sh 会调用 tui.sh 的 tui_err / tui_tip / tui_ok）。
+design_doc="$ROOT/docs/superpowers/specs/2026-10-21-vless-reality-deploy-design.md"
+assert_true "$(grep -qF 'core.sh ──> tui.sh' "$design_doc" 2>/dev/null && echo 0 || echo 1)" \
+  "设计稿 4.1 的依赖图补上了 core.sh → tui.sh 边（F-18）"
+
+test_case "Task 13：集成测试脚本"
+
+assert_true "$([[ -f "$ROOT/test/integration-debian.sh" ]] && echo 0 || echo 1)" "集成测试脚本存在"
+assert_status 0 "$(bash -n "$ROOT/test/integration-debian.sh" 2>&1; echo $?)" "集成测试脚本语法正确"
+itg=$(cat "$ROOT/test/integration-debian.sh" 2>/dev/null)
+assert_contains "$itg" "docker" "集成测试用 docker 起容器"
+assert_contains "$itg" "test/unit.sh" "集成测试在容器里跑单元测试"
+assert_contains "$itg" "build.sh" "集成测试在容器里构建单文件"
+assert_contains "$itg" "dist/install.sh" "集成测试在容器里验证单文件产物"
 ```
 
 **Step 2: 运行测试确认失败**
@@ -8526,7 +8653,11 @@ assert_eq 0 "$(grep -cE '^[^#]*(systemctl|apt-get|ufw|iptables|nft|rm -f|systemc
 bash test/unit.sh
 ```
 
-预期：FAIL，`demo.sh: No such file or directory`。
+预期：FAIL —— `demo.sh: No such file or directory`（`bash "$ROOT/demo.sh"` 返回 127）→
+Task 13 段的断言**大面积变红**（`tui_box_text` 还不存在、README 还不存在、
+集成脚本还不存在）。报告里必须写明**实测的红数**。
+⚠️ 这一步的失败**必须真的红**（不是「0 条红」）：0 条红说明测试根本没跑起来，
+后面「实现后全绿」就没有意义了。
 
 **Step 3: 实现 `demo.sh`**
 
@@ -8563,10 +8694,19 @@ tui_panel "示例配置" \
   "SNI|www.microsoft.com" \
   "公钥 pbk|xQ0G2k7F0l3mN8pQ2rS5tU7vW9xY1zA3bC5dE7fG"
 
-tui_section "圆角内容框"
-tui_box "分享链接（示例）"
-tui_box_line "vless://8f3a1c22-...@203.0.113.10:443?encryption=none&flow=xtls-rprx-vision&security=reality"
+tui_section "圆角内容框（内容放得下就画框）"
+tui_box "内容框"
+tui_box_line "vless://203.0.113.10:443"
 tui_box_end
+
+# ⚠️ 分享链接有 150+ 字符，框内净宽只有 TUI_WIDTH-6（默认 74）→
+#    硬塞进框里会把右边框顶出去（框线必须恰好等于 TUI_WIDTH 才合得拢）；
+#    也不能折行（用户要复制这一行，折行后粘到客户端是废链接）。
+#    → tui_box_text：放得下就画框，放不下就整行输出，
+#      终端的软换行只是显示效果、不会往内容里插字符 → 复制出来仍是完整的一行。
+tui_section "超宽内容（放不下就不画框，整行输出）"
+tui_box_text "分享链接（示例）" \
+  "vless://8f3a1c22-4b6d-4e51-9b2c-7a0e5d3f1c88@203.0.113.10:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=chrome&pbk=xQ0G2k7F0l3mN8pQ2rS5tU7vW9xY1zA3bC5dE7fG&sid=1a2b3c4d&type=tcp#my-node"
 
 tui_section "菜单（方向键移动 / 数字直选 / Enter 确认 / q 取消）"
 tui_menu "示例菜单" \
@@ -8616,7 +8756,9 @@ echo "==> 安装依赖"
 docker exec "$CNAME" bash -c 'apt-get update -qq && apt-get install -y -qq curl ca-certificates openssl qrencode procps iproute2 systemd >/dev/null 2>&1' || true
 
 echo "==> 语法检查"
-docker exec "$CNAME" bash -c 'find . -name "*.sh" -not -path "./.git/*" -print0 | xargs -0 -n1 bash -n' || {
+# ⚠️ 排除 .worktrees/：本机的工作树目录也会被挂进容器，
+#    里面的副本是同一份源码的另一次检出 → 不排除就会重复检查一遍。
+docker exec "$CNAME" bash -c 'find . -name "*.sh" -not -path "./.git/*" -not -path "./.worktrees/*" -print0 | xargs -0 -n1 bash -n' || {
   echo "语法检查失败"; exit 1; }
 
 echo "==> 单元测试"
@@ -8624,6 +8766,10 @@ docker exec "$CNAME" bash -c 'bash test/unit.sh' || { echo "单元测试失败";
 
 echo "==> 构建单文件"
 docker exec "$CNAME" bash -c 'bash build.sh' || { echo "构建失败"; exit 1; }
+
+echo "==> 校验单文件产物自包含"
+docker exec "$CNAME" bash -c 'test -f dist/install.sh && ! grep -q "source.*lib/" dist/install.sh && bash -n dist/install.sh' || {
+  echo "单文件产物校验失败"; exit 1; }
 
 echo "==> 非交互部署（--yes）"
 docker exec "$CNAME" bash -c 'bash dist/install.sh --yes --port 443 --sni www.microsoft.com --name it-test' || {
@@ -8640,15 +8786,25 @@ echo "==> 集成测试结束"
 
 - 项目简介与特性列表
 - 快速开始（两种方式：clone 运行 / `curl` 单文件）
-- `curl` 单文件方式的完整命令（**先下载再执行**，不用管道）
+- `curl` 单文件方式的完整命令（**先下载再执行**，不用管道）：
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/dist/install.sh -o install.sh
+  sudo bash install.sh
+  ```
+  ⚠️ 命令里必须是 `sudo bash install.sh`，**不是** `sudo ./install.sh`
+  —— 仓库里的 `.sh` 提交模式是 100644，新克隆的仓库里 `install.sh` **不可执行**，
+  `./install.sh` 会 Permission denied。
 - 目录结构说明
 - CLI 参数表
 - 部署向导的交互流程说明
 - 管理菜单说明
 - 客户端导入说明（v2rayN / v2rayNG / Clash Verge / Shadowrocket / Hiddify）
 - 常见问题（端口占用、防火墙、BBR、二维码缺失、xray 服务未启动）
-- **验证状态声明**（**必须逐条列出**下面这 5 项未验证内容，不得含糊成一句「仅供参考」；
-  同时列出已验证的项，让读者能自己判断哪些结论可信）
+- **验证状态声明**（**必须逐条列出**下面每一条未验证内容，**不得**含糊成一句「仅供参考」；
+  同时列出**已验证**的项，让读者能自己判断哪些结论可信）
+
+  #### 未验证项（逐条列出）
+
   1. **权限位 600/700 未在 Debian 真机验证** —— 开发环境是 Windows + Git Bash，
      它的 `chmod` 是**模拟**的（`stat -c '%a'` 恒为 644），所以
      「状态文件 600 / 状态目录 700 / 客户端导出目录 700 / 客户端物料文件 600」
@@ -8669,16 +8825,48 @@ echo "==> 集成测试结束"
      真实 Debian 上 `ID=debian` / `VERSION_ID` 的判定结果尚未实测。
   5. **shellcheck 未在本机运行** —— 开发环境没有 shellcheck，
      GitHub Actions 的 shellcheck 步骤**尚未实际执行过**（仓库还没在远端跑过 CI）。
+  6. **单元套件含【网络依赖】断言** —— `www.microsoft.com 支持 TLS 1.3` 这条要**真连外网**；
+     网络不通或被中间设备拦下时，那一条断言会红 —— 这是**已知的**环境依赖，不是代码缺陷。
+  7. **`nft` 的 handle 语义未实测** —— 本机没有 `nft` → 只能验证
+     「代码取的是 handle 而不是行号」，无法验证真实 `nft` 的行为。
+  8. **真实 systemd 的启停未验证** —— `systemctl disable --now xray`
+     与 `systemctl enable --now xray` 的真实行为没在装了 systemd 的机器上跑过。
+  9. **REALITY 握手未验证** —— 部署出来的节点没有与真实客户端握过手。
+  10. **`apt-get` 安装 Xray-core 未验证** —— 安装脚本里对 Xray-core 的下载与
+      安装流程没有在真实 Debian 上跑过。
+  11. **`ss` 的过滤语法未在真实环境验证** —— `ss -ltn "sport = :$port"` 这条过滤语法
+      本机没有 `ss`、无法实测；退化分支 `netstat -ltn` 同理。
 
-  必须同时写明**整体**验证边界：
+  #### 已知风险（已确知、无法在本工具内消除；同样必须【逐条】点名）
+
+  12. **以 root 执行 GitHub `main` 分支上的脚本、没有校验和校验** ——
+      安装或更新 Xray-core 时，工具会下载
+      `https://github.com/XTLS/Xray-install/raw/main/install-release.sh`
+      并**以 root 执行**它。这是 Xray 生态的通行做法，但用的是 **`main` 分支**
+      （内容可变）且**没有完整性校验**。
+      （这是计划里登记的 **T6-7**（Task 6 修订轮）与 **T10-7**（Task 10 修订轮）：
+      保留该行为，但**必须**让用户在自己的机器上看到这一条。）
+
+  #### 整体验证边界（必须同时写明）
+
   **Debian 真机端到端部署尚未在本开发环境验证** —— 开发环境是 Windows + Git Bash，
   没有 Debian、没有 Docker、没有真 TTY。因此以下环节**都没有**在真实目标机上跑过：
   `apt-get` 安装 Xray-core、systemd 单元的启停、防火墙放行（ufw/iptables/nft）、
-  REALITY 握手、真实终端下的 TUI 交互与按键响应。
+  REALITY 握手、真实终端下的 TUI 交互与按键响应、`ss` 的端口过滤。
   **已验证**的只有：所有 `.sh` 的 `bash -n` 语法检查、`bash test/unit.sh` 单元测试全部通过、
-  以及用 `TUI_TTY=1` + 管道喂按键模拟真终端的 TUI 渲染与交互路径。
+  用 `TUI_KEY_TIMEOUT=2` / `TUI_DIGIT_TIMEOUT=2` 放大按键超时后
+  以 `TUI_TTY=1` + 管道喂按键模拟真终端的 TUI 渲染与交互路径。
 - 卸载说明
 - 致谢与上游项目链接（XTLS/Xray-core、XTLS/Xray-install）
+
+⚠️ **上面这 12 个小节一个都不能少**（Step 1 有**逐个小节**的标题级断言：
+少写一个，单元测试就红）。
+
+**同时**同步设计稿：`docs/superpowers/specs/2026-10-21-vless-reality-deploy-design.md`
+的 **4.1 依赖方向**图要补上 `core.sh ──> tui.sh` 这条边（定点修订 **P4**，
+改前 / 改后的原文见本任务末尾「修订轮 1 的定点修订的『改前 / 改后』原文」）。
+理由：`lib/core.sh` 会调用 `lib/tui.sh` 的 `tui_err` / `tui_tip` / `tui_ok`
+—— 这是计划里 **F-18** 登记的「留到 Task 13 收尾补设计稿」。
 
 **Step 6: 运行测试确认通过**
 
@@ -8691,9 +8879,325 @@ bash test/unit.sh
 **Step 7: 提交**
 
 ```bash
-git add demo.sh README.md test/integration-debian.sh test/unit.sh
+git add demo.sh README.md test/integration-debian.sh test/unit.sh lib/tui.sh lib/deploy.sh \
+  docs/superpowers/specs/2026-10-21-vless-reality-deploy-design.md
+# ⚠️ 必须显式设置可执行位（见 T13-7）：仓库本地的 core.fileMode=false，
+#    新克隆的仓库里 .sh 全是 100644 → demo.sh 与集成脚本直接 ./ 跑会 Permission denied。
+git update-index --chmod=+x demo.sh
+git update-index --chmod=+x test/integration-debian.sh
 git commit -m "docs: TUI 预览脚本、集成测试与 README"
 ```
+
+#### 修订轮 1 的逐项发现与处置
+
+> 本节由**控制器**在 Task 13 派发前预扫（**实跑**计划里的 demo.sh + 源码静态核对）后写入。
+> 本节列的全是**计划缺陷**，责任方是控制器；Task 13 的代码块本身还没被实施过。
+>
+> 预扫对象：计划 `## Task 13` 段的 Step 1（测试）/ Step 3（demo.sh）/ Step 4（集成脚本）/ Step 5（README）。
+> 沙箱底座 = `git archive HEAD` 整棵树（**Task 12 的实施提交**）。
+
+| # | 级别 | 发现 | 处置 |
+|---|---|---|---|
+| **T13-1** | **Critical** | **分享链接会撑破边框 —— 这是真实产品的缺陷，不只是 demo 的问题。** `tui_box_line` 用的是 `tui_pad`，而 `tui_pad` **不截断**（Task 1 的既定语义：「已达宽度则不截断」）→ 内容比框内净宽（`TUI_WIDTH-6`，默认 **74**）长时，**右边框被顶出去**，框线合不拢（框线必须恰好等于 `TUI_WIDTH` 才对得齐）。<br>**实跑证据**（控制器实跑计划里的 demo.sh，`</dev/null`，限时 20 秒，rc=0，逐行量显示宽度）：框宽 **80**、分享链接那一行 **98** → **顶出去 18 列**（右边框被推到第 98 列，而上下边框在第 80 列）。而真实的 `vless://…` 分享链接有 **150+ 字符**（含 `pbk` / `sni` / `fp` / `sid` 等参数）→ 超框 **70+ 列**，在 80 列的终端里会**折成两行**，框彻底散架。<br>**受影响的真实调用点**：`lib/deploy.sh:763`（部署完成时展示分享链接）与 `lib/deploy.sh:802`（管理菜单「查看客户端分享链接」）—— **两处都是核心用户路径**，框里的标题恰恰写着「可直接粘贴到客户端导入」 | Step 1 新增组件 **`tui_box_text <标题> <内容>`**（定点修订 P1，`lib/tui.sh`）：<br>· 内容**放得下** → 照常画框；<br>· 内容**放不下** → **不开框**，改用小节标题 + **整行输出**。<br>⚠️ **为什么不折行**：用户要从终端复制这一行，折行后粘到客户端是**废链接**。<br>⚠️ 为什么整行输出就没事：终端的**软换行**只是显示效果，**不会往内容里插入字符** → 复制出来仍是完整的一行。<br>两处调用点改用它（定点修订 P2 / P3，`lib/deploy.sh`）；demo.sh 同时演示「放得下」（画框）与「放不下」（整行输出）两种形态 |
+| **T13-2** | **Important** | **Task 13 最关键的交付物 —— README 的「验证状态声明」—— 零断言覆盖。** Step 1 只有 6 条断言，全在 demo.sh 上；README 是**人写的散文**，计划只写了「必须包含以下小节」，没有任何可执行判据 → 实现者少写一半未验证项，测试**照样全绿** | Step 1 新增 **12 条** README 断言：逐条点名「权限位 / Debian 真机 / shellcheck / nft / systemd / REALITY / TLS 1.3 / apt-get」八个关键词 + 「已验证」+「sudo bash install.sh」+「curl」+「验证状态声明」小节名。<br>⚠️ 判据是**关键词必须在**（不是逐字匹配整段散文）—— 散文无法逐字节校验，但**关键结论被漏掉**必须能被抓到 |
+| **T13-3** | **Important** | **Step 1 的 demo.sh 调用没有超时保护 → 整个测试套件会挂死。** `out=$(bash "$ROOT/demo.sh" </dev/null 2>&1)`：demo.sh 若在某个分支里等输入不返回，套件**永远不结束**。CI 上表现为「超时失败」，且**看不出是哪一条断言**出的问题 —— 比红更糟 | 改成 `out=$(timeout 30 bash "$ROOT/demo.sh" </dev/null 2>&1)`（`timeout` 在运行时白名单里）→ 挂死变成「一条断言红」 |
+| **T13-4** | **Important** | **demo.sh 依赖「没有 `set -e`」这个隐含前提。** `tui_menu` 在非 TTY 下返回 **255**（取消）、`tui_input` 在 EOF 下返回非零 —— 现在 demo.sh 是 `set -uo pipefail`（**没有** `-e`）所以没事，但**将来谁加一行 `set -e` 就会在菜单那一步直接退出**，demo 变成半截输出 | demo.sh 顶部加一段注释写明「**不要加 `set -e`**」及其原因；Step 1 补一条断言：demo.sh 里**不含** `set -e` |
+| **T13-5** | Minor | **集成测试脚本的语法检查没排除 `.worktrees/`** —— 本机的工作树目录也会被挂进容器 → 里面的副本是同一份源码的另一次检出 → 不排除就会**重复检查一遍** | Step 4 的 `find` 加 `-not -path "./.worktrees/*"`（与 CI 的那条一致） |
+| **T13-6** | Minor | **集成测试脚本没有校验单文件产物的自包含性** —— 它构建了 `dist/install.sh` 却只验「存在」 | Step 4 补一步：验 `dist/install.sh` 存在、`grep -q 'source.*lib/'` 为假、`bash -n` 通过；Step 1 补一条断言点名 `dist/install.sh` |
+| **T13-7** | Minor | **`demo.sh` 与 `test/integration-debian.sh` 没有可执行位** —— 与 Task 12 的 T12-5 同一条纪律 | Step 6 提交时加两条 `git update-index --chmod=+x`；验收标准点名这两个文件的提交模式必须是 **100755**（⚠️ 这一项**不能**写成单元断言 —— 它是 Git 索引的属性，而单元测试要在 Docker 容器里跑，那里不一定装了 git） |
+| **T13-8** | Minor | **README 的验证状态声明缺 6 条未验证项**，且没要求列出「已验证」的清单。** 计划原文只有 5 项（权限位 / urlencode / detect_os / assert_debian / shellcheck），**漏掉**：单元套件的**网络依赖**断言（TLS 1.3 探测要真连外网）、`nft` 的 handle 语义、真实 **systemd** 的启停、**REALITY 握手**、`apt-get` 安装 Xray-core、`ss` 的端口过滤语法 | Step 5 的 README 骨架扩到 **11 条**未验证项，并要求同时写出「**已验证**」清单与整体验证边界 |
+| **T13-9** | **Critical** | **T6-7 被计划登记为 MUST，却从来没进过 README 的骨架 —— 计划自相矛盾。** 计划在**两处**明文登记：「**必须写进 README 的『验证状态声明』**：工具会以 root 执行一个从 GitHub `main` 分支下载的脚本，没有校验和校验」（Task 6 修订轮的 **T6-7**、Task 10 修订轮的 **T10-7**）。但 Step 5 的未验证项清单里**从来没有这一条**（修订轮 1 扩到 11 条也没有）→ 实施者**不写也不违反 Step 5 的字面要求** → 这条 MUST 事实上被静默丢弃。<br>后果：用户在自己的服务器上以 root 执行了一段**从可变分支下载、未经校验**的脚本，而 README 一个字都没提 | Step 5 的「验证状态声明」里加一个**「已知风险」**子块，第 12 条点名：安装/更新 Xray-core 时会下载并**以 root 执行** GitHub `main` 分支上的 `install-release.sh`，**没有校验和校验**；Step 1 加一条断言点名「校验和」 |
+| **T13-10** | **Important** | **README 的其余 10 个必需小节是零断言覆盖 —— 与 T13-2 同一类缺陷，修订轮 1 只修了其中一格。** Step 5 要求 README 有 **12 个小节**（简介与特性 / 快速开始 / curl 命令 / 目录结构 / CLI 参数表 / 部署向导 / 管理菜单 / 客户端导入 / 常见问题 / 验证状态声明 / 卸载说明 / 致谢与上游链接），而 Step 1 的 12 条 README 断言**全部落在「验证状态声明」那一格** → 实现者把「常见问题」「客户端导入」「卸载说明」「致谢」整个漏掉，测试**照样全绿**。README 是这个仓库**面向用户的唯一门面**（GitHub 分发），漏掉整节就是漏掉整节 | Step 1 补 **13 条**断言：9 条**标题级**判据（每个必需小节一条）+ 4 条**内容级**判据（v2rayNG / Clash / BBR / 二维码）。<br>⚠️ 标题级判据必须**剔掉 ``` 围栏**再取标题行 —— 否则代码块里以 `#` 开头的注释行会被当成标题 |
+| **T13-11** | Minor | **F-18 登记给 Task 13 的活儿，Task 13 里根本没有这一步。** 计划 Task 1 修订轮的 **F-18**：「设计稿 4.1 的依赖图漏了 `core.sh → tui.sh` 这条边」，处置写的是「**留到 Task 13 收尾补设计稿**」—— 但 Task 13 的 Step 1–7 里**没有任何一步**碰设计稿 → 这条义务被静默丢弃。<br>事实依据：`lib/core.sh` 会调用 `lib/tui.sh` 的 `tui_err` / `tui_tip` / `tui_ok`（`core.sh` 不主动 source `tui.sh`，由 `install.sh` 按 `tui → core` 的顺序引入）→ 这条边是真实存在的 | 加**定点修订 P4**：设计稿 4.1 的依赖方向图补上 `core.sh ──> tui.sh` 这条边；Step 5 末尾写明这一步；Step 1 加一条断言点名这条边 |
+
+### 顺带修掉的 Task 12 段两处【计划瑕疵】（由 Task 12 的实施者如实报出）
+
+| # | 级别 | 发现 | 处置 |
+|---|---|---|---|
+| **T12-18** | Minor | **Task 12 的验收标准第 3 条对 P5 自相矛盾。** 原文要求「每处的**旧文本在改后文件里必须命中 0 次**」—— 而 P5 的**新文本是旧文本的严格超集**（新 = 旧 + 追加几行）→ 改完后旧文本必然还命中 **1** 次 → **这条对它不可能成立**。<br>实施者按简报里的提示处理（旧 1 次 / 新 1 次）并**如实报出这个矛盾**，没有偷偷改计划，也没有改代码去凑 | 验收标准第 3 条补上 **P5 的例外条款**：新文本命中 1 次；P1–P4 的旧文本命中 0 次；**P5 的旧文本命中 1 次**（它就在新文本里） |
+| **T12-19** | Minor | **Task 12 修订轮 1 探针表里的「产物大小 100 407 字节」已过时** —— P1–P4 让 `install.sh` 与 `lib/tui.sh` 变大 → 实施后的产物是 **102 110 字节**。实施者主动报出了这个差异并说明「不是缺陷」 | 探针表的数字后补一句「这是修订轮 1 之前的数；实施后是 102 110 字节（不是缺陷）」 |
+
+> 两处都**只改散文**，Task 12 的**代码块一个字未动** —— 那些块已是实施完毕的内容
+> （提交 `deaa78c`），控制器复核时逐字节比对的就是它们。
+
+### 四处定点修订（均须恰好命中 1 次）
+
+| 编号 | 文件 | 改什么 |
+|---|---|---|
+| **P1** | `lib/tui.sh` | 在 `tui_box_end` 之后新增组件 **`tui_box_text`** |
+| **P2** | `lib/deploy.sh` | 部署完成时的分享链接框 → `tui_box_text` |
+| **P3** | `lib/deploy.sh` | 管理菜单查看分享链接时的框 → `tui_box_text` |
+| **P4** | `docs/superpowers/specs/2026-10-21-vless-reality-deploy-design.md` | 4.1 依赖方向图补上 **`core.sh ──> tui.sh`** 这条边（F-18） |
+
+> **代价与补偿**：改了之后，`lib/tui.sh` 与 `lib/deploy.sh`
+> 不再与计划里对应任务的 Step 3 块逐字节一致 →
+> 因此本任务把这四处写成**可机械核对的精确文本替换**，验收标准里逐条点名，
+> 控制器复核时逐条核对。
+
+### 控制器对「demo.sh 在 `</dev/null` 下会不会挂死」的实跑结论
+
+从计划里**抽出** Step 3 的 demo.sh 代码块 → 落进临时目录 → 实跑：
+
+| 检查 | 结果 |
+|---|---|
+| `bash -n demo.sh` | rc=0 ✓ |
+| `bash demo.sh </dev/null`（限时 20 秒） | **rc=0**，未挂死 ✓，输出 1922 字节 / 48 行 |
+| 输出含「分享链接」 | ✓ |
+| 输出含 `systemctl ` / `apt-get` | **0 / 0** ✓ |
+| 框线是否合得拢 | **❌ 框宽 80、分享链接那行 98 → 顶出去 18 列** → T13-1 |
+
+#### 修订轮 1 的定点修订的「改前 / 改后」原文
+
+下面 **四个**代码块对用 `text` 围栏而不是 `bash` —— 它们是**文件内部的片段**，
+单独 `bash -n` 必然报语法错。用 `text` 围栏可以让计划的语法自检脚本跳过它们，
+同时**原样**展示要替换的文本。
+
+> 「改前」文本必须在目标文件里**恰好命中 1 次**；改完后「改前」命中 **0** 次、
+> 「改后」命中 **1** 次。
+
+**P1 —— `lib/tui.sh`：在 `tui_box_end` 之后新增 `tui_box_text`**
+
+- 目标文件：`lib/tui.sh`
+
+- 改前：
+
+```text
+tui_box_end() {
+  local rw
+  rw=$(tui_border_len $((TUI_WIDTH - 4)))
+  printf '  %s%s%s%s\n' "$C_ACCENT" "$B_BL" "$(tui_repeat "$B_H" $rw)" "$B_BR$C_RESET"
+}
+```
+
+- 改后：
+
+```text
+tui_box_end() {
+  local rw
+  rw=$(tui_border_len $((TUI_WIDTH - 4)))
+  printf '  %s%s%s%s\n' "$C_ACCENT" "$B_BL" "$(tui_repeat "$B_H" $rw)" "$B_BR$C_RESET"
+}
+
+# 一个带标题的内容块：内容【放得下】就画框，【放不下】就整行输出。
+# ⚠️ 为什么需要它：分享链接有 150+ 字符，而框内净宽只有 TUI_WIDTH-6（默认 74）→
+#    硬塞进框里会把右边框顶出去，框线合不拢
+#    （框线必须恰好等于 TUI_WIDTH 才对得齐，见 tui_box / tui_box_end 的注释）。
+#    也不能把链接折成多行：用户要从终端复制这一行，折行后粘到客户端是废链接。
+#    → 放不下时不开框，改用小节标题 + 整行输出；
+#      终端的【软换行】只是显示效果，不会在内容里插入字符 → 复制出来仍是完整的一行。
+tui_box_text() {
+  local title="$1" text="$2" cw
+  cw=$(tui_content_width)
+  if (( $(tui_dwidth "$text") <= cw )); then
+    tui_box "$title"
+    tui_box_line "$text"
+    tui_box_end
+    return 0
+  fi
+  tui_section "$title"
+  printf '  %s%s%s\n' "$C_WHITE" "$text" "$C_RESET"
+}
+```
+
+**P2 —— `lib/deploy.sh`：部署完成时的分享链接框改用 `tui_box_text`**
+
+- 目标文件：`lib/deploy.sh`
+
+- 改前：
+
+```text
+  tui_box "分享链接（可直接粘贴到客户端导入）"
+  tui_box_line "$link"
+  tui_box_end
+```
+
+- 改后：
+
+```text
+  # 用 tui_box_text 而不是 tui_box/tui_box_line：分享链接有 150+ 字符，
+  # 框内净宽只有 TUI_WIDTH-6 → 硬塞进框里会把右边框顶出去（框线合不拢）；
+  # 也不能折行（用户要复制这一行，折行后粘到客户端是废链接）。
+  tui_box_text "分享链接（可直接粘贴到客户端导入）" "$link"
+```
+
+**P3 —— `lib/deploy.sh`：管理菜单查看分享链接时改用 `tui_box_text`**
+
+- 目标文件：`lib/deploy.sh`
+
+- 改前：
+
+```text
+  tui_box "分享链接"
+  tui_box_line "$link"
+  tui_box_end
+```
+
+- 改后：
+
+```text
+  # 同上：分享链接超出框宽 → 用 tui_box_text 整行输出（不撑破边框、也不折行）。
+  tui_box_text "分享链接" "$link"
+```
+
+**P4 —— 设计稿 4.1 依赖方向图补上 `core.sh → tui.sh` 这条边**
+
+- 目标文件：`docs/superpowers/specs/2026-10-21-vless-reality-deploy-design.md`
+
+- 改前：
+
+```text
+install.sh ──> deploy.sh ──> core.sh
+      │ └────────> tui.sh
+      ├────────> client.sh ──> core.sh
+      └────────> tui.sh
+```
+
+- 改后：
+
+```text
+install.sh ──> deploy.sh ──> core.sh
+      │ └────────> tui.sh
+      ├────────> client.sh ──> core.sh
+      └────────> tui.sh
+core.sh ──> tui.sh
+```
+
+> ⚠️ 这四处**都不满足**「改后文本是改前文本的严格超集」——
+> P4 的新文本**多了一行**（依赖图多一条边），前文没有前缀关系，
+> 所以统一判据成立：**改前命中 0 次、改后命中 1 次**。
+
+#### 修订轮 1 的验收标准
+
+1. `demo.sh` 的内容与上面 **Step 3 代码块逐字节一致**（新建文件）。
+2. `test/integration-debian.sh` 的内容与上面 **Step 4 代码块逐字节一致**（新建文件）。
+3. `test/unit.sh` 里 Task 13 的插入段与上面 **Step 1 代码块逐字节一致**
+   （追加在 `test_summary` **之前**）。
+4. `README.md` 必须包含 **Step 5 骨架里点名的每一个小节**（**12 个**，一个都不能少），
+   并且**逐条**写出了 **11 条未验证项** + **第 12 条「已知风险」**（T6-7：无校验和校验）
+   + 「已验证」清单 + 整体验证边界（缺一条都算不合格）。
+   报告里要贴出 README 的**小节标题清单**供核对。
+5. **四处定点修订**（P1 / P2 / P3 / P4）与上面写的**改后**文本逐字一致；
+   每处的**旧文本在改后文件里必须命中 0 次**、**新文本命中 1 次**。
+   **除这四处外，Task 1 / Task 2 / Task 9 / Task 10 的 Step 3 块一字未动**
+   （`lib/tui.sh` 与 `lib/deploy.sh` 因此不再与计划里对应任务的块逐字节一致 ——
+   补偿方式就是这四条可机械核对的精确文本替换）。
+6. `demo.sh` 与 `test/integration-debian.sh` 的提交模式是 **100755**：
+   `git ls-files -s demo.sh test/integration-debian.sh` 必须显示 `100755`。
+7. `bash test/unit.sh` 全部通过、退出码 0。
+8. 断言总数必须恒定，且**连跑 4 次条数相同**。
+   ⚠️ **平台差是【三个数】**（构成见 Global Constraints）：
+   本机（Windows + MSYS）**768**、Debian **以 root 运行** **768**、
+   Debian **以非 root 运行** **768**（= GitHub Actions runner 的身份）。
+   （底座 **718** + 本轮 **50**）
+   报告里必须写明「哪个平台 **+ 以什么身份运行**」。
+   ⚠️ 本轮**没有**任何平台相关断言（无 `stat -c '%a'`、无 `chmod 000` 的 `! -r`），
+   也**没有任何条件块** → 三个数**相同**。
+   ⚠️ **「调用点」与「执行数」必须写清**：本轮 Task 13 段源码里有 **50** 个
+   `assert_*` 调用点，**全部执行**。
+9. **产物核验**（这几条是 Task 13 真正的产品断言）：
+   - `bash demo.sh </dev/null` 退出码 0、**不挂死**（限时 30 秒）；
+   - demo 的输出里**不含** `systemctl` 与 `apt-get`；
+   - demo 的输出里**每一行**的显示宽度都 **≤ TUI_WIDTH**，
+     **唯一**的例外是那行**故意**超宽的分享链接（它必须**不在任何框里**）；
+   - 框的**顶边、内容行、底边**三者宽度**相等**（框线合得拢）。
+10. 红灯证据（**36 条变异**，每条都要贴出**变红的断言原文**）：
+   - A1 让 `tui_box_text` **总是画框**（去掉宽度判断）
+     → 「超宽内容不画上边框（框线会合不拢）」与「超宽内容不画下边框」必须变红；
+   - A2 让 `tui_box_text` **总是整行输出**（去掉「放得下才画框」分支）
+     → 「窄内容照常画框」必须变红；
+   - A3 让 `tui_box_text` 的**小节标题**不打印
+     → 「超宽内容仍带小节标题」必须变红；
+   - A4 让 `tui_box_text` **不打印内容**
+     → 「超宽内容整行输出，内容一个不少」必须变红；
+   - A5 把 `lib/deploy.sh` 部署完成处的 `tui_box_text` 改回 `tui_box` + `tui_box_line`
+     → 「部署完成时用 tui_box_text 显示分享链接」必须变红；
+   - A6 把 `lib/deploy.sh` 管理菜单处的 `tui_box_text` 改回 `tui_box` + `tui_box_line`
+     → 「管理菜单查看分享链接时用 tui_box_text」必须变红；
+   - A7 让 `demo.sh` 里出现 `systemctl`
+     → 「demo.sh 源码里不含任何改系统的命令」必须变红；
+   - A8 让 `demo.sh` 里出现 `apt-get`
+     → 「demo 不调用 apt-get」必须变红；
+   - A9 让 `demo.sh` 里出现 `set -e`
+     → 「demo.sh 不含 set -e（否则 tui_menu 的 255 会让它半路退出）」必须变红；
+   - A10 让 demo 里的标题不含「分享链接」
+     → 「demo 展示分享链接样例」必须变红；
+   - A11 让 `test/integration-debian.sh` 里不再出现 `docker`
+     → 「集成测试用 docker 起容器」必须变红；
+   - A12 让 `test/integration-debian.sh` 里不再出现 `test/unit.sh`
+     → 「集成测试在容器里跑单元测试」必须变红；
+   - A13 让 `test/integration-debian.sh` 里不再出现 `build.sh`
+     → 「集成测试在容器里构建单文件」必须变红；
+   - A14 让 `test/integration-debian.sh` 里不再出现 `dist/install.sh`
+     → 「集成测试在容器里验证单文件产物」必须变红；
+   - A15 让 `test/integration-debian.sh` 有语法错
+     → 「集成测试脚本语法正确」必须变红。
+     ⚠️ **必须是【真的】语法错**（`bash -n` 返回非 0）——
+     控制器实测过一种**假**的破坏：把 `IMAGE="${IMAGE:-debian:bookworm-slim}"`
+     的引号拆到下一行，bash 仍能解析 → 断言照样绿 → 这条变异**等于没做**。
+     可靠的造法：插入一行**未闭合的引号**（`bash -n` 报 `unexpected EOF`）；
+   - A16 让 `lib/tui.sh` 里**没有** `tui_box_text`
+     → 「lib/tui.sh 提供超宽内容的处理组件」必须变红；
+   - A17 让 `README.md` 里没有「验证状态声明」
+     → 「README 里有「验证状态声明」小节」必须变红；
+   - A18 让 `README.md` 里没有「nft」
+     → 「声明里点名：nft 的 handle 语义未实测」必须变红；
+   - A19 让 `README.md` 里没有「TLS 1.3」
+     → 「声明里点名：单元套件含网络依赖断言（TLS 1.3 探测）」必须变红；
+   - A20 让 `README.md` 里没有「已验证」
+     → 「README 同时列出已验证的项」必须变红；
+   - A21 让 `README.md` 里没有「sudo bash install.sh」
+     → 「README 给出 sudo bash install.sh 的用法」必须变红；
+   - A22 让 `README.md` 里没有「特性」**标题**
+     → 「README 有「特性」小节」必须变红；
+   - A23 让 `README.md` 里没有「目录结构」**标题**
+     → 「README 有「目录结构」小节」必须变红；
+   - A24 让 `README.md` 里没有「CLI 参数」**标题**
+     → 「README 有「CLI 参数」小节」必须变红。
+     ⚠️ 改名时**不得**再含 `CLI` 或 `命令行` 字样——
+     判据的正则是 `^#+ .*(CLI|命令行)`，
+     改成「## 命令行选项」**仍会命中** → 变异**等于没做**；
+   - A25 让 `README.md` 里没有「部署向导」**标题**
+     → 「README 有「部署向导」小节」必须变红；
+   - A26 让 `README.md` 里没有「管理菜单」**标题**
+     → 「README 有「管理菜单」小节」必须变红；
+   - A27 让 `README.md` 里没有「客户端导入」**标题**
+     → 「README 有「客户端导入」小节」必须变红；
+   - A28 让 `README.md` 里没有「常见问题」**标题**
+     → 「README 有「常见问题」小节」必须变红；
+   - A29 让 `README.md` 里没有「卸载」**标题**
+     → 「README 有「卸载」小节」必须变红；
+   - A30 让 `README.md` 里没有「致谢与上游项目」**标题**
+     → 「README 有「致谢与上游项目链接」小节」必须变红；
+   - A31 让 `README.md` 里没有「v2rayNG」
+     → 「客户端导入说明里点名 v2rayN / v2rayNG」必须变红；
+   - A32 让 `README.md` 里没有「Clash」
+     → 「客户端导入说明里点名 Clash Verge」必须变红；
+   - A33 让 `README.md` 里没有「BBR」
+     → 「常见问题里点名 BBR」必须变红；
+   - A34 让 `README.md` 里没有「二维码」
+     → 「常见问题里点名二维码缺失」必须变红；
+   - A35 让 `README.md` 里没有「校验和」
+     → 「声明里点名：以 root 执行 GitHub main 分支脚本、无校验和校验（T6-7）」必须变红；
+   - A36 让设计稿 4.1 的依赖图里没有 `core.sh ──> tui.sh` 这条边
+     → 「设计稿 4.1 的依赖图补上了 core.sh → tui.sh 边（F-18）」必须变红。
+   > ⚠️ **README 是散文**：A17–A35 的**变异串**必须按**实施后的实际 README** 写
+   > （逐字命中 1 次；命中 0 次 = 文本对不上 → **停下报告**，不要凑合）。
+   > 变异串「命中次数 != 1 直接报错」这条纪律对散文同样适用。
+   > ⚠️ **A22–A30 打的是【标题行】**（不是任意出现）——
+   >   变异串必须包含标题行本身（例如 `## 常见问题`），否则正文里出现同一个词就**打不红**。
+11. ⚠️ **变异矩阵的纪律**：
+   - 变异串必须与被测文件的**实际文本逐字一致**，**命中次数 != 1 直接报错**（不静默跳过）；
+   - 每条变异跑出来的**断言总数必须仍等于基线**（证明探针健康）；
+   - 变红的断言**原文**必须与上面点名的**逐字对上**；
+   - **一条变异打出 0 条红 = 该断言恒真**，必须**修判据**而不是跳过它；
+   - 变异只在**沙箱副本**里做，**仓库工作区全程不被变异**。
+12. 未验证项必须**如实报告**，不得当作已验证：
+    - **真实 Debian 上的端到端部署**未验证（开发环境是 Windows + Git Bash，
+      没有 Debian、没有 Docker、没有真 TTY）；
+    - **真实 systemd / ufw / iptables / nft 的行为**全部是 mock；
+    - **ShellCheck 本机没装** → `.shellcheckrc` 的豁免清单**未经真实 shellcheck 验证**；
+    - **真实 `ss` 的端口过滤语法**未实测（本机没有 `ss`）；
+    - **GitHub Actions 上的 CI 尚未实际跑过**（仓库还没推到远端）。
 
 ---
 
