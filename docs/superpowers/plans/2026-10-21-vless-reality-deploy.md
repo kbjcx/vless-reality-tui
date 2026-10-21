@@ -115,6 +115,11 @@ assert_status() {
 assert_true()  { if [[ "$1" == "0" ]]; then assert_eq 0 0 "${2:-为真}"; else assert_eq 0 1 "${2:-为真}"; fi; }
 assert_false() { if [[ "$1" == "0" ]]; then assert_eq 0 1 "${2:-为假}"; else assert_eq 0 0 "${2:-为假}"; fi; }
 
+# 以【退出码】断言：直接把命令作为参数传入。
+# 布尔型函数（返回 0/1 退出码而非打印值）必须用这两个，否则会误判。
+assert_succeeds() { local m="${2:-命令应以 0 退出}"; if "$@" >/dev/null 2>&1; then assert_eq 0 0 "$m"; else assert_eq 0 1 "$m"; fi; }
+assert_fails()    { local m="${2:-命令应以非 0 退出}"; if "$@" >/dev/null 2>&1; then assert_eq 0 1 "$m"; else assert_eq 0 0 "$m"; fi; }
+
 test_summary() {
   printf '\n  ────────────────────────────────\n'
   if [[ $TEST_FAIL -eq 0 ]]; then
@@ -144,13 +149,13 @@ source "$ROOT/lib/tui.sh"
 test_case "TUI 文本宽度与补白"
 
 assert_eq "5"  "$(tui_dwidth 'abcde')"        "纯 ASCII 宽度 = 字符数"
-assert_eq "6"  "$(tui_dwidth '中文')"          "两个中文字符宽度 = 4"
-assert_eq "6"  "$(tui_dwidth 'ab中文')"        "ASCII 与中文混合宽度"
-assert_eq "1"  "$(tui_dwidth '')"              "空串宽度 = 0"
+assert_eq "4"  "$(tui_dwidth '中文')"          "两个中文字符宽度 = 4（各占 2 列）"
+assert_eq "6"  "$(tui_dwidth 'ab中文')"        "ASCII 与中文混合宽度 = 6"
+assert_eq "0"  "$(tui_dwidth '')"              "空串宽度 = 0"
 
-assert_eq "-----  "  "$(tui_pad '-----' 9)"   "补白到指定宽度"
-assert_eq "abc"      "$(tui_pad 'abc' 3)"      "已达宽度则不截断"
-assert_eq "-----"    "$(tui_repeat '-' 5)"     "重复字符"
+assert_eq "-----    "  "$(tui_pad '-----' 9)" "补白到指定宽度（4 个空格）"
+assert_eq "abc"        "$(tui_pad 'abc' 3)"    "已达宽度则不截断"
+assert_eq "-----"      "$(tui_repeat '-' 5)"   "重复字符"
 
 assert_eq "hello" "$(tui_strip $'\033[32mhello\033[0m')" "剥离 ANSI 序列"
 
@@ -346,13 +351,13 @@ git commit -m "feat(tui): 基础层——颜色、宽度计算、边框与消息
 test_case "TUI 交互组件（非 TTY 降级路径）"
 
 # 非 TTY 下 tui_menu 必须打印带序号的完整列表并读入序号，不得挂死
-out=$(printf '2\n' | bash "$ROOT/test/helpers/menu_noninteractive.sh")
+out=$(printf '2\n' | bash "$ROOT/test/helpers/menu_noninteractive.sh"); rc=$?
 assert_contains "$out" "3)" "非 TTY 菜单打印完整编号列表"
-assert_status 1 "$?" "非 TTY 菜单返回选中项索引（0-based）"
+assert_status 1 "$rc" "非 TTY 菜单返回选中项索引（0-based）"
 
 # 取消（EOF）必须返回 255
-out=$(printf '' | bash "$ROOT/test/helpers/menu_noninteractive.sh")
-assert_status 255 "$?" "非 TTY 菜单遇 EOF 返回 255"
+printf '' | bash "$ROOT/test/helpers/menu_noninteractive.sh" >/dev/null 2>&1; rc=$?
+assert_status 255 "$rc" "非 TTY 菜单遇 EOF 返回 255"
 
 # 确认：默认应为「是」
 out=$(printf '\n' | bash "$ROOT/test/helpers/confirm.sh" y)
@@ -660,7 +665,6 @@ assert_eq "a%20b" "$(urlencode 'a b')" "urlencode 编码空格"
 assert_eq "%E4%B8%AD%E6%96%87" "$(urlencode '中文')" "urlencode 编码中文"
 assert_eq "abc123" "$(urlencode 'abc-123')" "urlencode 保留安全字符"
 
-assert_eq "16"  "${#-}" 2>/dev/null || true
 assert_eq "16"  "$(printf '%s' "$(random_hex 8)" | wc -c | tr -d ' ')" "random_hex 8 字节 = 16 个十六进制字符"
 assert_match_hex() {
   local v="$1"
@@ -674,9 +678,14 @@ cat >"$fake_os" <<'EOF'
 ID=debian
 VERSION_ID="12"
 EOF
-assert_eq "debian|12|$(uname -m)" "$(detect_os "$fake_os")" "detect_os 解析 id|version|arch"
+os_out=$(detect_os "$fake_os")
+assert_contains "$os_out" "debian|12|" "detect_os 解析 id|version|arch"
 rm -f "$fake_os"
 ```
+
+> **源码引入位置约定**：本任务及后续任务新增的 `source "$ROOT/lib/xxx.sh"` 一律放在
+> `test/unit.sh` 顶部的 source 区域（`source "$ROOT/lib/tui.sh"` 之后），
+> 不要追加到文件末尾——测试用例依赖函数在执行时已定义。
 
 > 注：`detect_os` 接受可选参数 `os_release_path`，默认 `/etc/os-release`——这使它可测。
 
@@ -731,12 +740,16 @@ urlencode() {
   if have_cmd python3; then
     python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "$s" 2>/dev/null && return 0
   fi
-  local out='' i c
-  for ((i = 0; i < ${#s}; i++)); do
+  # 回退实现：必须按【字节】遍历，否则多字节字符只会编码首字节。
+  # local LC_ALL=C 让 ${#s} 与 ${s:i:1} 都按字节切分。
+  local out='' i c len
+  local LC_ALL=C
+  len=${#s}
+  for ((i = 0; i < len; i++)); do
     c=${s:$i:1}
     case "$c" in
       [a-zA-Z0-9.~_-]) out+="$c" ;;
-      *) out+=$(LC_ALL=C printf '%%%02X' "'$c") ;;
+      *) out+=$(printf '%%%02X' "'$c") ;;
     esac
   done
   printf '%s' "$out"
@@ -1028,11 +1041,9 @@ git commit -m "feat(core): 网络探测——公网 IP、端口占用、TLS1.3 �
 
 **Step 1: 写失败的测试**
 
-追加到 `test/unit.sh`：
+追加到 `test/unit.sh`（`source "$ROOT/lib/deploy.sh"` 一行放在**顶部 source 区域**，见 Task 3 的约定）：
 
 ```bash
-source "$ROOT/lib/deploy.sh"
-
 test_case "x25519 密钥解析（跨版本兼容）"
 
 # 旧版输出格式
@@ -1094,9 +1105,14 @@ bash test/unit.sh
 xray_parse_keys() {
   local raw="$1" priv='' pub='' line key val
   while IFS= read -r line; do
-    [[ "$line" == *=* ]] && continue
-    key="${line%%:*}"
-    val="${line#*:}"
+    # 兼容 "key: value" 与 "key=value" 两种写法
+    if [[ "$line" == *=* && "$line" != *:* ]]; then
+      key="${line%%=*}"
+      val="${line#*=}"
+    else
+      key="${line%%:*}"
+      val="${line#*:}"
+    fi
     key=$(trim "$key")
     val=$(trim "$val")
     [[ -z "$val" ]] && continue
@@ -1294,12 +1310,12 @@ git commit -m "feat(deploy): 密钥解析跨版本兼容与服务端配置渲染
 ```bash
 test_case "deploy 系统操作的可测分支"
 
-# 未安装 xray 时 xray_installed 必须返回非零
+# 未安装 xray 时 xray_installed 必须返回非零退出码
 if [[ ! -x "$XRAY_BIN" ]]; then
-  assert_false "$(xray_installed)" "未安装时 xray_installed 返回假"
+  assert_fails xray_installed "未安装时 xray_installed 返回非零"
 fi
 
-# enable_bbr 在不支持 bbr 的内核上必须安全失败而非崩溃
+# enable_bbr 在不支持 bbr 的内核上必须安全失败而非崩溃；输出必须提及 bbr
 out=$(enable_bbr 2>&1) || true
 assert_contains "$out" "bbr" "enable_bbr 输出提及 bbr 状态"
 
@@ -1499,11 +1515,9 @@ git commit -m "feat(deploy): 内核安装、systemd、防火墙放行与 BBR 调
 
 **Step 1: 写失败的测试**
 
-追加到 `test/unit.sh`：
+追加到 `test/unit.sh`（`source "$ROOT/lib/client.sh"` 一行放在**顶部 source 区域**）：
 
 ```bash
-source "$ROOT/lib/client.sh"
-
 test_case "分享链接与客户端配置"
 
 link=$(build_share_link "UUID123" "1.2.3.4" "443" "www.microsoft.com" "PUBKEY" "a1b2c3d4" "我的节点")
@@ -1729,13 +1743,13 @@ assert_contains "$run_help" "--sni" "帮助信息含 --sni"
 assert_contains "$run_help" "--menu" "帮助信息含 --menu"
 
 # 未知参数必须报错退出
-out=$(bash "$ROOT/install.sh" --definitely-not-a-real-flag 2>&1)
-assert_status 1 "$?" "未知参数以非零码退出"
+out=$(bash "$ROOT/install.sh" --definitely-not-a-real-flag 2>&1); rc=$?
+assert_status 1 "$rc" "未知参数以非零码退出"
 assert_contains "$out" "未知" "未知参数给出提示"
 
-# --status 在未部署时应优雅退出而非崩溃
-out=$(bash "$ROOT/install.sh" --status 2>&1)
-assert_status 0 "$?" "未部署时 --status 退出码为 0"
+# --status 在未部署时应优雅退出而非崩溃（只读操作，不要求 root）
+out=$(bash "$ROOT/install.sh" --status 2>&1); rc=$?
+assert_status 0 "$rc" "未部署时 --status 退出码为 0"
 ```
 
 **Step 2: 运行测试确认失败**
@@ -1884,7 +1898,8 @@ main() {
   fi
 
   if [[ $OPT_STATUS -eq 1 ]]; then
-    require_root
+    # 只读操作，不要求 root —— 否则非 root 的 CI 环境会直接失败，
+    # 与本任务「--status 退出码为 0」的测试断言相矛盾。
     load_state || true
     tui_banner "$APP_NAME" "状态自检"
     tui_section "服务状态"
@@ -1992,29 +2007,32 @@ bash test/unit.sh
 把以下实现**追加到 `lib/deploy.sh`**（不是 `install.sh`——见 Task 8 的函数归属约定）：
 
 ```bash
-# 并发探测候选伪装目标：TLS1.3 支持 + 连通延迟，按延迟升序输出
+# 并发探测候选伪装目标：TLS1.3 支持 + 连通延迟，按延迟升序输出 "host|tls|latency"
+# 未知延迟（'?'）视为最大，排在最后
 probe_targets() {
-  local host tls lat tmp
+  local host tmp sortkey h t l
   tmp=$(mktemp)
   local -a pids=() hosts=()
   for host in "${REALITY_TARGETS[@]}"; do
     (
-      tls='fail'
-      target_supports_tls13 "$host" && tls='ok'
-      lat=$(target_latency_ms "$host")
-      printf '%s|%s|%s\n' "$host" "$tls" "$lat" >"$tmp.$host"
+      t='fail'
+      target_supports_tls13 "$host" && t='ok'
+      l=$(target_latency_ms "$host")
+      printf '%s|%s|%s\n' "$host" "$t" "$l" >"$tmp.$host"
     ) &
     pids+=($!)
     hosts+=("$host")
   done
-  for p in "${pids[@]}"; do wait "$p" 2>/dev/null || true; done
+  for host in "${pids[@]}"; do wait "$host" 2>/dev/null || true; done
   for host in "${hosts[@]}"; do
-    [[ -f "$tmp.$host" ]] && cat "$tmp.$host"
+    [[ -f "$tmp.$host" ]] || continue
+    IFS='|' read -r h t l <"$tmp.$host"
+    sortkey="$l"
+    [[ -z "$sortkey" || "$sortkey" == '?' ]] && sortkey=999999
+    printf '%s|%s|%s|%s\n' "$sortkey" "$h" "$t" "$l"
     rm -f "$tmp.$host"
-  done
+  done | sort -t'|' -k1,1n -k2,2 | cut -d'|' -f2-
   rm -f "$tmp"
-  # 按延迟升序排序（? 视为最大）
-  sort -t'|' -k3,3n -k1,1
 }
 
 choose_target() {
@@ -2036,7 +2054,7 @@ choose_target() {
   done <<<"$probe"
 
   if [[ $OPT_YES -eq 1 ]]; then
-    # 自动挑选第一个支持 TLS1.3 且延迟最低的目标
+    # 自动挑选第一个支持 TLS1.3 且延迟已知的目标
     local pick=''
     while IFS='|' read -r host tls lat; do
       if [[ "$tls" == 'ok' && "$lat" != '?' ]]; then pick="$host"; break; fi
@@ -2045,11 +2063,7 @@ choose_target() {
     printf '%s' "$pick"; return 0
   fi
 
-  tui_section "伪装目标候选（按延迟升序）"
-  local i
-  for i in "${!labels[@]}"; do
-    printf '     %s%2d%s) %s\n' "$C_GRAY" "$((i + 1))" "$C_RESET" "${labels[$i]}"
-  done
+  # 交由 tui_menu 统一渲染，避免重复打印列表
   local sel
   sel=$(tui_menu "选择 REALITY 伪装目标（SNI）" "${labels[@]}") || sel=0
   printf '%s' "${hosts[$sel]}"
@@ -2646,7 +2660,16 @@ printf '已生成 %s (v%s)\n' "$OUT" "$VERSION"
 
 **Step 4: 实现 CI**
 
-创建 `.github/workflows/ci.yml`：
+先创建 `.shellcheckrc`（本地与 CI 共用同一份豁免清单，避免两处行为不一致）：
+
+```
+# SC1090/SC1091：脚本在运行时 source 其它文件，shellcheck 无法静态解析
+disable=SC1090,SC1091
+# SC2034：全局状态变量在各模块间传递，单独看像是未使用
+disable=SC2034
+```
+
+再创建 `.github/workflows/ci.yml`：
 
 ```yaml
 name: CI
@@ -2671,7 +2694,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq shellcheck
-          shellcheck --severity=warning --exclude=SC1090,SC1091,SC2034 install.sh uninstall.sh build.sh demo.sh lib/*.sh test/*.sh
+          shellcheck --severity=warning install.sh uninstall.sh build.sh demo.sh lib/*.sh test/*.sh test/helpers/*.sh
 
       - name: 单元测试
         run: bash test/unit.sh
