@@ -8493,13 +8493,15 @@ export TUI_DIGIT_TIMEOUT=2
 
 **Files:**
 - Create: `demo.sh`
-- Create: `README.md`
+- Create: `README.md`（定点修订 P10 在创建后更正其中一处过时的陈述）
 - Create: `test/integration-debian.sh`
 - Modify: `test/unit.sh`
 - Modify: `lib/tui.sh`（定点修订 P1：新增 `tui_box_text`）
 - Modify: `lib/deploy.sh`（定点修订 P2 / P3：分享链接改用 `tui_box_text`）
 - Modify: `docs/superpowers/specs/2026-10-21-vless-reality-deploy-design.md`（定点修订 P4：4.1 依赖图补 `core.sh → tui.sh` 边）
-- Modify: `dist/install.sh`（**重新生成**：P1–P3 改了 `lib/` → 产物必须同步，见 T13-12）
+- Modify: `install.sh`（定点修订 P5 / P6：更正「提交模式是 100644」的过时陈述）
+- Modify: `uninstall.sh`（定点修订 P7：更正「提交模式是 100644」的过时陈述）
+- Modify: `dist/install.sh`（**重新生成**：P1–P3 与 P8 改了 `lib/` → 产物必须同步，见 T13-12）
 
 **Interfaces:**
 - Consumes: `lib/tui.sh` `lib/core.sh`
@@ -8598,6 +8600,22 @@ assert_contains "$rmd" "已验证" "README 同时列出已验证的项"
 # 快速开始：必须是「先下载再执行」，不用管道
 assert_contains "$rmd" "sudo bash install.sh" "README 给出 sudo bash install.sh 的用法"
 assert_contains "$rmd" "curl" "README 给出 curl 单文件方式的命令"
+
+# ⚠️ T13-14：README 里曾陈述「仓库里的 .sh 提交模式是 100644，install.sh 不可执行」
+#    —— 但 Task 11 的 T11-6(b) 与 Task 12 的 T12-4 / T12-5 已把 install.sh /
+#    uninstall.sh / build.sh / dist/install.sh / demo.sh / test/integration-debian.sh
+#    全部提交成 100755。陈述与仓库的真实状态【矛盾】→ 用户会以为 clone 下来的
+#    脚本一个都跑不了。真正该说的理由是【另一个】：curl 下载下来的文件没有执行位。
+assert_not_contains "$rmd" "100644" "README 不再陈述过时的提交模式（100644）"
+assert_contains "$rmd" "没有执行位" "README 点名：curl 下载下来的文件没有执行位"
+assert_contains "$rmd" "100755" "README 点名：仓库里的脚本提交模式是 100755"
+
+# 三个入口脚本里的同一处陈述也要改掉 —— 它们不是散文，是用户可能直接读到的源码。
+inst13=$(cat "$ROOT/install.sh")
+uninst13=$(cat "$ROOT/uninstall.sh")
+dep13=$(cat "$ROOT/lib/deploy.sh")
+assert_not_contains "$inst13 $dep13 $uninst13" "100644" \
+  "install.sh / uninstall.sh / lib/deploy.sh 不再陈述过时的提交模式（100644）"
 
 test_case "Task 13：README 的必需小节一个都不能少"
 
@@ -8793,8 +8811,9 @@ echo "==> 集成测试结束"
   sudo bash install.sh
   ```
   ⚠️ 命令里必须是 `sudo bash install.sh`，**不是** `sudo ./install.sh`
-  —— 仓库里的 `.sh` 提交模式是 100644，新克隆的仓库里 `install.sh` **不可执行**，
-  `./install.sh` 会 Permission denied。
+  —— `curl -o` 下载下来的文件**没有执行位**，所以 `./install.sh` 会 Permission denied。
+  （仓库里的 `install.sh` 提交模式是 100755，clone 下来就带执行位；
+    但 `bash install.sh` 两种情况都成立。）
 - 目录结构说明
 - CLI 参数表
 - 部署向导的交互流程说明
@@ -8880,16 +8899,18 @@ bash test/unit.sh
 **Step 7: 提交**
 
 ```bash
-# ⚠️ 提交前必须先重新生成单文件产物：P1–P3 改了 lib/tui.sh 与 lib/deploy.sh，
+# ⚠️ 提交前必须先重新生成单文件产物：P1–P3 与 P8 改了 lib/tui.sh 与 lib/deploy.sh，
 #    dist/install.sh 是 build.sh 从它们内联出来的 → 不重新生成就会「脱节」：
 #    ① 单元套件每跑一次都会自己执行 bash build.sh → 不提交它，git status 永远不干净；
 #    ② CI 的「dist 与源码同步校验」步骤（bash build.sh + git diff --exit-code --stat dist/install.sh）
 #       会直接红。见 T13-12。
 bash build.sh
 git add demo.sh README.md test/integration-debian.sh test/unit.sh lib/tui.sh lib/deploy.sh \
+  install.sh uninstall.sh \
   docs/superpowers/specs/2026-10-21-vless-reality-deploy-design.md dist/install.sh
-# ⚠️ 必须显式设置可执行位（见 T13-7）：仓库本地的 core.fileMode=false，
-#    新克隆的仓库里 .sh 全是 100644 → demo.sh 与集成脚本直接 ./ 跑会 Permission denied。
+# ⚠️ 必须显式设置可执行位（见 T13-7）：本仓库本地的 core.fileMode=false →
+#    git add 不会记录工作区的执行位 → 索引里会记成 100644 →
+#    新克隆的仓库里 demo.sh 与集成脚本就【不可执行】→ 直接 ./ 跑会 Permission denied。
 git update-index --chmod=+x demo.sh
 git update-index --chmod=+x test/integration-debian.sh
 git commit -m "docs: TUI 预览脚本、集成测试与 README"
@@ -8927,7 +8948,7 @@ git commit -m "docs: TUI 预览脚本、集成测试与 README"
 > 两处都**只改散文**，Task 12 的**代码块一个字未动** —— 那些块已是实施完毕的内容
 > （提交 `deaa78c`），控制器复核时逐字节比对的就是它们。
 
-### 四处定点修订（均须恰好命中 1 次）
+### 十处定点修订（均须恰好命中 1 次）
 
 | 编号 | 文件 | 改什么 |
 |---|---|---|
@@ -8935,6 +8956,12 @@ git commit -m "docs: TUI 预览脚本、集成测试与 README"
 | **P2** | `lib/deploy.sh` | 部署完成时的分享链接框 → `tui_box_text` |
 | **P3** | `lib/deploy.sh` | 管理菜单查看分享链接时的框 → `tui_box_text` |
 | **P4** | `docs/superpowers/specs/2026-10-21-vless-reality-deploy-design.md` | 4.1 依赖方向图补上 **`core.sh ──> tui.sh`** 这条边（F-18） |
+| **P5** | `install.sh` | 头部注释更正「提交模式是 100644」的陈述 |
+| **P6** | `install.sh` | 卸载分支里 `-f` 判定的注释更正（T13-14） |
+| **P7** | `uninstall.sh` | 头部注释更正「提交模式是 100644」的陈述 |
+| **P8** | `lib/deploy.sh` | `menu_uninstall` 里 `-f` 判定的注释更正（T13-14） |
+| **P9** | `test/unit.sh` | 可执行位那组断言上方的注释更正（T13-14） |
+| **P10** | `README.md` | 「快速开始」里更正「为什么用 `bash install.sh`」的说明（T13-14） |
 
 > **代价与补偿**：改了之后，`lib/tui.sh` 与 `lib/deploy.sh`
 > 不再与计划里对应任务的 Step 3 块逐字节一致 →
@@ -9080,8 +9107,159 @@ core.sh ──> tui.sh
 | **T13-12** | **Important** | **Task 13 的 Step 7 提交清单漏了 `dist/install.sh`。** P1 / P2 / P3 改了 `lib/tui.sh` 与 `lib/deploy.sh`，而 `dist/install.sh` 是 `build.sh` 从它们**内联**出来的 → 产物必然与源码脱节。后果有三条：<br>① **单元套件每跑一次都会自己执行 `bash build.sh`**（见 `test/unit.sh` 的 Task 12 段）→ 不把产物提交进去，`git status --porcelain` **永远不干净**；<br>② CI 的「dist 与源码同步校验」步骤（`bash build.sh` + `git diff --exit-code --stat dist/install.sh`）会**直接红**；<br>③ 计划自身的「单文件产物与开发版不漂移」不变量被打破。<br>**实施者在报告里如实指出这一点并选择了提交产物**，控制器核实后认定该处置正确 | Step 7 的提交清单**补上 `dist/install.sh`**，并在提交前显式加上 `bash build.sh`；Files 块补一条 `Modify: dist/install.sh` |
 | **T13-13** | **Important** | **验收标准第 5 条对 **P1 / P4** 自相矛盾（与 Task 12 的 T12-18 同一类）。** 原文要求「每处的**旧文本在改后文件里必须命中 0 次**」—— 但 **P1** 的新文本是旧文本的**严格超集**（`tui_box_end` 的函数体被原样保留在改后文本里），**P4** 同理（依赖图的前 4 行原样保留，只是多了一行）→ 改完后旧文本必然还命中 **1** 次 → **这条对 P1 / P4 不可能成立**。<br>**实施者如实报出了这个矛盾**，没有偷偷改计划，也没有改代码去凑 | 验收标准第 5 条补上 **P1 / P4 的例外条款**：新文本命中 1 次；**P2 / P3 的旧文本命中 0 次**；**P1 / P4 的旧文本命中 1 次**（它就在新文本里） |
 
-> 两次都**只改散文**，Task 13 的**代码块一个字未动** —— 那些块已是实施完毕的内容，
-> 控制器复核时逐字节比对的就是它们。
+> 修订轮 1 与修订轮 2 都**只改散文**，Task 13 的**代码块一个字未动** —— 那些块已是实施完毕的内容，控制器复核时逐字节比对的就是它们。
+> ⚠️ **修订轮 3 改了 Task 13 的 Step 1 块**（T13-14：补 4 条断言）→ 那个块的
+> 「逐字节一致」判据要按**修订轮 3 之后**的版本重新核对。
+
+### 修订轮 3：控制器独立复核时发现的「陈述过时」（T13-14）
+
+> 本节由**控制器**在 Task 13 实施提交（`f0ba172`）之后复核时发现：
+> 实施者**逐字照抄**了计划里那段过时的陈述 —— 是**计划**的缺陷，责任方在控制器。
+
+| # | 级别 | 发现 | 处置 |
+|---|---|---|---|
+| **T13-14** | **Important** | **「仓库里所有 `.sh` 的提交模式是 100644」这句话已经过时，而它同时出现在 README 与 4 处代码注释里 —— 用户读到的与仓库的真实状态矛盾。**<br>**事实**：Task 11 的 T11-6(b) 与 Task 12 的 T12-4 / T12-5 已经用 `git update-index --chmod=+x` 把 `install.sh` / `uninstall.sh` / `build.sh` / `dist/install.sh` / `demo.sh` / `test/integration-debian.sh` 全部提交成 **100755**（实测 `git ls-files -s`：这 6 个文件都是 `100755`；其余 `lib/*.sh` / `test/*.sh` 仍是 `100644`，它们只被 source 或 `bash xxx` 调用，不需要执行位）。<br>**但 README 的「快速开始」仍写着**「仓库里的 `.sh` 提交模式是 `100644`，新克隆的仓库里 `install.sh` **不可执行**，`./install.sh` 会 Permission denied」→ **陈述与仓库状态矛盾**（clone 下来的 `install.sh` 是**可执行**的）。<br>更糟的是**原因也错了**：「用 `bash install.sh` 而不是 `./install.sh`」的**真实**理由是 —— 单文件分发版是 `curl -o` **下载**来的，那个文件**没有执行位**；这跟仓库里的提交模式**无关**。<br>同一处陈述在 `install.sh` / `uninstall.sh` / `lib/deploy.sh` / `test/unit.sh` 的注释里各出现一次（4 处） | 定点修订 **P5**–**P10**：把 5 处「提交模式是 100644」的陈述改成**与最终状态一致**的写法 —— 「`-x` 判定依赖执行位，而执行位**不可靠**（单文件分发版里根本没有 `uninstall.sh`，`curl` 下载来的文件也没有执行位）→ 必须用 `-f` 判定 + `exec bash`」；README 改成「`curl -o` 下载下来的文件**没有执行位**（仓库里的 `install.sh` 提交模式是 **100755**，clone 下来就带执行位；但 `bash install.sh` 两种情况都成立）」。<br>Step 1 补 **4 条断言**（README 不含 `100644` / README 点名「没有执行位」 / README 点名 `100755` / 三个入口脚本不含 `100644`）；变异清单补 **A37–A40** 四条 |
+
+#### 修订轮 3 的定点修订的「改前 / 改后」原文
+
+下面 **六个**代码块对用 `text` 围栏（它们是文件内部的片段，单独 `bash -n` 必然报错）。
+
+> 「改前」文本必须在目标文件里**恰好命中 1 次**；改完后「改前」命中 **0** 次、
+> 「改后」命中 **1** 次。
+> ⚠️ P5–P10 的**新文本都不是旧文本的严格超集** → 统一判据成立。
+
+**P5 —— `install.sh`**
+
+- 目标文件：`install.sh`
+
+- 改前：
+
+```text
+# ⚠️ 用 `bash install.sh` 而不是 `./install.sh`：
+#    仓库里的 .sh 提交模式是 100644（core.fileMode=false），
+#    新克隆的仓库里这个文件【不可执行】→ ./install.sh 会 Permission denied。
+```
+
+- 改后：
+
+```text
+# ⚠️ 用 `bash install.sh` 而不是 `./install.sh`：
+#    单文件分发版是 `curl -o` 下载来的 → 那个文件【没有执行位】，
+#    ./install.sh 会 Permission denied。
+#    （仓库里的 install.sh 提交模式是 100755，clone 下来就带执行位；
+#      但 `bash install.sh` 两种情况都成立。）
+```
+
+**P6 —— `install.sh`**
+
+- 目标文件：`install.sh`
+
+- 改前：
+
+```text
+    # 用 -f 判定而不是 -x：仓库里所有 .sh 的提交模式都是 100644（core.fileMode=false），
+    # 新克隆的仓库里 uninstall.sh 【不可执行】→ -x 永远判成「没有」→ 卸载入口是死的。
+    # 用 `exec bash` 显式执行 → 完全不依赖执行位。
+    if [[ -f "$ROOT_DIR/uninstall.sh" ]]; then
+```
+
+- 改后：
+
+```text
+    # 用 -f 判定而不是 -x：`-x` 依赖执行位，而执行位【不可靠】——
+    # 单文件分发版里根本没有 uninstall.sh，curl 下载来的文件也没有执行位
+    # → -x 永远判成「没有」→ 卸载入口是死的。
+    # 用 `exec bash` 显式执行 → 完全不依赖执行位。
+    if [[ -f "$ROOT_DIR/uninstall.sh" ]]; then
+```
+
+**P7 —— `uninstall.sh`**
+
+- 目标文件：`uninstall.sh`
+
+- 改前：
+
+```text
+# ⚠️ 用 `bash uninstall.sh` 而不是 `./uninstall.sh`：
+#    仓库里的 .sh 提交模式是 100644（core.fileMode=false），
+#    新克隆的仓库里这个文件【不可执行】→ ./uninstall.sh 会 Permission denied。
+```
+
+- 改后：
+
+```text
+# ⚠️ 用 `bash uninstall.sh` 而不是 `./uninstall.sh`：
+#    单文件分发版是 `curl -o` 下载来的 → 那个文件【没有执行位】，
+#    ./uninstall.sh 会 Permission denied。
+#    （仓库里的 uninstall.sh 提交模式是 100755，clone 下来就带执行位；
+#      但 `bash uninstall.sh` 两种情况都成立。）
+```
+
+**P8 —— `lib/deploy.sh`**
+
+- 目标文件：`lib/deploy.sh`
+
+- 改前：
+
+```text
+  # 用 -f 判定而不是 -x：仓库里所有 .sh 的提交模式都是 100644（core.fileMode=false），
+  # 新克隆的仓库里 uninstall.sh 【不可执行】→ -x 永远判成「没有」→ 卸载入口是死的。
+  # 用 `exec bash` 显式执行 → 完全不依赖执行位。
+  if [[ ! -f "$ROOT_DIR/uninstall.sh" ]]; then
+```
+
+- 改后：
+
+```text
+  # 用 -f 判定而不是 -x：`-x` 依赖执行位，而执行位【不可靠】——
+  # 单文件分发版里根本没有 uninstall.sh，curl 下载来的文件也没有执行位
+  # → -x 永远判成「没有」→ 卸载入口是死的。
+  # 用 `exec bash` 显式执行 → 完全不依赖执行位。
+  if [[ ! -f "$ROOT_DIR/uninstall.sh" ]]; then
+```
+
+**P9 —— `test/unit.sh`**
+
+- 目标文件：`test/unit.sh`
+
+- 改前：
+
+```text
+  # ⚠️ 仓库里所有 .sh 的提交模式都是 100644（core.fileMode=false）→
+  #    新克隆的仓库里 uninstall.sh 【不可执行】→ 用 -x 判定会永远判成「没有」，
+  #    卸载入口就是死的。必须用 -f 判定 + `bash` 显式执行。
+```
+
+- 改后：
+
+```text
+  # ⚠️ `-x` 判定依赖执行位，而执行位【不可靠】——
+  #    单文件分发版里根本没有 uninstall.sh，curl 下载来的文件也没有执行位
+  #    → 用 -x 判定会永远判成「没有」，卸载入口就是死的。
+  #    必须用 -f 判定 + `bash` 显式执行。
+```
+
+**P10 —— `README.md`**
+
+- 目标文件：`README.md`
+
+- 改前：
+
+```text
+> ⚠️ 命令里是 `sudo bash install.sh`，**不是**直接用 `./install.sh` 执行 ——
+> 仓库里的 `.sh` 提交模式是 `100644`，新克隆的仓库里 `install.sh` **不可执行**，
+> `./install.sh` 会 Permission denied。
+```
+
+- 改后：
+
+```text
+> ⚠️ 命令里是 `sudo bash install.sh`，**不是**直接用 `./install.sh` 执行 ——
+> `curl -o` 下载下来的文件**没有执行位**，所以 `./install.sh` 会 Permission denied。
+> （仓库里的 `install.sh` 提交模式是 `100755`，clone 下来就带执行位；
+> 但 `bash install.sh` 两种情况都成立。）
+```
+
 
 #### 修订轮 1 的验收标准
 
@@ -9093,8 +9271,11 @@ core.sh ──> tui.sh
    并且**逐条**写出了 **11 条未验证项** + **第 12 条「已知风险」**（T6-7：无校验和校验）
    + 「已验证」清单 + 整体验证边界（缺一条都算不合格）。
    报告里要贴出 README 的**小节标题清单**供核对。
-5. **四处定点修订**（P1 / P2 / P3 / P4）与上面写的**改后**文本逐字一致；
-   每处的**新文本命中 1 次**；**P2 / P3 的旧文本在改后文件里必须命中 0 次**。
+   ⚠️ T13-14：README 里**不得**再出现「100644」；必须点名「`curl -o` 下载下来的文件
+   **没有执行位**」与「仓库里的脚本提交模式是 **100755**」—— 前者是「为什么用
+   `bash install.sh` 而不是 `./install.sh`」的**真实**理由，后者纠正了旧陈述。
+5. **十处定点修订**（P1 / P2 / P3 / P4 / P5 / P6 / P7 / P8 / P9 / P10）与上面写的**改后**文本逐字一致；
+   每处的**新文本命中 1 次**；**P2 / P3 / P5 / P6 / P7 / P8 / P9 / P10 的旧文本在改后文件里必须命中 0 次**。
    ⚠️ **P1 与 P4 是例外**：它们的「新文本」是「旧文本」的**严格超集**
    （P1 的 `tui_box_end` 函数体被原样保留在改后文本里；
    P4 的依赖图前 4 行也原样保留，只是多了一行 `core.sh ──> tui.sh`）
@@ -9108,13 +9289,13 @@ core.sh ──> tui.sh
 7. `bash test/unit.sh` 全部通过、退出码 0。
 8. 断言总数必须恒定，且**连跑 4 次条数相同**。
    ⚠️ **平台差是【三个数】**（构成见 Global Constraints）：
-   本机（Windows + MSYS）**768**、Debian **以 root 运行** **768**、
-   Debian **以非 root 运行** **768**（= GitHub Actions runner 的身份）。
-   （底座 **718** + 本轮 **50**）
+   本机（Windows + MSYS）**772**、Debian **以 root 运行** **772**、
+   Debian **以非 root 运行** **772**（= GitHub Actions runner 的身份）。
+   （底座 **718** + 本轮 **54**）
    报告里必须写明「哪个平台 **+ 以什么身份运行**」。
    ⚠️ 本轮**没有**任何平台相关断言（无 `stat -c '%a'`、无 `chmod 000` 的 `! -r`），
    也**没有任何条件块** → 三个数**相同**。
-   ⚠️ **「调用点」与「执行数」必须写清**：本轮 Task 13 段源码里有 **50** 个
+   ⚠️ **「调用点」与「执行数」必须写清**：本轮 Task 13 段源码里有 **54** 个
    `assert_*` 调用点，**全部执行**。
 9. **产物核验**（这几条是 Task 13 真正的产品断言）：
    - `bash demo.sh </dev/null` 退出码 0、**不挂死**（限时 30 秒）；
@@ -9122,7 +9303,7 @@ core.sh ──> tui.sh
    - demo 的输出里**每一行**的显示宽度都 **≤ TUI_WIDTH**，
      **唯一**的例外是那行**故意**超宽的分享链接（它必须**不在任何框里**）；
    - 框的**顶边、内容行、底边**三者宽度**相等**（框线合得拢）。
-10. 红灯证据（**36 条变异**，每条都要贴出**变红的断言原文**）：
+10. 红灯证据（**40 条变异**，每条都要贴出**变红的断言原文**）：
    - A1 让 `tui_box_text` **总是画框**（去掉宽度判断）
      → 「超宽内容不画上边框（框线会合不拢）」与「超宽内容不画下边框」必须变红；
    - A2 让 `tui_box_text` **总是整行输出**（去掉「放得下才画框」分支）
@@ -9201,7 +9382,15 @@ core.sh ──> tui.sh
    - A35 让 `README.md` 里没有「校验和」
      → 「声明里点名：以 root 执行 GitHub main 分支脚本、无校验和校验（T6-7）」必须变红；
    - A36 让设计稿 4.1 的依赖图里没有 `core.sh ──> tui.sh` 这条边
-     → 「设计稿 4.1 的依赖图补上了 core.sh → tui.sh 边（F-18）」必须变红。
+     → 「设计稿 4.1 的依赖图补上了 core.sh → tui.sh 边（F-18）」必须变红；
+   - A37 让 `README.md` 里没有「没有执行位」
+     → 「README 点名：curl 下载下来的文件没有执行位」必须变红；
+   - A38 让 `README.md` 里没有「100755」
+     → 「README 点名：仓库里的脚本提交模式是 100755」必须变红；
+   - A39 让 `README.md` 里**重新出现**那句过时陈述（「提交模式是 100644」）
+     → 「README 不再陈述过时的提交模式（100644）」必须变红；
+   - A40 让 `install.sh` 里**重新出现**那句过时陈述（「提交模式是 100644」）
+     → 「install.sh / uninstall.sh / lib/deploy.sh 不再陈述过时的提交模式（100644）」必须变红。
    > ⚠️ **README 是散文**：A17–A35 的**变异串**必须按**实施后的实际 README** 写
    > （逐字命中 1 次；命中 0 次 = 文本对不上 → **停下报告**，不要凑合）。
    > 变异串「命中次数 != 1 直接报错」这条纪律对散文同样适用。
