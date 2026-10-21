@@ -284,3 +284,188 @@ write_config_atomic() {
   chmod 600 "$outfile" || { tui_err "无法设置配置文件权限：$outfile"; return 1; }
   return 0
 }
+xray_installed() { [[ -x "$XRAY_BIN" ]]; }
+
+xray_version() {
+  "$XRAY_BIN" version 2>/dev/null | head -1 | tr -d '\r'
+}
+
+install_xray() {
+  if xray_installed; then
+    tui_ok "Xray 已安装：$(xray_version)"
+    tui_tip "如需更新请使用管理菜单的「更新 Xray 内核」"
+    return 0
+  fi
+  # 依赖装不上就必须中止：ensure_packages 会透传 apt 的失败码。
+  ensure_packages curl ca-certificates || return 1
+  local installer
+  installer=$(mktemp 2>/dev/null)
+  # mktemp 必须有空值守卫：失败时 installer 为空 → curl -o "" 失败，
+  # 报错会指向「网络」而真实原因是 mktemp 不可用。
+  if [[ -z "$installer" ]]; then
+    tui_err "无法创建临时文件，Xray 安装中止。"
+    return 1
+  fi
+  if ! curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o "$installer"; then
+    tui_err "下载 Xray 安装脚本失败，请检查网络连通性"
+    rm -f "$installer"
+    return 1
+  fi
+  chmod +x "$installer"
+  tui_run "安装 Xray 内核" bash "$installer" install
+  local rc=$?
+  rm -f "$installer"
+  if [[ $rc -ne 0 ]] || ! xray_installed; then
+    tui_err "Xray 安装失败"
+    return 1
+  fi
+  tui_ok "Xray 安装完成：$(xray_version)"
+  return 0
+}
+
+setup_systemd() {
+  if ! have_cmd systemctl; then
+    tui_err "未找到 systemctl，systemd 不可用"
+    return 1
+  fi
+  tui_run "启用并启动 xray 服务" systemctl enable --now xray
+  if ! systemctl is-active --quiet xray; then
+    tui_err "xray 服务未能启动，最近日志如下："
+    journalctl -u xray -n 30 --no-pager 2>/dev/null | sed -e 's/^/      /' || true
+    return 1
+  fi
+  # 依据实际运行用户授权日志目录
+  local run_user svc_user
+  run_user=$(service_run_user)
+  if [[ "$run_user" != "root" ]]; then
+    svc_user="$run_user"
+    # mkdir 的退出码必须检查：失败时后面仍然会打印「日志目录已授权」→ 谎报。
+    # 目录建不出来时 xray 写不了日志，用户却以为一切正常。
+    if ! mkdir -p "$LOG_DIR"; then
+      tui_warn "无法创建日志目录 $LOG_DIR，xray 可能无法写入日志。"
+    else
+      if id "$svc_user" >/dev/null 2>&1; then
+        chown -R "$svc_user" "$LOG_DIR" 2>/dev/null || true
+      fi
+      tui_tip "日志目录已授权给运行用户 $svc_user"
+    fi
+  fi
+  tui_ok "xray 服务已运行"
+  return 0
+}
+
+restart_service() {
+  tui_run "重启 xray 服务" systemctl restart xray
+  if systemctl is-active --quiet xray; then
+    tui_ok "xray 服务重启成功"
+    return 0
+  fi
+  tui_err "xray 服务重启后未处于运行状态"
+  journalctl -u xray -n 30 --no-pager 2>/dev/null | sed -e 's/^/      /' || true
+  return 1
+}
+
+open_firewall() {
+  local port="$1"
+  # ufw 的状态检测【不能】写成 `ufw status | grep -q ...`：
+  # grep -q 命中即退出 → 上游 ufw 收到 SIGPIPE(141) → set -o pipefail 下整条管道
+  # 的退出码变成 141 → 条件判假 → 【ufw 明明是 active 也不会走 ufw 分支】，
+  # 静默降级到 iptables / nft 分支（与 Task 4 的 F4-1 同一个坑）。
+  # 修法与 F4-1 一致：先把整段输出收进变量，再对变量做匹配
+  # （链路上没有任何会早退的管道 → 不可能有 SIGPIPE）。
+  if have_cmd ufw; then
+    local ufw_status
+    ufw_status=$(ufw status 2>/dev/null || printf '')
+    if [[ "$ufw_status" == *"Status: active"* ]]; then
+      tui_run "放行端口 $port/tcp (ufw)" ufw allow "$port/tcp"
+      return $?
+    fi
+  fi
+  if have_cmd iptables; then
+    if iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; then
+      tui_ok "iptables 规则已存在，无需重复添加"
+      return 0
+    fi
+    tui_run "放行端口 $port/tcp (iptables)" iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
+    return $?
+  fi
+  if have_cmd nft; then
+    nft list table inet filter >/dev/null 2>&1 || {
+      nft add table inet filter 2>/dev/null || true
+      nft add chain inet filter input '{ type filter hook input priority 0; policy accept; }' 2>/dev/null || true
+    }
+    if nft list chain inet filter input 2>/dev/null | grep -q "tcp dport $port"; then
+      tui_ok "nftables 规则已存在，无需重复添加"
+    else
+      # 失败必须传播出去：原来这一分支不管 nft insert 成功与否都 return 0，
+      # 调用方（do_deploy）会以为端口已放行。
+      tui_run "放行端口 $port/tcp (nftables)" nft insert rule inet filter input tcp dport "$port" ct state new counter accept || return 1
+    fi
+    if have_cmd systemctl && systemctl is-enabled nftables >/dev/null 2>&1; then
+      tui_tip "nftables 规则由 nftables.service 管理，重启后可能丢失；建议同步写入 /etc/nftables.conf"
+    fi
+    return 0
+  fi
+  tui_warn "未检测到 ufw / iptables / nftables，未改动防火墙。"
+  tui_tip "请自行放行端口：$port/tcp"
+  return 0
+}
+
+enable_bbr() {
+  local avail
+  avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || printf '')
+  if [[ "$avail" != *bbr* ]]; then
+    tui_warn "当前内核未提供 bbr 拥塞控制，跳过网络调优。"
+    tui_tip "可用算法：${avail:-未知}"
+    return 1
+  fi
+  # 配置路径可被环境变量覆盖 —— 仅为让单元测试能在【不碰宿主机内核参数】的前提下
+  # 覆盖成功路径；生产环境不要设置它。
+  local conf="${VLESS_REALITY_SYSCTL_CONF:-/etc/sysctl.d/99-vless-reality-bbr.conf}"
+  local bbr_conf
+  bbr_conf='net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_fastopen = 3
+net.core.somaxconn = 4096
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_slow_start_after_idle = 0'
+  # 写失败必须报错并返回非零：原来 `cat >"$conf"` 的失败被后面的 `|| true` 吃掉，
+  # 函数照样 tui_ok「已启用 bbr」并返回 0 —— 失败被伪装成成功。
+  if ! printf '%s\n' "$bbr_conf" >"$conf"; then
+    tui_err "无法写入 sysctl 配置：$conf"
+    tui_tip "可能缺少 root 权限，或该目录不可写。"
+    return 1
+  fi
+  if ! sysctl -p "$conf" >/dev/null 2>&1 && ! sysctl --system >/dev/null 2>&1; then
+    tui_err "内核参数应用失败：$conf"
+    tui_tip "可能缺少 root 权限。"
+    return 1
+  fi
+  tui_ok "已启用 bbr 拥塞控制与 fq 队列（$conf）"
+  return 0
+}
+
+service_status() {
+  if have_cmd systemctl; then
+    local active enabled
+    # 必须用 `|| true` 而不是 `|| printf 'unknown'`：
+    # systemctl is-active 在服务停止时【会输出 "inactive" 并返回非零】，
+    # `|| printf 'unknown'` 会把 unknown 追加到后面 → 状态显示成两行
+    # （"inactive\nunknown"），界面上看着像出了两个状态。
+    # 正确做法是保留 systemctl 的输出，只在它【一个字都没输出】时才回落到 unknown。
+    active=$(systemctl is-active xray 2>/dev/null || true)
+    [[ -n "$active" ]] || active='unknown'
+    enabled=$(systemctl is-enabled xray 2>/dev/null || true)
+    [[ -n "$enabled" ]] || enabled='unknown'
+    tui_kv "服务状态" "$active"
+    tui_kv "开机自启" "$enabled"
+    tui_kv "内核版本" "$(xray_version 2>/dev/null || printf '未安装')"
+  fi
+  if have_cmd ss && [[ -n "${PORT:-}" ]]; then
+    if port_in_use "$PORT"; then
+      tui_kv "端口 $PORT" "监听中"
+    else
+      tui_kv "端口 $PORT" "未监听"
+    fi
+  fi
+}

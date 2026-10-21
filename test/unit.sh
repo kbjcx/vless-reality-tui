@@ -1144,4 +1144,261 @@ else
 fi
 rm -rf "$atomic_dir"
 
+test_case "deploy 系统操作的可测分支"
+
+# ── xray_installed：未安装返回非零，已安装返回 0 ──────────────
+# 必须【1 换 1 配对】：真实 Debian 上装好 xray 后 `[[ ! -x "$XRAY_BIN" ]]` 为假
+# → 原来的写法会让这条断言【整条消失】→ 断言条数随机器状态漂移（见全局约束）。
+if [[ ! -x "$XRAY_BIN" ]]; then
+  assert_fails "未安装时 xray_installed 返回非零" xray_installed
+else
+  assert_succeeds "已安装时 xray_installed 返回 0" xray_installed
+fi
+
+# ── xray_version：必须输出 xray 的版本串 ──────────────
+# 用 shell 函数当假 xray（MSYS 的 chmod 位不可靠，造可执行脚本 + chmod +x 不稳）。
+out=$( ( XRAY_BIN=xrayv; xrayv() { printf 'Xray 1.8.0 (Xray, Penetrates Everything.) Custom\n'; }; xray_version 2>&1 ) )
+assert_contains "$out" "Xray 1.8.0" "xray_version 输出 xray 的版本串"
+
+# ── install_xray：已安装时不得重复安装 ──────────────
+out=$( ( XRAY_BIN=/nonexistent/xray; xray_installed() { return 0; }
+         xray_version() { printf 'Xray 1.8.0\n'; }; install_xray 2>&1 ) ); rc=$?
+assert_status 0 "$rc" "install_xray 在已安装时返回 0"
+assert_contains "$out" "已安装" "install_xray 在已安装时给出提示"
+
+# ── install_xray：下载安装脚本失败必须返回非零（不得谎报已安装）──
+# ensure_packages 与 curl 都必须 mock：前者会真的调 apt-get，后者会真的联网。
+out=$( ( XRAY_BIN=/nonexistent/xray; xray_installed() { return 1; }
+         ensure_packages() { return 0; }; curl() { return 22; }
+         install_xray 2>&1 ) ); rc=$?
+assert_status 1 "$rc" "install_xray 在下载安装脚本失败时返回非零"
+assert_contains "$out" "下载 Xray 安装脚本失败" "install_xray 下载失败时给出明确提示"
+# 注意：assert_false 的语义是「退出码非 0」，【没有】「子串不存在」这个语义。
+# 三参用法会把第 2 个参数当成描述 → 这条断言恒真（控制器核对 test/lib.sh 后发现）。
+# 「子串必须不存在」必须自己判断再断言。
+if [[ "$out" == *"Xray 安装完成"* ]]; then lied=1; else lied=0; fi
+assert_eq "0" "$lied" "install_xray 下载失败时不得谎报『Xray 安装完成』"
+
+# ── setup_systemd：服务未运行时必须返回非零并输出 xray 的原始日志 ──────────────
+# systemctl / journalctl / tui_run 全部 mock：绝不能真的动宿主机的 systemd。
+out=$( ( have_cmd() { return 0; }; tui_run() { return 0; }
+         systemctl() { return 3; }
+         journalctl() { printf 'xray: Failed to start.\n'; }
+         service_run_user() { printf 'root'; }
+         setup_systemd 2>&1 ) ); rc=$?
+assert_status 1 "$rc" "setup_systemd 在服务未运行时返回非零"
+assert_contains "$out" "xray 服务未能启动" "setup_systemd 失败时给出明确提示"
+assert_contains "$out" "xray: Failed to start." "setup_systemd 失败时输出 xray 的原始日志"
+
+# ── setup_systemd：服务正常运行时返回 0 ──────────────
+out=$( ( have_cmd() { return 0; }; tui_run() { return 0; }
+         systemctl() { return 0; }
+         service_run_user() { printf 'root'; }
+         setup_systemd 2>&1 ) ); rc=$?
+assert_status 0 "$rc" "setup_systemd 在服务正常运行时返回 0"
+
+# ── restart_service：服务未运行时必须返回非零 ──────────────
+out=$( ( tui_run() { return 0; }; systemctl() { return 3; }
+         journalctl() { printf 'xray: Failed to start.\n'; }
+         restart_service 2>&1 ) ); rc=$?
+assert_status 1 "$rc" "restart_service 在服务未运行时返回非零"
+assert_contains "$out" "未处于运行状态" "restart_service 失败时给出明确提示"
+
+# ── restart_service：服务正常运行时返回 0 ──────────────
+out=$( ( tui_run() { return 0; }; systemctl() { return 0; }
+         restart_service 2>&1 ) ); rc=$?
+assert_status 0 "$rc" "restart_service 在服务正常运行时返回 0"
+
+# ── service_status：必须打印服务状态与端口监听情况 ──────────────
+out=$( ( have_cmd() { return 0; }
+         systemctl() { case "$1" in
+                         is-active)  printf 'active\n'; return 0 ;;
+                         is-enabled) printf 'enabled\n'; return 0 ;;
+                       esac; return 0; }
+         xray_version() { printf 'Xray 1.8.0\n'; }
+         port_in_use() { return 1; }
+         PORT=8443
+         service_status 2>&1 ) )
+assert_contains "$out" "服务状态" "service_status 打印服务状态"
+assert_contains "$out" "active" "service_status 显示服务是否在运行"
+assert_contains "$out" "8443" "service_status 显示端口监听情况"
+assert_contains "$out" "开机自启" "service_status 显示开机自启状态"
+
+# ── enable_bbr 在不支持 bbr 的内核上必须安全失败而非崩溃 ──────────────
+# 必须 mock 掉 sysctl 走「不支持 bbr」分支：真实调用会写
+# /etc/sysctl.d/99-vless-reality-bbr.conf 并 `sysctl -p` 立即应用，
+# 那是单元测试不该有的主机副作用（CI 上会真的改掉运行内核的拥塞控制）。
+# 断言必须点【具体文案】而不是「提及 bbr」—— 成功路径的输出里也有 bbr，
+# 断言「提及 bbr」在两条路径上都成立 → 恒绿、没有判别力。
+out=$( ( sysctl() { printf 'cubic\n'; }; enable_bbr 2>&1 ) ) || true
+assert_contains "$out" "未提供 bbr" "enable_bbr 在内核不支持 bbr 时明确说明"
+assert_contains "$out" "可用算法" "enable_bbr 在内核不支持 bbr 时提示可用算法"
+
+# ── open_firewall 在无任何防火墙工具时必须明确告知而不是静默成功 ──────────────
+# 必须【1 换 1 配对】：真实 Debian 上一定有 iptables 或 nft → 原来的写法会让
+# 这条断言【整条消失】→ 断言条数随机器状态漂移（见全局约束）。
+if ! have_cmd ufw && ! have_cmd nft && ! have_cmd iptables; then
+  out=$(open_firewall 443 2>&1) || true
+  assert_contains "$out" "防火墙" "无防火墙工具时给出明确提示"
+else
+  assert_eq "本机存在防火墙工具" "本机存在防火墙工具" \
+    "无防火墙工具的用例已跳过（本机存在 ufw / nft / iptables，用例前提不成立）"
+fi
+
+# open_firewall：ufw 分支必须真的调用 ufw allow 且把失败码传出去。
+# 用 mock 捕获 tui_run 的命令，【不碰真实防火墙】。
+out=$( ( have_cmd() { case "$1" in ufw) return 0 ;; iptables|nft) return 1 ;; *) return 1 ;; esac; }
+            ufw() { printf 'Status: active\n'; }
+            tui_run() { printf '%s\n' "$*"; return 0; }
+            open_firewall 8443 2>&1 ) )
+assert_contains "$out" "放行端口 8443/tcp (ufw)" "open_firewall 的 ufw 分支被走到（必须真的调用 ufw allow）"
+if [[ "$out" == *"未检测到 ufw"* ]]; then bailed=1; else bailed=0; fi
+assert_eq "0" "$bailed" "open_firewall 不得退化成『未检测到防火墙』（ufw 分支）"
+out=$( ( have_cmd() { case "$1" in ufw) return 0 ;; iptables|nft) return 1 ;; *) return 1 ;; esac; }
+            ufw() { printf 'Status: active\n'; }
+            tui_run() { return 7; }
+            open_firewall 8443 >/dev/null 2>&1 ) ); rc=$?
+assert_status 7 "$rc" "open_firewall 必须把防火墙命令的失败码传出去（不得静默成功）"
+
+# enable_bbr 的成功路径：配置路径由环境变量覆盖 → 不碰宿主机内核参数。
+# （原来的成功路径根本没法测：一写就是真的改宿主机拥塞控制。）
+bbr_dir=$(mktemp -d 2>/dev/null)
+if [[ -n "$bbr_dir" ]]; then
+  out=$( ( sysctl() { case "$1" in -n) printf 'bbr cubic\n' ;; *) return 0 ;; esac; }
+            VLESS_REALITY_SYSCTL_CONF="$bbr_dir/99-bbr.conf"; enable_bbr 2>&1 ) ); rc=$?
+  assert_status 0 "$rc" "enable_bbr 在支持 bbr 时返回 0"
+  assert_contains "$(cat "$bbr_dir/99-bbr.conf" 2>/dev/null)" 'tcp_congestion_control = bbr' "enable_bbr 写入 bbr 配置"
+  # 写不进去时必须返回非零并明确报错（不得谎报「已启用」）
+  out=$( ( sysctl() { case "$1" in -n) printf 'bbr cubic\n' ;; *) return 0 ;; esac; }
+            VLESS_REALITY_SYSCTL_CONF="$bbr_dir/no-such-dir/99-bbr.conf"; enable_bbr 2>&1 ) ); rc=$?
+  assert_status 1 "$rc" "enable_bbr 在无法写入 sysctl 配置时返回非零"
+  if [[ "$out" == *"已启用 bbr"* ]]; then lied=1; else lied=0; fi
+  assert_eq "0" "$lied" "enable_bbr 写失败时不得谎报『已启用 bbr』"
+
+  # ── 内核参数【应用】失败（sysctl -p / --system 都失败）必须返回非零 ──────────────
+  # 原来只测了「配置写不进去」，没测「配置写进去了但内核参数应用失败」
+  # → 那条分支根本没被执行到（控制器第二轮变异实证：删掉它，0 条红）。
+  out=$( ( sysctl() { case "$1" in
+                        -n) printf 'bbr cubic\n' ;;
+                        *) return 1 ;;
+                      esac; }
+              VLESS_REALITY_SYSCTL_CONF="$bbr_dir/99-bbr.conf"; enable_bbr 2>&1 ) ); rc=$?
+  assert_status 1 "$rc" "enable_bbr 在内核参数应用失败时返回非零"
+  assert_contains "$out" "内核参数应用失败" "enable_bbr 在 sysctl 应用失败时给出明确报错"
+else
+  assert_eq "mktemp -d 能创建唯一临时目录" "失败（mktemp -d 返回空路径）" \
+    "enable_bbr 用例前提：mktemp -d 必须能创建唯一临时目录"
+fi
+rm -rf "$bbr_dir"
+# ── T6-9（F4-1 同款）：open_firewall 的 ufw 状态检测不得把 grep -q 直接接在管道上 ──────────────
+# 为什么必须是【源码静态断言】而不是运行期断言：
+# 「管道 + grep -q」在【小输出】下不会触发 SIGPIPE —— mock 的 ufw 只输出一行
+# → 写不进管道缓冲 → 上游不会收到 SIGPIPE(141) → 运行期根本复现不出差异。
+# 控制器第二轮变异实证：把 ufw 检测改回 `| grep -q` 形态 → 0 条红。
+# 真实 `ufw status` 的输出要超过管道缓冲（约 8KB）且是否触发取决于时序
+# → 不能写成依赖时序的运行期断言。权威判据是这条静态断言（与 Task 4 的 F4-1 同款）。
+open_firewall_body="$(awk '/^open_firewall\(\) *\{/,/^\}/' "$ROOT/lib/deploy.sh")"
+[[ -n "$open_firewall_body" ]]; assert_true "$?" \
+  "deploy.sh 里必须存在 open_firewall 函数（下面那条静态断言的前提）"
+# 检查前必须先去掉整行注释：函数的说明性注释里会写「不能写成 ufw status | grep -q」
+# 这类字样 —— 那是【说明】不是【代码】，不去掉会把自己判成违规（Task 4 实测踩过）。
+open_firewall_code="$(printf '%s\n' "$open_firewall_body" | grep -v '^[[:space:]]*#')"
+assert_eq "" "$(printf '%s\n' "$open_firewall_code" | grep -n 'ufw status.*grep[ \t]*-q' | tr '\n' ' ')" \
+  "open_firewall 的 ufw 状态检测不得把 grep -q 直接接在管道上（SIGPIPE 会把 141 带进退出码）"
+# 正向钉住修法本身：必须先把输出收进变量，再对变量做匹配。
+# open_firewall 里【另有】一处合法的 `nft list chain ... | grep -q`（那是「内容里
+# 有没有这条规则」的查询，命中与否两条路都走到 then/else，退出码 1 与 141 后果相同
+# → 不属于 F4-1 同款缺陷）→ 所以上面那条只针对含 "ufw status" 的行，不误伤。
+assert_contains "$open_firewall_code" 'ufw_status=$(ufw status' \
+  "open_firewall 的 ufw 状态检测必须先把输出收进变量再匹配"
+
+# ── T6-10：setup_systemd 的「运行用户不是 root」分支之前根本没被执行到 ──────────────
+# 原来的 mock 里 service_run_user 恒返回 root → `run_user != "root"` 分支永远进不去
+# → mkdir 的退出码检查就永远测不到（控制器第二轮变异实证：删掉它，0 条红）。
+out=$( ( have_cmd() { return 0; }; tui_run() { return 0; }
+         systemctl() { return 0; }
+         service_run_user() { printf 'xray'; }
+         mkdir() { return 1; }
+         setup_systemd 2>&1 ) ); rc=$?
+assert_status 0 "$rc" "setup_systemd 在日志目录创建失败时仍正常返回（只是警告）"
+assert_contains "$out" "无法创建日志目录" "setup_systemd 在 mkdir 失败时给出明确警告"
+if [[ "$out" == *"日志目录已授权"* ]]; then lied=1; else lied=0; fi
+assert_eq "0" "$lied" "setup_systemd 在 mkdir 失败时不得谎报『日志目录已授权』"
+
+# ── setup_systemd：非 root 运行用户 + 目录创建成功 → 必须给出授权提示 ──────────────
+out=$( ( have_cmd() { return 0; }; tui_run() { return 0; }
+         systemctl() { return 0; }
+         service_run_user() { printf 'xray'; }
+         mkdir() { return 0; }
+         id() { return 0; }
+         chown() { return 0; }
+         setup_systemd 2>&1 ) ); rc=$?
+assert_status 0 "$rc" "setup_systemd 在非 root 运行用户下正常返回"
+assert_contains "$out" "日志目录已授权给运行用户 xray" "setup_systemd 在目录创建成功时给出授权提示"
+
+# ── setup_systemd：没有 systemctl 时必须明确报错 ──────────────
+out=$( ( have_cmd() { case "$1" in systemctl) return 1 ;; *) return 0 ;; esac; }
+         setup_systemd 2>&1 ) ); rc=$?
+assert_status 1 "$rc" "setup_systemd 在没有 systemctl 时返回非零"
+assert_contains "$out" "systemd 不可用" "setup_systemd 在没有 systemctl 时给出明确提示"
+
+# ── install_xray：下载与安装都成功时必须返回 0 并提示完成 ──────────────
+# xray_installed 的 mock 必须【前一次调用返回「未安装」、后一次返回「已安装」】——
+# install_xray 开头查一次（判断是否已安装），末尾还要再查一次（判断是否装上了）。
+# 用计数器实现，不能用固定返回值。
+out=$( ( XRAY_BIN=/nonexistent/xray
+         _calls=0
+         xray_installed() { _calls=$((_calls + 1)); [[ $_calls -ge 2 ]]; }
+         ensure_packages() { return 0; }
+         curl() { return 0; }
+         tui_run() { return 0; }
+         xray_version() { printf 'Xray 1.8.0\n'; }
+         install_xray 2>&1 ) ); rc=$?
+assert_status 0 "$rc" "install_xray 在下载与安装都成功时返回 0"
+assert_contains "$out" "Xray 安装完成" "install_xray 成功时提示安装完成"
+
+# ── install_xray：mktemp 失败时必须给出明确提示，不得把错误指向「网络」 ──────────────
+out=$( ( XRAY_BIN=/nonexistent/xray
+         xray_installed() { return 1; }
+         ensure_packages() { return 0; }
+         mktemp() { return 1; }
+         curl() { return 0; }
+         install_xray 2>&1 ) ); rc=$?
+assert_status 1 "$rc" "install_xray 在 mktemp 失败时返回非零"
+assert_contains "$out" "无法创建临时文件" "install_xray 在 mktemp 失败时给出明确提示"
+
+# ── open_firewall：iptables 分支 ──────────────
+# 判据必须点【该分支独有的东西】：「iptables」这三个字在兜底提示
+# （「未检测到 ufw / iptables / nftables」）里也出现、「8443」在
+# 「请自行放行端口：8443/tcp」里也出现 → 用它们当判据是**恒真的**
+# （控制器探针实测：把整个 iptables 分支删掉，只有「识别出规则已存在」那条变红，
+#   「被走到」「带上了端口」两条仍然绿）。
+out=$( ( have_cmd() { case "$1" in iptables) return 0 ;; ufw|nft) return 1 ;; *) return 1 ;; esac; }
+            iptables() { return 1; }
+            tui_run() { printf '%s\n' "$*"; return 0; }
+            open_firewall 8443 2>&1 ) )
+assert_contains "$out" "放行端口 8443/tcp (iptables)" "open_firewall 的 iptables 分支被走到（必须真的调用 iptables -I）"
+if [[ "$out" == *"未检测到 ufw"* ]]; then bailed=1; else bailed=0; fi
+assert_eq "0" "$bailed" "open_firewall 不得退化成『未检测到防火墙』（iptables 分支）"
+out=$( ( have_cmd() { case "$1" in iptables) return 0 ;; ufw|nft) return 1 ;; *) return 1 ;; esac; }
+            iptables() { return 0; }
+            tui_run() { printf '%s\n' "$*"; return 0; }
+            open_firewall 8443 2>&1 ) )
+assert_contains "$out" "iptables 规则已存在" "open_firewall 的 iptables 分支识别出规则已存在"
+
+# ── open_firewall：nftables 分支 ──────────────
+# nft 的 list 子命令返回非零 → 规则不存在 → 走 tui_run 插入规则的分支。
+# ⚠️ 这三条断言原先全是**恒真的**：把整个 nftables 分支删掉，0 条红
+# （控制器探针实测）—— 因为「nftables」「8443」在兜底提示里也出现。
+out=$( ( have_cmd() { case "$1" in nft) return 0 ;; ufw|iptables) return 1 ;; *) return 1 ;; esac; }
+            nft() { case "$1" in
+                      list) return 1 ;;
+                      *) return 0 ;;
+                    esac; }
+            tui_run() { printf '%s\n' "$*"; return 0; }
+            open_firewall 8443 2>&1 ) )
+assert_contains "$out" "放行端口 8443/tcp (nftables)" "open_firewall 的 nftables 分支被走到（必须真的插入 nft 规则）"
+if [[ "$out" == *"未检测到 ufw"* ]]; then bailed=1; else bailed=0; fi
+assert_eq "0" "$bailed" "open_firewall 不得退化成『未检测到防火墙』（nftables 分支）"
+
 test_summary
