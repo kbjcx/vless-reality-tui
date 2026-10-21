@@ -6207,6 +6207,28 @@ git commit -m "feat(wizard): 部署向导——参数确认、目标探测与六
 > 因此本任务把「定点修订」写成**可机械核对的精确文本替换**（P1 / P2），
 > 验收标准里逐条点名，控制器复核时逐条核对。
 
+
+#### 控制器的变异判据修正（落盘后追加）
+
+第一次跑这 24 条变异时，**C1 / C2 / D3 三条没有命中点名的断言**。
+归因是**沙箱实证**，不是猜测：
+
+| 变异 | 第一版（只拆一道守卫） | 为什么没命中点名的断言 |
+|---|---|---|
+| C1 `menu_show_client` | 拆掉 `state_exists` 守卫 | **退出码没变** —— 下一道 `load_state \|\| return 1` 照样返回 1 → 点名的「返回非零」保持绿；真正变红的只是「给出明确提示」 |
+| C2 `menu_rotate_keys` | 拆掉 `state_exists` 守卫 | 同上 |
+| D3 `menu_update_xray` | 拆掉 mktemp 空值守卫 | `curl -o ""`（被 mock 成成功）→ `chmod +x ""` 在 MSYS 上**真的返回 1**（实测 `chmod: cannot access ''`）→ 仍然 `return 1` → 同样只有「给出明确提示」变红 |
+
+**根因不是测试弱，而是「变异选错了目标」**：这几道守卫的作用是**「给出明确提示」**，
+退出码由**下一道守卫**兜着 —— 所以「返回非零」那条断言本来就抓不住这个变异。
+
+**处置**：把这三条改成**复合变异**（把两道守卫一起拆掉）。
+这才是「不检查未部署就直接展示 / 直接轮换 / 直接下载」的真实缺陷形态，
+改完之后「返回非零」「给出明确提示」「不生成新密钥」会**一起**变红。
+
+> **Step 1 / Step 3 的代码块一个字都没改** —— 改的只有变异串与下面验收标准里
+> 这三条的描述。断言条数仍是 623。
+
 #### 修订轮 1 的定点修订（对 Task 9 产物的精确文本替换）
 
 这两处改的是 `lib/deploy.sh` 里 `deploy_wizard` 函数内部。
@@ -6319,9 +6341,9 @@ git commit -m "feat(wizard): 部署向导——参数确认、目标探测与六
      → 「menu_tune 在防火墙放行失败时返回非零」必须变红；
    - B3 把 `menu_tune` 的 `enable_bbr` 失败改成 `return 1`
      → 「menu_tune 在 BBR 未启用时仍返回 0」必须变红；
-   - C1 把 `menu_show_client` 的「尚未部署」守卫去掉
+   - C1 把 `menu_show_client` 的「尚未部署」守卫**和紧随其后的 `load_state` 失败检查一起去掉**
      → 「menu_show_client 在未部署时返回非零」必须变红；
-   - C2 把 `menu_rotate_keys` 的「尚未部署」守卫去掉
+   - C2 把 `menu_rotate_keys` 的「尚未部署」守卫**和紧随其后的 `load_state` 失败检查一起去掉**
      → 「menu_rotate_keys 在未部署时返回非零」必须变红；
    - C3 把 `menu_rotate_keys` 的 `save_state` 失败处理改成 `|| true`
      → 「menu_rotate_keys 在状态保存失败时返回非零」必须变红；
@@ -6335,7 +6357,7 @@ git commit -m "feat(wizard): 部署向导——参数确认、目标探测与六
      → 「menu_update_xray 在依赖安装失败时返回非零」必须变红；
    - D2 把 `menu_update_xray` 的 `curl` 失败处理改成 `|| true`
      → 「menu_update_xray 在下载安装脚本失败时返回非零」必须变红；
-   - D3 把 `menu_update_xray` 的 mktemp 空值守卫去掉
+   - D3 把 `menu_update_xray` 的 mktemp 空值守卫**和 `chmod +x` 的失败检查一起去掉**
      → 「menu_update_xray 在 mktemp 失败时返回非零」必须变红；
    - D4 把 `menu_update_xray` 的 `return $rc` 改成 `return 0`
      → 「menu_update_xray 在安装脚本执行失败时返回非零」必须变红；
