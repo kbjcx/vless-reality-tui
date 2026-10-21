@@ -1009,6 +1009,8 @@ git commit -m "feat(tui): 交互层——菜单、输入、确认与 spinner"
   - `read_file <path>` → stdout（已 trim）
   - `detect_os [os_release_path]` → stdout `"id|version|arch"`
   - `assert_debian` → `0`/`1`
+  - `validate_hostname <str>` → `0`/`1`（SNI 主机名校验，纯函数）
+  - `state_quote <str>` → stdout 单引号字面量（可被 shell 安全求值）
   - `save_state` / `load_state` / `state_exists`
   - 常量：`STATE_DIR` `STATE_FILE` `OUT_DIR` `XRAY_BIN` `XRAY_CONFIG` `LOG_DIR` `REALITY_TARGETS[]`
 
@@ -1042,6 +1044,40 @@ EOF
 os_out=$(detect_os "$fake_os")
 assert_contains "$os_out" "debian|12|" "detect_os 解析 id|version|arch"
 rm -f "$fake_os"
+
+# validate_hostname：SNI 会原样进入服务端/客户端 config.json 与分享链接，
+# 必须是纯 DNS 主机名，不允许引号、反斜杠、空白等会破坏 JSON 的字符。
+assert_succeeds "合法主机名 www.microsoft.com"  validate_hostname "www.microsoft.com"
+assert_succeeds "合法主机名 a-b.example.com"   validate_hostname "a-b.example.com"
+assert_fails    "空串不是合法主机名"            validate_hostname ""
+assert_fails    "无点号的单标签主机名不合法"     validate_hostname "localhost"
+assert_fails    "含双引号（会破坏 JSON）"        validate_hostname 'a"b.com'
+assert_fails    "含反斜杠（会破坏 JSON）"        validate_hostname 'a\b.com'
+assert_fails    "含空格"                        validate_hostname "a b.com"
+assert_fails    "含反斜杠命令替换"              validate_hostname 'a$(id).com'
+assert_fails    "标签以连字符开头"               validate_hostname "-a.com"
+assert_fails    "标签以连字符结尾"               validate_hostname "a-.com"
+
+# state_quote：状态文件会被 load_state 用 `.` 引入执行，
+# 写入的值必须是可被 shell 安全求值的单引号字面量。
+assert_eq "'443'"     "$(state_quote 443)"      "state_quote 产出单引号字面量"
+assert_eq "''"       "$(state_quote '')"        "state_quote 空值产出空字面量"
+assert_eq "'a'\''b'" "$(state_quote "a'b")"     "state_quote 转义内部单引号"
+assert_eq "'\$(id)'" "$(state_quote '$(id)')"   "state_quote 不让命令替换在字面量内生效"
+
+# save_state / load_state 往返：REMARK 来自用户输入（--name），
+# 写入后再读回必须逐字节一致，且其中的 $(...) 不得在读取时被执行。
+t_dir=$(mktemp -d)
+t_state="$t_dir/deploy.env"
+( STATE_DIR="$t_dir"; STATE_FILE="$t_state"; PORT=8443
+  REMARK='$(touch '"$t_dir"'/pwned)'; SNI="a'b"
+  save_state >/dev/null 2>&1 )
+back=$( ( STATE_FILE="$t_state"; REMARK=''; load_state >/dev/null 2>&1; printf '%s' "$REMARK" ) )
+assert_eq '$(touch '"$t_dir"'/pwned)' "$back" "load_state 读回的 REMARK 逐字节一致"
+assert_contains "$(cat "$t_state")" "REMARK='" "状态文件以单引号字面量保存 REMARK"
+[[ -e "$t_dir/pwned" ]]; rc=$?
+assert_false "$rc" "load_state 不得执行状态文件中的命令替换"
+rm -rf "$t_dir"
 ```
 
 > **源码引入位置约定**：本任务及后续任务新增的 `source "$ROOT/lib/xxx.sh"` 一律放在
@@ -1071,7 +1107,7 @@ APP_VERSION='1.0.0'
 
 LIB_DIR="${LIB_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
 STATE_DIR="${STATE_DIR:-/etc/vless-reality}"
-STATE_FILE="$STATE_DIR/deploy.env"
+STATE_FILE="${STATE_FILE:-$STATE_DIR/deploy.env}"
 OUT_DIR="${OUT_DIR:-/root/vless-reality}"
 XRAY_BIN="${XRAY_BIN:-/usr/local/bin/xray}"
 XRAY_CONFIG="${XRAY_CONFIG:-/usr/local/etc/xray/config.json}"
@@ -1158,25 +1194,59 @@ assert_debian() {
   return 0
 }
 
+# 校验 SNI：必须是纯 DNS 主机名。
+# SNI 会【原样】进入服务端 config.json、客户端 client.json 与分享链接，
+# 不校验等于把用户输入直接拼进 JSON —— 引号/反斜杠会让 JSON 失效
+# （虽不会写坏已有配置：写入恒为「临时文件 → xray run -test → 原子替换」），
+# 但会直接让部署失败。因此在【输入口】拦住，而不是在渲染口做转义。
+validate_hostname() {
+  local host="$1" label len
+  [[ -n "$host" ]] || return 1
+  [[ ${#host} -le 253 ]] || return 1
+  [[ "$host" != *[[:space:]]* ]] || return 1
+  [[ "$host" != *'"'* ]] || return 1
+  [[ "$host" != *'\'* ]] || return 1
+  [[ "$host" == *.* ]] || return 1
+  local -a labels
+  IFS='.' read -r -a labels <<<"$host"
+  ((${#labels[@]} > 0)) || return 1
+  for label in "${labels[@]}"; do
+    len=${#label}
+    [[ $len -ge 1 && $len -le 63 ]] || return 1
+    [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
+  done
+  return 0
+}
+
+# 把任意文本转成可被 shell 安全求值的单引号字面量。
+# 状态文件会被 load_state 用 `.`（source）引入执行，而 REMARK / SNI 来自
+# 用户输入（--name / --sni），不转义等于让其中的 $(...) / 反引号在下次
+# 读取状态时被执行。单引号包裹 + 内部单引号转义为 '\'' 是 POSIX 标准做法；
+# 换行也能安全保留（bash 的单引号字符串允许跨行）。
+state_quote() {
+  local v="$1"
+  printf "'%s'" "${v//\'/\'\\\'\'}"
+}
+
 save_state() {
   mkdir -p "$STATE_DIR"
   chmod 700 "$STATE_DIR"
   local tmp="$STATE_FILE.tmp"
   {
     printf '# %s v%s 部署状态（勿手工编辑）\n' "$APP_NAME" "$APP_VERSION"
-    printf 'DEPLOYED_AT=%s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')"
-    printf 'MODE=%s\n' "${MODE:-native}"
-    printf 'PORT=%s\n' "${PORT:-}"
-    printf 'UUID=%s\n' "${UUID:-}"
-    printf 'SNI=%s\n' "${SNI:-}"
-    printf 'TARGET=%s\n' "${TARGET:-}"
-    printf 'PRIVATE_KEY=%s\n' "${PRIVATE_KEY:-}"
-    printf 'PUBLIC_KEY=%s\n' "${PUBLIC_KEY:-}"
-    printf 'SHORT_ID=%s\n' "${SHORT_ID:-}"
-    printf 'SERVER_IP=%s\n' "${SERVER_IP:-}"
-    printf 'REMARK=%s\n' "${REMARK:-}"
-    printf 'FLOW=%s\n' "${FLOW:-xtls-rprx-vision}"
-    printf 'FINGERPRINT=%s\n' "${FINGERPRINT:-chrome}"
+    printf 'DEPLOYED_AT=%s\n' "$(state_quote "$(date '+%Y-%m-%d %H:%M:%S %Z')")"
+    printf 'MODE=%s\n' "$(state_quote "${MODE:-native}")"
+    printf 'PORT=%s\n' "$(state_quote "${PORT:-}")"
+    printf 'UUID=%s\n' "$(state_quote "${UUID:-}")"
+    printf 'SNI=%s\n' "$(state_quote "${SNI:-}")"
+    printf 'TARGET=%s\n' "$(state_quote "${TARGET:-}")"
+    printf 'PRIVATE_KEY=%s\n' "$(state_quote "${PRIVATE_KEY:-}")"
+    printf 'PUBLIC_KEY=%s\n' "$(state_quote "${PUBLIC_KEY:-}")"
+    printf 'SHORT_ID=%s\n' "$(state_quote "${SHORT_ID:-}")"
+    printf 'SERVER_IP=%s\n' "$(state_quote "${SERVER_IP:-}")"
+    printf 'REMARK=%s\n' "$(state_quote "${REMARK:-}")"
+    printf 'FLOW=%s\n' "$(state_quote "${FLOW:-xtls-rprx-vision}")"
+    printf 'FINGERPRINT=%s\n' "$(state_quote "${FINGERPRINT:-chrome}")"
   } >"$tmp"
   chmod 600 "$tmp"
   mv -f "$tmp" "$STATE_FILE"
@@ -2197,6 +2267,13 @@ parse_args() {
       *) tui_err "未知参数：$1"; usage; exit 1 ;;
     esac
   done
+  # SNI 会在后续被原样写进 config.json 与分享链接 —— 在【参数解析口】校验，
+  # 避免把带引号/反斜杠的字符串送进 JSON 渲染。
+  if [[ -n "$OPT_SNI" ]] && ! validate_hostname "$OPT_SNI"; then
+    tui_err "--sni 不是合法的主机名：$OPT_SNI"
+    tui_tip "示例：www.microsoft.com（只允许字母、数字、连字符与点，且必须含点）"
+    exit 1
+  fi
 }
 
 require_root() {
