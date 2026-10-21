@@ -9,6 +9,8 @@ source "$ROOT/test/lib.sh"
 source "$ROOT/lib/tui.sh"
 # shellcheck source=lib/core.sh
 source "$ROOT/lib/core.sh"
+# shellcheck source=lib/deploy.sh
+source "$ROOT/lib/deploy.sh"
 
 test_case "TUI 文本宽度与补白"
 
@@ -817,5 +819,212 @@ else
   assert_eq "标记文件已存在" "标记文件已存在" \
     "apt update 失败用例已跳过（本机已存在 /var/lib/vless-reality/apt-updated，用例前提不成立）"
 fi
+
+test_case "x25519 密钥解析（跨版本兼容）"
+
+# 旧版输出格式
+out=$(xray_parse_keys "Private key: aaaBBB111ccc
+Public key: dddEEE222fff")
+assert_eq "aaaBBB111ccc|dddEEE222fff" "$out" "解析旧版 Private/Public key 格式"
+
+# 新版 v25.x 输出格式（公钥字段名为 Password）
+out=$(xray_parse_keys "PrivateKey: xxxYYY222zzz
+Password: wwwVVV333uuu")
+assert_eq "xxxYYY222zzz|wwwVVV333uuu" "$out" "解析新版 PrivateKey/Password 格式"
+
+# 单行、带多余空白的脏输出
+out=$(xray_parse_keys "  Private key :   qqq444   ")
+assert_eq "qqq444|" "$out" "私钥可解析时公钥为空"
+
+# 无关输出不应误判。必须【同时】断言「输出为空」与「退出码非零」——
+# 原来只有一条 assert_eq，描述里写的「退出码非零」从来没被断言过。
+out=$(xray_parse_keys "hello world" 2>/dev/null || printf '')
+assert_eq "" "$out" "无法识别时返回空串"
+rc=0
+xray_parse_keys "hello world" >/dev/null 2>&1 || rc=$?
+assert_status 1 "$rc" "无法识别时退出码非零"
+
+test_case "服务端配置渲染"
+
+# mktemp 失败时 $cfg 为空 → 渲染函数会写出 ".new" 污染仓库当前目录 → 必须守卫。
+cfg=$(mktemp)
+if [[ -z "$cfg" ]]; then
+  assert_eq "mktemp 能创建临时文件" "失败（mktemp 返回空路径）" "渲染用例前提：mktemp 必须可用"
+else
+  # 私钥必须用【真实的 x25519 私钥形态】（base64url，40-64 字符）：
+  # render_server_config 会对入参做白名单校验（见 Step 3），
+  # "PRIVKEY" 这种占位串会被直接拒绝。
+  PRIVKEY='PRIVKEY0123456789abcdefghijklmnopqrstuvwxyzABCDE'
+  render_server_config "$cfg" "11111111-2222-3333-4444-555555555555" "$PRIVKEY" "www.microsoft.com" "443" "a1b2c3d4" >/dev/null
+  # JSON 合法性检查必须在 python3 判活守卫【之内】：
+  # 守卫外的那条会在「没有 python3」的机器上必然判红（捕获到 "1" → assert_true 失败）。
+  # 判活必须用【功能可用】而不是 have_cmd：本机可能存在名为 python3 的占位/存根
+  # （例如 Microsoft Store 的 app execution alias），`command -v` 找得到但一跑就失败。
+  # 用 have_cmd 判活会让「JSON 合法性」断言在这些机器上必然判红。
+  if python3 -c 'import json' >/dev/null 2>&1; then
+    assert_status 0 "$(python3 -c "import json,sys;json.load(open(sys.argv[1]));print(0)" "$cfg" 2>/dev/null || echo 1)" "生成的配置是合法 JSON"
+    assert_contains "$(cat "$cfg")" '"security": "reality"' "配置启用 reality"
+    assert_contains "$(cat "$cfg")" '"target": "www.microsoft.com:443"' "reality target 正确"
+    assert_contains "$(cat "$cfg")" '"serverNames": [' "配置含 serverNames"
+    assert_contains "$(cat "$cfg")" '"flow": "xtls-rprx-vision"' "配置含 xtls-rprx-vision 流控"
+    assert_contains "$(cat "$cfg")" '"privateKey": "'"$PRIVKEY"'"' "配置含私钥"
+    assert_contains "$(cat "$cfg")" '"shortIds": [' "配置含 shortIds"
+    assert_eq 0 "$(grep -c 'geoip' "$cfg")" "配置不引用 geoip（避免 geoip.dat 依赖）"
+  else
+    # python3 不可用不是缺陷（它只是校验 JSON 合法性的手段），此处【不断言失败】，
+    # 只登记一条说明以保持断言条数恒定（见全局约束）。
+    assert_eq "python3 功能不可用" "python3 功能不可用" \
+      "python3 功能探测未通过：JSON 合法性校验已跳过（条数保持恒定）"
+  fi
+
+  # ── 注入面：未加引号的 heredoc 会【执行】入参里的 $(...) ──────────────
+  # render_server_config 用 `cat >"$tmp" <<EOF`（未加引号）渲染 →
+  # 入参里的 $(...) / 反引号会被真实执行。
+  # 控制器实证：把 '$(echo PWNED)' 传进 ShortID 或 SNI，
+  # 该命令被执行并把结果写进了 config.json。
+  # 当前所有调用方恰好都校验过输入（Task 8 校验 --sni/--port，向导校验端口），
+  # 但「安全性靠调用方自觉」不是函数契约 —— 函数自身必须守住。
+  rc=0
+  render_server_config "$cfg.inj" "11111111-2222-3333-4444-555555555555" "$PRIVKEY" "www.microsoft.com" "443" '$(echo PWNED)' >/dev/null 2>&1 || rc=$?
+  assert_status 1 "$rc" "render_server_config 拒绝含命令替换的 ShortID"
+  rc=0
+  render_server_config "$cfg.inj2" "11111111-2222-3333-4444-555555555555" "$PRIVKEY" 'x$(echo PWNED).com' "443" "a1b2c3d4" >/dev/null 2>&1 || rc=$?
+  assert_status 1 "$rc" "render_server_config 拒绝含命令替换的 SNI"
+  rc=0
+  render_server_config "$cfg.inj3" "11111111-2222-3333-4444-555555555555" "$PRIVKEY" "www.microsoft.com" '443$(id)' "a1b2c3d4" >/dev/null 2>&1 || rc=$?
+  assert_status 1 "$rc" "render_server_config 拒绝含命令替换的端口"
+  rc=0
+  render_server_config "$cfg.inj4" '11111111-2222-3333-4444-555555555$(id)' "$PRIVKEY" "www.microsoft.com" "443" "a1b2c3d4" >/dev/null 2>&1 || rc=$?
+  assert_status 1 "$rc" "render_server_config 拒绝含命令替换的 UUID"
+  rc=0
+  render_server_config "$cfg.inj5" "11111111-2222-3333-4444-555555555555" '$(echo PWNED)' "www.microsoft.com" "443" "a1b2c3d4" >/dev/null 2>&1 || rc=$?
+  assert_status 1 "$rc" "render_server_config 拒绝含命令替换的私钥"
+  rm -f "$cfg" "$cfg.inj" "$cfg.inj2" "$cfg.inj3" "$cfg.inj4" "$cfg.inj5"
+
+  # 目标目录不存在时，cat 的重定向会失败 —— 必须返回非零并给出【我们自己的】提示
+  # （不能把裸的 bash 报错漏给用户）。
+  # 光断言退出码【没有判别力】：去掉 cat 的退出码检查后，函数仍会因为后面的
+  # `chmod 600 "$tmp"` 失败而返回 1 → 退出码一样是 1 → 那条断言仍然绿。
+  # 所以必须断言【错误提示的文本】—— 这才是真正被 cat 检查守住的东西。
+  # 路径用 "$cfg.d/no-such-dir/..."，保证父目录一定不存在，
+  # 且在 Linux / macOS / MSYS 上行为一致。
+  out=$(render_server_config "$cfg.d/no-such-dir/config.json" "11111111-2222-3333-4444-555555555555" "$PRIVKEY" "www.microsoft.com" "443" "a1b2c3d4" 2>&1); rc=$?
+  assert_status 1 "$rc" "render_server_config 在目标目录不存在时返回非零"
+  assert_contains "$out" "无法写入配置暂存文件" "render_server_config 在目标目录不存在时给出自己的错误提示（而不是裸的 bash 报错）"
+fi
+
+test_case "gen_keys 与 xray_test_config"
+
+# gen_keys 与 xray_test_config 此前【一条断言都没有】——
+# 把 gen_keys 整个换成 `return 0`、把 xray_test_config 整个换成 `return 0`，
+# 全部断言仍然全绿、0 条红（控制器 P3/P4 实证）。
+# 这两个函数恰好是「把 xray 的输出变成配置」的关键环节，必须钉住。
+#
+# 假 xray 用 shell 函数实现，而不是「造可执行脚本 + chmod +x」：
+# MSYS 的 chmod 位不可靠（本机上 chmod 000 都不生效），
+# 而 bash 会在变量展开之后继续做函数查找 —— 所以 XRAY_BIN=xray 就能命中这个函数。
+FAKE_XRAY_MODE=''
+xray() {
+  case "$1" in
+    x25519)
+      case "$FAKE_XRAY_MODE" in
+        bad)    printf 'hello world\n' ;;
+        nopriv) printf 'Public key: IIIIJJJJKKKKLLLL\n' ;;
+        nopub)  printf 'Private key: AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH\n' ;;
+        *)      printf 'Private key: AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH\nPublic key: IIIIJJJJKKKKLLLL\n' ;;
+      esac ;;
+    uuid)
+      case "$FAKE_XRAY_MODE" in
+        baduuid) printf 'not-a-uuid\n' ;;
+        *)       printf '11111111-2222-3333-4444-555555555555\n' ;;
+      esac ;;
+    run|-test)
+      case "$FAKE_XRAY_MODE" in
+        cfg)   [[ "$3" == "-config" ]] && return 0; return 1 ;;
+        short) [[ "$3" == "-c" ]] && return 0; return 1 ;;
+        bare)  [[ "$1" == "-test" && "$2" == "-config" ]] && return 0; return 1 ;;
+        none)  return 1 ;;
+        *)     return 0 ;;
+      esac ;;
+    *) return 1 ;;
+  esac
+}
+
+# ── gen_keys：成功路径必须一次设置 4 个全局变量 ──────────────
+# 注意：gen_keys 设置的是【全局变量】，在 $( ) 子 shell 里设置父 shell 看不到 →
+# 必须在子 shell 内部把值打印出来再断言。
+out=$( ( XRAY_BIN=xray; FAKE_XRAY_MODE=ok; gen_keys >/dev/null 2>&1
+         printf 'PRIV=%s|PUB=%s|UUID=%s|SIDLEN=%s' "$PRIVATE_KEY" "$PUBLIC_KEY" "$UUID" "${#SHORT_ID}" ) 2>&1 )
+assert_contains "$out" "PRIV=AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH" "gen_keys 设置 PRIVATE_KEY"
+assert_contains "$out" "PUB=IIIIJJJJKKKKLLLL" "gen_keys 设置 PUBLIC_KEY"
+assert_contains "$out" "UUID=11111111-2222-3333-4444-555555555555" "gen_keys 设置 UUID"
+assert_contains "$out" "SIDLEN=8" "gen_keys 设置 8 位十六进制 SHORT_ID"
+
+# ── gen_keys：五条失败路径都必须返回非零 ──────────────
+out=$( ( XRAY_BIN=./no-such-xray-binary; gen_keys ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "gen_keys 在 xray x25519 失败时返回非零"
+out=$( ( XRAY_BIN=xray; FAKE_XRAY_MODE=bad; gen_keys ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "gen_keys 在无法解析 xray 输出时返回非零"
+out=$( ( XRAY_BIN=xray; FAKE_XRAY_MODE=nopriv; gen_keys ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "gen_keys 在 xray 只给出公钥（私钥为空）时返回非零"
+out=$( ( XRAY_BIN=xray; FAKE_XRAY_MODE=nopub; gen_keys ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "gen_keys 在 xray 只给出私钥（公钥为空）时返回非零"
+out=$( ( XRAY_BIN=xray; FAKE_XRAY_MODE=baduuid; gen_keys ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "gen_keys 在 xray uuid 输出的不是合法 UUID 时返回非零"
+out=$( ( XRAY_BIN=xray; FAKE_XRAY_MODE=ok; random_hex() { return 1; }; gen_keys ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "gen_keys 在 random_hex 失败时返回非零"
+out=$( ( XRAY_BIN=xray; FAKE_XRAY_MODE=ok; random_hex() { printf ''; return 0; }; gen_keys ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "gen_keys 在 random_hex 输出空串时返回非零"
+
+# ── xray_test_config：四种子命令写法都要认 ──────────────
+out=$( ( XRAY_BIN=xray; FAKE_XRAY_MODE=cfg; xray_test_config "/tmp/whatever.json" ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "xray_test_config 识别 run -test -config 写法"
+out=$( ( XRAY_BIN=xray; FAKE_XRAY_MODE=short; xray_test_config "/tmp/whatever.json" ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "xray_test_config 识别 run -test -c 写法"
+out=$( ( XRAY_BIN=xray; FAKE_XRAY_MODE=bare; xray_test_config "/tmp/whatever.json" ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "xray_test_config 识别 -test -config 写法"
+out=$( ( XRAY_BIN=xray; FAKE_XRAY_MODE=none; xray_test_config "/tmp/whatever.json" ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "xray_test_config 在所有写法都不被支持时返回非零"
+# 假 xray 只在本用例里用 —— 用完立刻撤掉，别影响后续用例（Task 6 起会用到真 xray）。
+unset -f xray
+
+test_case "服务端配置原子写入"
+
+# write_config_atomic 是写服务端配置的唯一入口，两条路径都必须被覆盖。
+# 校验失败：必须返回非零、【保留原有配置】、并清理临时文件。
+atomic_dir=$(mktemp -d 2>/dev/null)
+if [[ -n "$atomic_dir" ]]; then
+  atarget="$atomic_dir/config.json"
+  printf 'OLD-CONTENT\n' >"$atarget"
+  # 源文件必须是【真实存在的路径】！
+  # 原来这里直接传字面量 '{"broken":' —— 而 write_config_atomic 的第一步就是
+  # `[[ -f "$src" ]]` → 直接把它挡在门外，根本走不到 xray 校验那条路径 →
+  # 下面三条断言全是恒真（控制器 P1 实证：把校验失败分支改成【破坏目标文件】，
+  # 全部断言仍然全绿、0 条红）。
+  printf '{"broken":\n' >"$atomic_dir/broken.json"
+  # 本机没有 xray → xray_test_config 必然失败 → 正好走「校验失败」这条路径
+  out=$( ( XRAY_BIN="$atomic_dir/no-such-xray"; write_config_atomic "$atarget" "$atomic_dir/broken.json" ) 2>&1 ); rc=$?
+  assert_status 1 "$rc" "write_config_atomic 在配置校验失败时返回非零"
+  assert_eq "OLD-CONTENT" "$(cat "$atarget")" "write_config_atomic 校验失败时保留原有配置不变"
+  if [[ -e "$atarget.new" ]]; then leftover=1; else leftover=0; fi
+  assert_eq "0" "$leftover" "write_config_atomic 校验失败时清理临时文件"
+  # 校验通过：必须原子替换成新内容（注意 write_config_atomic 收的是【源文件】）
+  printf '{"ok":1}\n' >"$atomic_dir/src.json"
+  out=$( ( xray_test_config() { return 0; }; write_config_atomic "$atarget" "$atomic_dir/src.json" ) 2>&1 ); rc=$?
+  assert_status 0 "$rc" "write_config_atomic 在配置校验通过时返回 0"
+  assert_contains "$(cat "$atarget")" '"ok":1' "write_config_atomic 校验通过时替换成新配置"
+  # 源文件不存在时必须失败，而不是写出空配置
+  # 先把目标文件恢复成 OLD-CONTENT —— 上一条断言已经把它换成新内容了。
+  printf 'OLD-CONTENT\n' >"$atarget"
+  out=$( ( xray_test_config() { return 0; }; write_config_atomic "$atarget" "$atomic_dir/no-such-file" ) 2>&1 ); rc=$?
+  assert_status 1 "$rc" "write_config_atomic 在源文件不存在时返回非零"
+  # 源文件不存在时【不得碰目标文件】—— 上面那条只查退出码，
+  # 若实现写成「先覆盖目标再校验」，退出码仍可能对，但正式配置已经被毁了。
+  assert_eq "OLD-CONTENT" "$(cat "$atarget")" "write_config_atomic 在源文件不存在时不得覆盖目标文件"
+else
+  assert_eq "mktemp -d 能创建唯一临时目录" "失败（mktemp -d 返回空路径）" \
+    "write_config_atomic 用例前提：mktemp -d 必须能创建唯一临时目录"
+fi
+rm -rf "$atomic_dir"
 
 test_summary
