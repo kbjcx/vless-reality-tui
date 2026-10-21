@@ -2131,8 +2131,9 @@ menu_rotate_keys() {
 
 menu_uninstall() {
   # 单文件分发版（dist/install.sh）里没有 uninstall.sh → exec 会失败并让菜单崩掉。
-  # 用 -f 判定而不是 -x：仓库里所有 .sh 的提交模式都是 100644（core.fileMode=false），
-  # 新克隆的仓库里 uninstall.sh 【不可执行】→ -x 永远判成「没有」→ 卸载入口是死的。
+  # 用 -f 判定而不是 -x：`-x` 依赖执行位，而执行位【不可靠】——
+  # 单文件分发版里根本没有 uninstall.sh，curl 下载来的文件也没有执行位
+  # → -x 永远判成「没有」→ 卸载入口是死的。
   # 用 `exec bash` 显式执行 → 完全不依赖执行位。
   if [[ ! -f "$ROOT_DIR/uninstall.sh" ]]; then
     tui_warn "当前目录没有 uninstall.sh（单文件分发版不含卸载脚本）。"
@@ -2202,8 +2203,10 @@ management_menu() {
 #   sudo bash install.sh --uninstall  卸载
 #
 # ⚠️ 用 `bash install.sh` 而不是 `./install.sh`：
-#    仓库里的 .sh 提交模式是 100644（core.fileMode=false），
-#    新克隆的仓库里这个文件【不可执行】→ ./install.sh 会 Permission denied。
+#    单文件分发版是 `curl -o` 下载来的 → 那个文件【没有执行位】，
+#    ./install.sh 会 Permission denied。
+#    （仓库里的 install.sh 提交模式是 100755，clone 下来就带执行位；
+#      但 `bash install.sh` 两种情况都成立。）
 
 
 
@@ -2343,8 +2346,9 @@ main() {
   tui_init
 
   if [[ $OPT_UNINSTALL -eq 1 ]]; then
-    # 用 -f 判定而不是 -x：仓库里所有 .sh 的提交模式都是 100644（core.fileMode=false），
-    # 新克隆的仓库里 uninstall.sh 【不可执行】→ -x 永远判成「没有」→ 卸载入口是死的。
+    # 用 -f 判定而不是 -x：`-x` 依赖执行位，而执行位【不可靠】——
+    # 单文件分发版里根本没有 uninstall.sh，curl 下载来的文件也没有执行位
+    # → -x 永远判成「没有」→ 卸载入口是死的。
     # 用 `exec bash` 显式执行 → 完全不依赖执行位。
     if [[ -f "$ROOT_DIR/uninstall.sh" ]]; then
       exec bash "$ROOT_DIR/uninstall.sh"

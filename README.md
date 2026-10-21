@@ -49,8 +49,9 @@ sudo bash install.sh
 ```
 
 > ⚠️ 命令里是 `sudo bash install.sh`，**不是**直接用 `./install.sh` 执行 ——
-> 仓库里的 `.sh` 提交模式是 `100644`，新克隆的仓库里 `install.sh` **不可执行**，
-> `./install.sh` 会 Permission denied。
+> `curl -o` 下载下来的文件**没有执行位**，所以 `./install.sh` 会 Permission denied。
+> （仓库里的 `install.sh` 提交模式是 `100755`，clone 下来就带执行位；
+> 但 `bash install.sh` 两种情况都成立。）
 
 ## curl 单文件方式的完整命令
 

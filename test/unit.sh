@@ -3056,9 +3056,10 @@ if [[ -n "$T11_TMP" ]]; then
 
   test_case "uninstall：可执行位（定点修订）"
 
-  # ⚠️ 仓库里所有 .sh 的提交模式都是 100644（core.fileMode=false）→
-  #    新克隆的仓库里 uninstall.sh 【不可执行】→ 用 -x 判定会永远判成「没有」，
-  #    卸载入口就是死的。必须用 -f 判定 + `bash` 显式执行。
+  # ⚠️ `-x` 判定依赖执行位，而执行位【不可靠】——
+  #    单文件分发版里根本没有 uninstall.sh，curl 下载来的文件也没有执行位
+  #    → 用 -x 判定会永远判成「没有」，卸载入口就是死的。
+  #    必须用 -f 判定 + `bash` 显式执行。
   inst=$(cat "$ROOT/install.sh")
   assert_not_contains "$inst" 'if [[ -x "$ROOT_DIR/uninstall.sh" ]]' "install.sh 不再用 -x 判定 uninstall.sh"
   assert_contains "$inst" 'exec bash "$ROOT_DIR/uninstall.sh"' "install.sh 用 bash 显式执行 uninstall.sh（不依赖执行位）"
@@ -3278,6 +3279,22 @@ assert_contains "$rmd" "已验证" "README 同时列出已验证的项"
 # 快速开始：必须是「先下载再执行」，不用管道
 assert_contains "$rmd" "sudo bash install.sh" "README 给出 sudo bash install.sh 的用法"
 assert_contains "$rmd" "curl" "README 给出 curl 单文件方式的命令"
+
+# ⚠️ T13-14：README 里曾陈述「仓库里的 .sh 提交模式是 100644，install.sh 不可执行」
+#    —— 但 Task 11 的 T11-6(b) 与 Task 12 的 T12-4 / T12-5 已把 install.sh /
+#    uninstall.sh / build.sh / dist/install.sh / demo.sh / test/integration-debian.sh
+#    全部提交成 100755。陈述与仓库的真实状态【矛盾】→ 用户会以为 clone 下来的
+#    脚本一个都跑不了。真正该说的理由是【另一个】：curl 下载下来的文件没有执行位。
+assert_not_contains "$rmd" "100644" "README 不再陈述过时的提交模式（100644）"
+assert_contains "$rmd" "没有执行位" "README 点名：curl 下载下来的文件没有执行位"
+assert_contains "$rmd" "100755" "README 点名：仓库里的脚本提交模式是 100755"
+
+# 三个入口脚本里的同一处陈述也要改掉 —— 它们不是散文，是用户可能直接读到的源码。
+inst13=$(cat "$ROOT/install.sh")
+uninst13=$(cat "$ROOT/uninstall.sh")
+dep13=$(cat "$ROOT/lib/deploy.sh")
+assert_not_contains "$inst13 $dep13 $uninst13" "100644" \
+  "install.sh / uninstall.sh / lib/deploy.sh 不再陈述过时的提交模式（100644）"
 
 test_case "Task 13：README 的必需小节一个都不能少"
 

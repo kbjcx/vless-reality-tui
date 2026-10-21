@@ -7,8 +7,10 @@
 #   sudo bash uninstall.sh --purge    同时删除状态文件
 #
 # ⚠️ 用 `bash uninstall.sh` 而不是 `./uninstall.sh`：
-#    仓库里的 .sh 提交模式是 100644（core.fileMode=false），
-#    新克隆的仓库里这个文件【不可执行】→ ./uninstall.sh 会 Permission denied。
+#    单文件分发版是 `curl -o` 下载来的 → 那个文件【没有执行位】，
+#    ./uninstall.sh 会 Permission denied。
+#    （仓库里的 uninstall.sh 提交模式是 100755，clone 下来就带执行位；
+#      但 `bash uninstall.sh` 两种情况都成立。）
 set -uo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
