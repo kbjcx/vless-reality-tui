@@ -283,17 +283,27 @@ assert_eq "16" "$(printf '%s' "$out" | wc -c | tr -d ' ')" "random_hex 回退实
 assert_match_hex "$out"
 
 # ── read_file ──────────────────────────────────────────────
+# 前提守卫：mktemp 失败时路径为空，cat >"" 会写到【当前目录】（污染仓库），
+# 所以必须让用例明确失败，绝不继续往下走。
+# 注意：守卫块内的用例行【保持原样不缩进】——缩进会改动既有行，
+# 导致 git diff 出现删除行（验收标准要求 test/unit.sh 的删除行数为 0）。
 rf=$(mktemp)
+if [[ -n "$rf" && -f "$rf" ]]; then
 printf '  hello world  \n' >"$rf"
 assert_eq "hello world" "$(read_file "$rf")" "read_file 读取并 trim 内容"
 printf 'no-newline-at-eof' >"$rf"
 assert_eq "no-newline-at-eof" "$(read_file "$rf")" "read_file 兼容无尾换行"
 rm -f "$rf"
+else
+  assert_eq "mktemp 能创建临时文件" "失败（mktemp 返回空路径）" \
+    "read_file 用例前提：mktemp 必须能创建临时文件"
+fi
 assert_fails "read_file 对不存在的文件返回非 0" read_file "$rf"
 
 # ── detect_os ─────────────────────────────────────────────
 # 必须能解析传入的 os-release 路径（默认 /etc/os-release 只是取值来源）
 fake_os=$(mktemp)
+if [[ -n "$fake_os" && -f "$fake_os" ]]; then
 cat >"$fake_os" <<'EOF'
 ID=debian
 VERSION_ID="12"
@@ -301,13 +311,22 @@ EOF
 os_out=$(detect_os "$fake_os")
 assert_contains "$os_out" "debian|12|" "detect_os 解析 id|version|arch"
 assert_eq "3" "$(printf '%s' "$os_out" | awk -F'|' '{print NF}')" "detect_os 输出恰好三段"
+else
+  assert_eq "mktemp 能创建临时文件" "失败（mktemp 返回空路径）" \
+    "detect_os 用例前提：mktemp 必须能创建临时文件"
+fi
 fake_os2=$(mktemp)
+if [[ -n "$fake_os2" && -f "$fake_os2" ]]; then
 printf 'NAME="Nothing"\n' >"$fake_os2"
 os_out2=$(detect_os "$fake_os2")
 # cut -f1,2 只输出被选中的字段（两个空字段之间只隔【一个】分隔符），
 # 所以这里按字段分别断言，失败时能直接看出是 ID 还是 VERSION_ID 没留空
 assert_eq "" "$(printf '%s' "$os_out2" | cut -d'|' -f1)" "detect_os 缺少 ID 时 id 字段留空"
 assert_eq "" "$(printf '%s' "$os_out2" | cut -d'|' -f2)" "detect_os 缺少 VERSION_ID 时 version 字段留空"
+else
+  assert_eq "mktemp 能创建临时文件" "失败（mktemp 返回空路径）" \
+    "detect_os 空字段用例前提：mktemp 必须能创建临时文件"
+fi
 rm -f "$fake_os" "$fake_os2"
 
 # ── assert_debian ─────────────────────────────────────────
@@ -366,7 +385,10 @@ assert_eq "$sq_v" "$sq_back" "state_quote 产物 eval 后逐字节还原"
 
 # save_state / load_state 往返：REMARK 来自用户输入（--name），
 # 写入后再读回必须逐字节一致，且其中的 $(...) 不得在读取时被执行。
+# 前提守卫：mktemp -d 失败时路径为空，后续 "$t_dir/deploy.env" 会退化成往
+# 【当前目录】写文件（污染仓库），所以必须让用例明确失败。
 t_dir=$(mktemp -d)
+if [[ -n "$t_dir" && -d "$t_dir" ]]; then
 t_state="$t_dir/deploy.env"
 ( STATE_DIR="$t_dir"; STATE_FILE="$t_state"; PORT=8443
   REMARK='$(touch '"$t_dir"'/pwned)'; SNI="a'b"
@@ -401,6 +423,10 @@ assert_status 1 "$rc" "state_exists 对不存在的状态文件返回非 0"
 ( STATE_FILE="$t_dir/nope.env"; load_state >/dev/null 2>&1 ); rc=$?
 assert_status 1 "$rc" "load_state 对不存在的状态文件返回非 0"
 rm -rf "$t_dir"
+else
+  assert_eq "mktemp -d 能创建唯一临时目录" "失败（mktemp -d 返回空路径）" \
+    "save_state/load_state 用例前提：mktemp -d 必须能创建唯一临时目录"
+fi
 
 test_case "core 常量与文件边界"
 
@@ -433,5 +459,106 @@ assert_contains "$core_src" "chmod 700" "core.sh 对状态目录设置 700 权�
 # （require_root 属于 install.sh；其余网络探测类属于 Task 4）
 offenders="$(grep -nE '^[[:space:]]*(function[[:space:]]+)?(require_root|is_modern_debian|detect_public_ip|detect_local_ip|port_in_use|port_occupant|random_free_port|target_supports_tls13|target_latency_ms|apt_update_once|ensure_packages|service_run_user)[[:space:]]*(\(\))?[[:space:]]*[{]' "$ROOT/lib/core.sh" | tr '\n' ' ')"
 assert_eq "" "$offenders" "core.sh 不含属于 install.sh / Task 4 的越权函数"
+
+test_case "core 修复轮 1 回归（评审发现项）"
+
+# ── I-1：全局状态变量必须显式声明 ─────────────────────────
+# install.sh 跑在 `set -u` 下；--menu 路径不经过 preflight → SERVER_IP 从未探测，
+# 未声明时 deploy_wizard 引用 $SERVER_IP 会直接崩，且没有 tui_err 提示。
+out=$(bash -c 'set -uo pipefail; source "$1"; printf "%s" "$SERVER_IP"' _ "$ROOT/lib/core.sh" 2>&1); rc=$?
+assert_status 0 "$rc" "core.sh 显式声明了全局状态变量（set -u 下引用不 unbound）"
+out=$(bash -c 'set -uo pipefail; PORT=1234; source "$1"; printf "%s" "$PORT"' _ "$ROOT/lib/core.sh" 2>&1)
+assert_eq "1234" "$out" "core.sh 的声明块保留调用方预设的全局变量（用 ${VAR:-} 而非 VAR=''）"
+
+# ── M-2 / F-16：random_hex 失败必须返回非零 ─────────────────
+# 旧写法 `openssl ... | tr ...; return 0` 的退出码取自 tr，openssl 失败时仍返回 0
+# → 输出空串 → 空 SHORT_ID 进 config.json → xray 报错与真实原因无关。
+out=$( ( have_cmd() { return 1; }; od() { return 1; }; random_hex 4 ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "random_hex 在 openssl 与 od 都不可用时返回非零"
+assert_eq "" "$out" "random_hex 失败时不输出任何内容"
+out=$( ( openssl() { printf 'NOTHEX'; }; random_hex 4 ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "openssl 输出非十六进制时退回 /dev/urandom 而不是把垃圾返回"
+assert_eq "8" "$(printf '%s' "$out" | wc -c | tr -d ' ')" "回退后输出恰好 8 个十六进制字符"
+if [[ "$out" =~ ^[0-9a-f]{8}$ ]]; then hex_ok=1; else hex_ok=0; fi
+assert_eq "1" "$hex_ok" "回退后输出是纯小写十六进制"
+
+# ── I-2：save_state 写失败必须返回非零，且不得谎报成功 ───────
+bad_dir=$(mktemp -d 2>/dev/null)
+if [[ -n "$bad_dir" ]]; then
+  : > "$bad_dir/notadir"   # 用一个普通文件占住目录名，让 mkdir -p 必然失败
+  out=$( ( STATE_DIR="$bad_dir/notadir"; STATE_FILE="$bad_dir/notadir/deploy.env"; save_state ) 2>&1 ); rc=$?
+  assert_status 1 "$rc" "save_state 在状态目录无法创建时返回非零"
+  assert_contains "$out" "无法创建状态目录" "save_state 写失败时给出明确错误"
+  if [[ "$out" == *"配置已保存"* ]]; then lied=1; else lied=0; fi
+  assert_eq "0" "$lied" "save_state 写失败时不得打印『配置已保存』"
+else
+  assert_eq "mktemp -d 能创建唯一临时目录" "失败（mktemp -d 返回空路径）" \
+    "save_state 失败路径用例前提：mktemp -d 必须能创建唯一临时目录"
+fi
+rm -rf "$bad_dir"
+
+# ── M-1：状态文件损坏时 load_state 必须返回非零 ───────────────
+bad_dir=$(mktemp -d 2>/dev/null)
+if [[ -n "$bad_dir" ]]; then
+  printf 'PORT=443\nif then fi\n' > "$bad_dir/broken.env"
+  out=$( ( STATE_FILE="$bad_dir/broken.env"; load_state ) 2>&1 ); rc=$?
+  assert_status 1 "$rc" "load_state 对语法错误的状态文件返回非零"
+  assert_contains "$out" "状态文件格式错误" "load_state 对损坏的状态文件给出明确错误"
+  printf 'PORT=443\nfalse\n' > "$bad_dir/lastfalse.env"
+  out=$( ( STATE_FILE="$bad_dir/lastfalse.env"; load_state ) 2>&1 ); rc=$?
+  assert_status 0 "$rc" "load_state 对末条命令返回非零的合法状态文件仍视为可读"
+else
+  assert_eq "mktemp -d 能创建唯一临时目录" "失败（mktemp -d 返回空路径）" \
+    "load_state 失败路径用例前提：mktemp -d 必须能创建唯一临时目录"
+fi
+rm -rf "$bad_dir"
+
+# ── M-7：urlencode 两个分支的 stdout 必须逐字节一致 ──────────
+enc_all="a b'c\\d中文"
+enc_py="$(urlencode "$enc_all")"
+enc_fb="$( ( have_cmd() { return 1; }; urlencode "$enc_all" ) )"
+assert_eq "$enc_py" "$enc_fb" "urlencode 的 python 分支与回退分支输出逐字节一致"
+assert_eq "a%20b%27c%5Cd%E4%B8%AD%E6%96%87" "$enc_py" "urlencode 编码结果正确"
+raw_enc="$(urlencode 'abc' | od -An -c | tr -d ' ')"
+assert_eq "abc" "$raw_enc" "urlencode 输出不含多余的尾换行（od 逐字节可见）"
+
+# ── O-1：detect_os 必须能处理 CRLF 行尾的 os-release ─────────
+crlf_os=$(mktemp 2>/dev/null)
+if [[ -n "$crlf_os" ]]; then
+  printf 'ID=debian\r\nVERSION_ID="12"\r\n' > "$crlf_os"
+  os_crlf="$(detect_os "$crlf_os")"
+  assert_eq "debian" "$(printf '%s' "$os_crlf" | cut -d'|' -f1)" "detect_os 去掉 CRLF os-release 里的 CR"
+  assert_eq "12" "$(printf '%s' "$os_crlf" | cut -d'|' -f2)" "detect_os 去掉 CRLF os-release 里的 CR（version）"
+else
+  assert_eq "mktemp 能创建临时文件" "失败（mktemp 返回空路径）" \
+    "detect_os CRLF 用例前提：mktemp 必须能创建临时文件"
+fi
+rm -f "$crlf_os"
+
+# ── M-5①：REALITY_TARGETS 必须钉住计划指定的全部 7 个目标 ────
+missing_targets=''
+for t in 'www.microsoft.com' 'dl.google.com' 'www.apple.com' 'one.one.one.one' 'www.cloudflare.com' 'time.akamai.com' 'addons.mozilla.org'; do
+  found=0
+  for x in ${REALITY_TARGETS[@]+"${REALITY_TARGETS[@]}"}; do
+    if [[ "$x" == "$t" ]]; then found=1; break; fi
+  done
+  if [[ $found -eq 0 ]]; then missing_targets+="$t "; fi
+done
+assert_eq "" "$missing_targets" "REALITY_TARGETS 包含计划指定的全部 7 个目标"
+
+# ── M-5②：权限位【行为断言】——只在 chmod 真的生效的文件系统上跑 ──
+# Debian 真机必然生效；本开发机（MSYS）的 chmod 是模拟的，probe_mode != 600 → 跳过。
+perm_dir=$(mktemp -d 2>/dev/null)
+if [[ -n "$perm_dir" ]]; then
+  : > "$perm_dir/probe"
+  chmod 600 "$perm_dir/probe" 2>/dev/null
+  probe_mode="$(stat -c '%a' "$perm_dir/probe" 2>/dev/null)"
+  if [[ "$probe_mode" == "600" ]]; then
+    ( STATE_DIR="$perm_dir/sd"; STATE_FILE="$perm_dir/sd/deploy.env"; save_state >/dev/null 2>&1 )
+    assert_eq "600" "$(stat -c '%a' "$perm_dir/sd/deploy.env" 2>/dev/null)" "save_state 写出的状态文件权限为 600"
+    assert_eq "700" "$(stat -c '%a' "$perm_dir/sd" 2>/dev/null)" "save_state 建出的状态目录权限为 700"
+  fi
+fi
+rm -rf "$perm_dir"
 
 test_summary

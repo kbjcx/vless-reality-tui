@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # lib/core.sh — 环境探测与通用能力
 # 本文件只放【纯函数】与【状态持久化】；网络探测类函数属于 Task 4。
+# 注意：本文件【不是自包含】的 —— assert_debian / save_state / load_state 会调用
+# lib/tui.sh 的 tui_err / tui_tip / tui_ok。按计划的「函数归属唯一」约定，
+# core.sh 不主动 source tui.sh，由 install.sh 统一按 tui → core 的顺序引入。
 
 APP_NAME='VLESS + REALITY 部署工具'
 APP_VERSION='1.0.0'
@@ -12,6 +15,18 @@ OUT_DIR="${OUT_DIR:-/root/vless-reality}"
 XRAY_BIN="${XRAY_BIN:-/usr/local/bin/xray}"
 XRAY_CONFIG="${XRAY_CONFIG:-/usr/local/etc/xray/config.json}"
 LOG_DIR="${LOG_DIR:-/var/log/xray}"
+
+# 全局部署状态：Task 5/7/9 赋值，Task 3 的 save_state 负责持久化。
+# 必须显式声明：install.sh 跑在 `set -u` 下，未声明又未赋值的变量一旦被引用
+# 就会触发 unbound variable（实测：--menu 路径不经过 preflight → SERVER_IP 从未
+# 探测，deploy_wizard 引用 $SERVER_IP、menu_tune 引用 $PORT 都会直接崩掉，
+# 而且没有 tui_err 提示，用户只看到一句 "SERVER_IP: unbound variable"）。
+# 用 ${VAR:-默认} 而不是 VAR='' ：前者既定义了变量（set -u 安全），
+# 又【保留调用方在 source 之前预设的值】，后者会把预设值清空。
+PORT="${PORT:-}"; UUID="${UUID:-}"; SNI="${SNI:-}"; TARGET="${TARGET:-}"
+PRIVATE_KEY="${PRIVATE_KEY:-}"; PUBLIC_KEY="${PUBLIC_KEY:-}"; SHORT_ID="${SHORT_ID:-}"
+SERVER_IP="${SERVER_IP:-}"; REMARK="${REMARK:-}"
+MODE="${MODE:-native}"; FLOW="${FLOW:-xtls-rprx-vision}"; FINGERPRINT="${FINGERPRINT:-chrome}"
 
 REALITY_TARGETS=(
   'www.microsoft.com'
@@ -35,7 +50,9 @@ trim() {
 urlencode() {
   local s="$1"
   if have_cmd python3; then
-    python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "$s" 2>/dev/null && return 0
+    # 必须用 sys.stdout.write 而不是 print：print 会多输出一个尾换行，
+    # 而回退分支没有 —— 同一个函数的两个分支 stdout 字节不一致。
+    python3 -c 'import sys,urllib.parse;sys.stdout.write(urllib.parse.quote(sys.argv[1],safe=""))' "$s" 2>/dev/null && return 0
   fi
   # 回退实现：必须按【字节】遍历，否则多字节字符只会编码首字节。
   # local LC_ALL=C 让 ${#s} 与 ${s:i:1} 都按字节切分。
@@ -46,10 +63,11 @@ urlencode() {
     c=${s:$i:1}
     case "$c" in
       [a-zA-Z0-9.~_-]) out+="$c" ;;
-      # 偏离说明（见 task-3-report.md）：brief 的写法统一用 printf '%%%02X' "'$c" 取字节值。
-      # 该形式依赖 bash 对「以 ' 开头的字符常量」的解释，实测 bash 5.3 能正确处理
-      # '' (39) 与 '\' (92)，但这属于未文档化的实现细节，bash 4.2 未必一致。
-      # 这里把这两个字节的数值写死，保证任意 bash 4.2+ 上结果一致（其余字节走原写法）。
+      # ' 与 \ 的编码写死：printf '%%%02X' "'$c" 依赖 bash 对「以 ' 开头的字符常量」
+      # 的解释，这一点【未在本机文档中确认】（bash 5.3.9 实测给出 39/92，
+      # 但 help printf 只列了 %b %q %Q %(fmt)T 四个扩展，未提该形式）。
+      # 把这两个字节的数值写死后，任意 bash 4.2+ 上结果一致，
+      # 输出与原写法逐字节相同（其余字节仍走原写法）。
       "'")  out+='%27' ;;
       '\')  out+='%5C' ;;
       *) out+=$(printf '%%%02X' "'$c") ;;
@@ -59,16 +77,29 @@ urlencode() {
 }
 
 random_hex() {
-  local n="${1:-8}"
+  local n="${1:-8}" out=''
+  [[ "$n" =~ ^[0-9]+$ ]] || return 1
+  # 必须【先捕获输出再判断】，不能用 `openssl ... | tr ...; return 0`：
+  # 管道的退出码取自最后一个命令（tr），openssl 失败时 tr 仍返回 0 →
+  # random_hex 会【返回 0 但输出空串】→ 空 SHORT_ID 被原样写进 config.json →
+  # xray run -test 失败 → 部署中止，且报错与真实原因（取不到随机数）完全无关。
   if have_cmd openssl; then
-    # 偏离说明（见 task-3-report.md）：brief 写的是 tr -d '\n'，但只删 LF 不删 CR ——
-    # 某些 openssl 构建（含本开发机的 MSYS2 版本）输出的是 \r\n，
-    # 残留的 \r 会混进 SHORT_ID / 密钥，随后被原样写进 config.json
-    # （JSON 字符串里不允许裸控制字符）→ 直接让部署失败。
-    # Debian 自带的 openssl 只输出 \n，此处多删一个 \r 对其无影响。
-    openssl rand -hex "$n" 2>/dev/null | tr -d '\r\n'; return 0
+    out=$(openssl rand -hex "$n" 2>/dev/null) || out=''
   fi
-  od -An -tx1 -N "$n" /dev/urandom 2>/dev/null | tr -d ' \r\n'
+  if [[ ! "$out" =~ ^[0-9a-f]+$ ]]; then
+    # openssl 不可用或输出不可用 → 退回 /dev/urandom（od 是 coreutils，几乎必然存在）
+    out=$(od -An -tx1 -N "$n" /dev/urandom 2>/dev/null) || out=''
+  fi
+  # 空格与 CR 一起删：od 的输出用空格分隔；某些 openssl 构建（含本开发机的
+  # MSYS2 版本）输出的是 \r\n，只删 LF 会残留一个 \r，而这个 \r 会混进
+  # SHORT_ID / 密钥，随后被原样写进 config.json（JSON 字符串里不允许裸控制
+  # 字符）→ 直接让部署失败。Debian 自带的 openssl 只输出 \n，多删一个 \r
+  # 对其无影响。
+  out=$(printf '%s' "$out" | tr -d ' \r\n')
+  # 必须是纯小写十六进制：脏输出（错误文本、半截输出）若被原样写进 config.json，
+  # 失败点会被推迟到 xray 校验，报错与真实原因完全无关。
+  [[ -n "$out" && "$out" =~ ^[0-9a-f]+$ ]] || return 1
+  printf '%s' "$out"
 }
 
 read_file() {
@@ -78,10 +109,17 @@ read_file() {
 }
 
 detect_os() {
-  local os_release="${1:-/etc/os-release}" id='' ver='' arch=''
+  local os_release="${1:-/etc/os-release}" id='' ver='' arch='' pair=''
   if [[ -r "$os_release" ]]; then
-    id=$(. "$os_release"; printf '%s' "${ID:-}")
-    ver=$(. "$os_release"; printf '%s' "${VERSION_ID:-}")
+    # 只接受受信任路径：os-release 是 shell 片段，`.` 引入等价于执行代码。
+    # 本函数只用于 /etc/os-release 与测试用临时文件，不接受用户可控输入。
+    # 只 source 一次，同时取出 ID 与 VERSION_ID。
+    pair=$(. "$os_release" 2>/dev/null; printf '%s|%s' "${ID:-}" "${VERSION_ID:-}")
+    # 连 CR 一起删：CRLF 行尾的 os-release 会让 ID 变成 "debian\r" →
+    # assert_debian 误判成「不是 Debian」。Debian 自带的 os-release 是 LF，
+    # 但 /etc 里也可能存在被 CRLF 改写过的副本。
+    id=$(printf '%s' "${pair%%|*}" | tr -d '\r')
+    ver=$(printf '%s' "${pair#*|}" | tr -d '\r')
   fi
   case "$(uname -m)" in
     x86_64|amd64)  arch='amd64' ;;
@@ -143,8 +181,12 @@ state_quote() {
 }
 
 save_state() {
-  mkdir -p "$STATE_DIR"
-  chmod 700 "$STATE_DIR"
+  # 每一步都必须检查返回码：把「没写成功」伪装成「配置已保存」是最坏的失败模式
+  # —— 状态没落盘，但用户以为成功了 → 之后 --status 显示未部署、卸载流程拿不到
+  # 端口 → 防火墙规则被遗留。触发条件虽窄（root + 正常 /etc 时不会发生），
+  # 但磁盘满、/etc 只读、STATE_DIR 配错都会触发。
+  mkdir -p "$STATE_DIR" || { tui_err "无法创建状态目录：$STATE_DIR"; return 1; }
+  chmod 700 "$STATE_DIR" || { tui_err "无法设置状态目录权限：$STATE_DIR"; return 1; }
   local tmp="$STATE_FILE.tmp"
   {
     printf '# %s v%s 部署状态（勿手工编辑）\n' "$APP_NAME" "$APP_VERSION"
@@ -161,16 +203,30 @@ save_state() {
     printf 'REMARK=%s\n' "$(state_quote "${REMARK:-}")"
     printf 'FLOW=%s\n' "$(state_quote "${FLOW:-xtls-rprx-vision}")"
     printf 'FINGERPRINT=%s\n' "$(state_quote "${FINGERPRINT:-chrome}")"
-  } >"$tmp"
-  chmod 600 "$tmp"
-  mv -f "$tmp" "$STATE_FILE"
+  } >"$tmp" || { tui_err "无法写入状态临时文件：$tmp"; rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp" || { tui_err "无法设置状态文件权限：$tmp"; rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$STATE_FILE" || { tui_err "无法保存状态文件：$STATE_FILE"; rm -f "$tmp"; return 1; }
   tui_ok "配置已保存：$STATE_FILE"
 }
 
 load_state() {
   [[ -f "$STATE_FILE" ]] || return 1
+  # 状态文件是纯变量赋值，正常 source 必定【静默】。
+  # 先在子 shell 里做一次静默探测：语法错误一定有 stderr 输出，而
+  # 「文件最后一条命令返回非零」不会 —— 这样只抓真正的语法错误，
+  # 不会把合法状态文件误判成损坏。命令替换跑在子 shell，变量不会落到当前
+  # 作用域，所以探测之后还要再 source 一次。
+  local probe_err=''
+  probe_err=$( . "$STATE_FILE" 2>&1 >/dev/null ) || true
+  if [[ -n "$probe_err" ]]; then
+    tui_err "状态文件格式错误：$STATE_FILE"
+    tui_tip "${probe_err%%$'\n'*}"
+    return 1
+  fi
   # shellcheck disable=SC1090
-  . "$STATE_FILE"
+  # 这里的返回码【不作为失败判据】：状态文件最后一条命令返回非零是合法的
+  # （例如末尾是一条返回 1 的语句），真正坏掉的文件已在上面的探测里被拦下。
+  . "$STATE_FILE" || true
   return 0
 }
 
