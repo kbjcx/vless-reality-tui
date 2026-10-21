@@ -2024,7 +2024,12 @@ called_file="$(mktemp 2>/dev/null)"
 if [[ -n "$called_file" ]]; then
   out=$( ( have_cmd() { return 1; }
            apt_update_once() { return 1; }
-           tui_run() { : >"$called_file"; return 0; }
+           # 标记文件必须【写入内容】：`: >"$called_file"` 只创建空文件（size 0），
+           # 而下面的判定是 `[[ -s "$called_file" ]]`（size > 0）→ 空文件恒为假 →
+           # 这条断言【永远绿、永远不可能变红】（假绿）。
+           # 控制器与实施者各自独立实证：把本行改成写 1 字节后，
+           # 把 ensure_packages 变异成 `apt_update_once || true` 才会红 2 条。
+           tui_run() { printf called >"$called_file"; return 0; }
            ensure_packages curl ) 2>/dev/null ); rc=$?
   assert_status 1 "$rc" "ensure_packages 在 apt update 失败时必须返回非零"
   if [[ -s "$called_file" ]]; then called=1; else called=0; fi
@@ -2387,16 +2392,49 @@ git commit -m "feat(core): 网络探测——公网 IP、端口占用、TLS1.3 �
    是【1 换 1】的配对 → 无论走哪边，总数都不变。）
 5. `lib/tui.sh`、`test/lib.sh` **一字未动**。
 6. 红灯证据（至少这四条）：
-   - 删掉 `detect_public_ip` 里的 `tr -d '[:space:]'` → 「detect_public_ip 输出正确的
-     公网 IPv4」必须变红；
+   - 删掉 `detect_public_ip` 里的 `tr -d '[:space:]'` → 「detect_public_ip **会剥掉响应里的
+     空白与换行**（真实 IP 服务都带尾随换行）」必须变红。
+     注意：不是「detect_public_ip 输出正确的公网 IPv4」—— 那条在删掉 `tr` 后**仍然绿**：
+     命令替换 `$(...)` 本身就会剥掉尾部的 `\n`，所以对 mock `printf '1.2.3.4\n'` 来说
+     `tr` 没有作用；`tr` 真正承重的是**尾部空格与 CR**（控制器与实施者各自实测）；
    - 把 `target_supports_tls13` 里的 grep 模式改坏 → 「target_supports_tls13
      识别出 TLS 1.3 的握手输出」必须变红；
    - 把 `detect_local_ip` 的「失败返回非零」改回「rc=0 + 空输出」→
      「detect_local_ip 在 ip 与 hostname 都不可用时必须返回非零」必须变红；
    - 把 `ensure_packages` 的 `apt_update_once || return 1` 改成 `apt_update_once || true` →
      「ensure_packages 在 apt update 失败时必须返回非零」与
-     「…不得继续调用 apt-get install」两条必须变红。
+     「…不得继续调用 apt-get install」**两条**必须变红。
+     ⚠️ 这两条要求 **F4-15 已修** —— 修之前第二条恒绿（mock 写的是空文件），
+     变异后只可能红 1 条。
 7. **计划文件实施者一个字都不许改** —— 计划修订是控制器的职责。
+
+#### 修订轮 3 的逐项发现与处置
+
+> 本节由**控制器**在 Task 4 修订轮 2 实施完成（提交 `3f51e8d`）、控制器独立复核之后写入。
+> 修订轮 2 的代码块本身是对的 —— 本节修的是**验收标准**与**一条恒真断言**。
+
+| # | 级别 | 发现 | 处置 |
+|---|---|---|---|
+| F4-15 | **Important** | Step 1 里 `ensure_packages` 那组的 mock 写的是 `tui_run() { : >"$called_file"; return 0; }` —— `: >file` **只创建空文件**（size 0），而判定用的是 `[[ -s "$called_file" ]]`（size > 0）→ 空文件恒为假 → 「ensure_packages 在 apt update 失败时**不得继续调用 apt-get install**」这条断言**永远绿、永远不可能变红**。这不是「实现有 bug」——实现是对的（`apt_update_once || return 1` 确实中止了）——而是**这条断言没有判别力** | mock 改成 `printf called >"$called_file"`（写 1 字节）。控制器与实施者**各自独立**实证：修之前把 `ensure_packages` 变异成 `|| true` 只红 1 条，修之后红 2 条 |
+| F4-16 | **Important** | 修订轮 2 的验收标准第 6 条第 1 小项写的是「删掉 `tr -d '[:space:]'` → 「detect_public_ip 输出正确的公网 IPv4」必须变红」。**这条是错的**：命令替换 `$(...)` 本身就会剥掉尾部的 `\n`，所以对 mock `printf '1.2.3.4\n'` 而言 `tr` 没有作用 → 删掉 `tr` 后那条断言**仍然绿**。真正变红的是「detect_public_ip **会剥掉响应里的空白与换行**」—— `tr` 承重的是**尾部空格与 CR** | 验收标准第 6 条第 1 小项改成点名「会剥掉响应里的空白与换行」，并写明「输出正确的公网 IPv4」在删 `tr` 后仍绿的原因 |
+
+> **控制器的自我记账**：修订轮 2 的沙箱预演当时就报出了「ensure_packages 不再中止 → **1 条**」，
+> 而当时的验收标准写的是「**两条**必须变红」—— **这个矛盾当时就在眼前，控制器没有当场拦住**，
+> 把它当成「预演通过」放过去了。实施者本轮独立复现时才发现。
+> 教训：**验收标准里写死的条数必须与预演结果逐条对照**，对不上就是计划缺陷，
+> 不能当成「预演失败就改预演」或「标准写错了但无所谓」。
+
+#### 修订轮 3 的验收标准
+
+1. `lib/core.sh` 与 `test/unit.sh` 里除下面那一行 mock 之外**一字不变**。
+2. `bash test/unit.sh` 全部通过、退出码 0；断言总数仍是 **197**（本机 = Windows + MSYS）、
+   **201**（Debian / CI，以非 root 运行）。报告里必须写明是哪个平台的数字。
+3. 连跑 4 次，条数必须每次都是 197。
+4. 红灯证据：`apt_update_once || return 1` → `|| true` 必须让**两条**断言变红
+   （「ensure_packages 在 apt update 失败时必须返回非零」与
+   「…不得继续调用 apt-get install」）。**这是本轮唯一要证明的事**。
+5. `lib/tui.sh`、`test/lib.sh` **一字未动**。
+6. 计划文件实施者一个字都不许改。
 
 #### 修订轮 1 的验收标准
 
