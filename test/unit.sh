@@ -2739,4 +2739,338 @@ else
 fi
 rm -rf "$T10_TMP"
 
+# ── Task 11：卸载脚本（全部 mock：不碰系统目录、不动防火墙，不停真服务）──
+# ⚠️ 本段【不写任何会整块跳过的条件块】：外部依赖一律用 shell 函数 mock。
+# ⚠️ 共享 mock 集合里【不许】出现与被测对象同名的函数
+#    （被测对象是 uninstall.sh 里的那些函数，一个都不许出现在共享集合里）。
+#
+# ⚠️ uninstall.sh 必须【可被 source 而不执行 main】——
+#    否则单元测试只能测参数解析，主流程（停服务 / 备份 / 删配置 / 撤防火墙）
+#    一条都测不到；而 main 里的 root 检查在非 root 机器上会直接 exit。
+#    所以测试用 `UNINSTALL_SH_NO_MAIN=1` + `source` 的方式引入，
+#    再逐个函数用 mock 驱动。
+#
+# ⚠️ mock 的「调用记录」必须走【日志文件】，不能走 stdout：
+#    实现里有几处刻意丢弃外部命令的输出（systemctl >/dev/null 2>&1、
+#    ufw delete >/dev/null 2>&1）—— 那正是这些命令「成功了但没话说」的正常表现。
+#    用 stdout 当记录通道会有两个问题：
+#      ① 「命令被调用过」和「命令自己的输出」混在一起，分不清；
+#      ② 凡是实现里带了 >/dev/null 的，记录被吞掉 → 断言根本无从观察。
+#    记录走日志文件后，「命令被调用过」（calls）与「给用户看的提示」（out）
+#    是两条互相独立的通道。
+
+T11_TMP=$(mktemp -d 2>/dev/null)
+T11_LOG=''
+T11_STATE_DIR="${T11_TMP}/state"
+T11_STATE_FILE="${T11_STATE_DIR}/deploy.env"
+T11_CONFIG="${T11_TMP}/config.json"
+T11_OUT_DIR="${T11_TMP}/out"
+T11_SYSCTL_CONF="${T11_TMP}/bbr.conf"
+
+# 共享 mock 集合：卸载流程依赖的【所有】外部动作换成会记日志的假实现。
+# ⚠️ cp / rm / mkdir 【不 mock】—— 它们的操作目标全在 $T11_TMP 临时目录里，
+#    用真命令跑更真实（还能验证「文件真的被删了」而不只是「调用了 rm」）。
+#    只有需要模拟「备份失败 / 删除失败 / 目录建不出来」的那三个用例里
+#    才临时覆盖对应的命令。
+t11_mocks() {
+  cat <<'MOCKS'
+have_cmd() { case "$1" in ufw|iptables|nft) return 1 ;; *) return 0 ;; esac; }
+systemctl() { printf 'MOCK_SYSTEMCTL %s\n' "$*" >> "$T11_LOG"; return 0; }
+ufw() { case "$1" in status) printf 'Status: inactive\n' ;; *) printf 'MOCK_UFW %s\n' "$*" >> "$T11_LOG" ;; esac; return 0; }
+iptables() { case "$1" in -C) return 1 ;; *) printf 'MOCK_IPTABLES %s\n' "$*" >> "$T11_LOG" ;; esac; return 0; }
+nft() { case "$1" in -a) printf 'table inet filter {\n chain input {\n }\n}\n' ;; *) printf 'MOCK_NFT %s\n' "$*" >> "$T11_LOG" ;; esac; return 0; }
+sysctl() { printf 'MOCK_SYSCTL %s\n' "$*" >> "$T11_LOG"; return 0; }
+tui_confirm() { printf 'MOCK_CONFIRM %s\n' "$*" >> "$T11_LOG"; return 0; }
+tui_panel() { printf 'MOCK_PANEL %s\n' "$*" >> "$T11_LOG"; return 0; }
+tui_banner() { printf 'MOCK_BANNER\n' >> "$T11_LOG"; return 0; }
+tui_init() { printf 'MOCK_TUI_INIT\n' >> "$T11_LOG"; return 0; }
+MOCKS
+}
+
+# 把 uninstall.sh 引进来但不跑 main，并装好全套 mock。
+# ⚠️ 必须【直接调用】t11_load，绝不能写成 `eval "$(t11_load)"`：
+#    `$(...)` 会在【子 shell】里执行 t11_load → 里面 source 进来的被测函数与
+#    eval 出来的 mock 全部随子 shell 一起消失 → 被测函数根本不存在，
+#    每次调用都是 "command not found"（rc=127）；而断言大多只看输出文本，
+#    就会得到一堆【看似失败、实则根本没测到】的红。
+t11_load() {
+  export UNINSTALL_SH_NO_MAIN=1
+  export STATE_DIR="$T11_STATE_DIR"
+  export STATE_FILE="$T11_STATE_FILE"
+  export XRAY_CONFIG="$T11_CONFIG"
+  export OUT_DIR="$T11_OUT_DIR"
+  # sysctl 调优文件必须指到临时目录：remove_tuning 会真的 rm 掉它，
+  # 用默认路径会【真的删掉这台机器上的 /etc/sysctl.d/99-vless-reality-bbr.conf】。
+  export VLESS_REALITY_SYSCTL_CONF="$T11_SYSCTL_CONF"
+  # 这几个文件必须【真的存在】：
+  #   ① $XRAY_CONFIG —— 被测代码用 [[ -f ]] 判断「配置在不在」，
+  #      文件不存在就直接跳过整段备份逻辑 → 备份分支一条都走不到；
+  #   ② $STATE_FILE —— 同理，revoke_firewall 用它判断「有没有部署过」；
+  #   ③ $VLESS_REALITY_SYSCTL_CONF —— 用来验证 remove_tuning 真的删掉了它。
+  # 状态文件里写一个端口：让 revoke_firewall 走得到防火墙分支。
+  mkdir -p "$STATE_DIR" "$OUT_DIR"
+  printf "PORT='443'\n" > "$STATE_FILE"
+  : > "$XRAY_CONFIG"
+  : > "$VLESS_REALITY_SYSCTL_CONF"
+  # shellcheck source=/dev/null
+  source "$ROOT/uninstall.sh"
+  eval "$(t11_mocks)"
+}
+
+if [[ -n "$T11_TMP" ]]; then
+  T11_LOG="${T11_TMP}/calls.log"
+  : > "$T11_LOG"
+
+  test_case "uninstall：参数解析"
+
+  # 未知参数 → 非零退出 + 明确提示
+  out=$(bash "$ROOT/uninstall.sh" --not-a-flag 2>&1); rc=$?
+  assert_status 1 "$rc" "uninstall 未知参数以非零码退出"
+  assert_contains "$out" "未知" "uninstall 未知参数给出提示"
+
+  # --help → 0 退出，且帮助里说清 --purge 与「用 bash 调用」
+  out=$(bash "$ROOT/uninstall.sh" --help 2>&1); rc=$?
+  assert_status 0 "$rc" "uninstall --help 退出码为 0"
+  assert_contains "$out" "purge" "uninstall 帮助含 --purge"
+  assert_contains "$out" "bash uninstall.sh" "uninstall 帮助用 bash 调用（不依赖执行位）"
+
+  test_case "uninstall：root 检查与可 source 性"
+
+  # ⚠️ EUID 是 bash 的【只读】变量 → 本机无法注入 root 身份 →
+  #    「非 root 时返回非零」这条断言在本机与 Debian 上的结果【相反】，
+  #    写进单元测试就会让条数随平台漂移 → 只做源码级断言。
+  src=$(cat "$ROOT/uninstall.sh")
+  assert_contains "$src" "EUID" "uninstall.sh 用 EUID 判定 root 身份"
+  assert_contains "$src" "需要 root 权限" "uninstall.sh 在非 root 时给出明确提示"
+  assert_contains "$src" "UNINSTALL_SH_NO_MAIN" "uninstall.sh 有「被 source 时不跑 main」的开关"
+  assert_contains "$src" "BASH_SOURCE[0]" "uninstall.sh 用 BASH_SOURCE 守卫主流程"
+
+  test_case "uninstall：备份与删除配置"
+
+  # 备份失败 → 必须中止，且【绝不】删除原配置（这是本脚本最关键的安全性质）
+  : > "$T11_LOG"
+  out=$( ( t11_load
+           cp() { return 1; }
+           backup_and_remove_config ) 2>&1 ); rc=$?
+  assert_status 1 "$rc" "backup_and_remove_config 在备份失败时返回非零"
+  assert_contains "$out" "备份配置失败" "备份失败时给出明确提示"
+  assert_contains "$out" "未删除原配置" "备份失败时明确说明原配置未被删除"
+  if [[ -f "$T11_CONFIG" ]]; then rc=0; else rc=1; fi
+  assert_true "$rc" "备份失败时原配置文件仍在（绝没有被删）"
+
+  # 备份目录建不出来 → 同样必须中止，且不删原配置
+  : > "$T11_LOG"
+  out=$( ( t11_load
+           mkdir() { return 1; }
+           backup_and_remove_config ) 2>&1 ); rc=$?
+  assert_status 1 "$rc" "backup_and_remove_config 在备份目录建不出来时返回非零"
+  assert_contains "$out" "无法创建备份目录" "备份目录建不出来时给出明确提示"
+  if [[ -f "$T11_CONFIG" ]]; then rc=0; else rc=1; fi
+  assert_true "$rc" "备份目录建不出来时原配置文件仍在"
+
+  # 备份成功 → 删配置 + 报告备份路径
+  : > "$T11_LOG"
+  out=$( ( t11_load
+           backup_and_remove_config ) 2>&1 ); rc=$?
+  assert_status 0 "$rc" "backup_and_remove_config 在备份成功时返回 0"
+  assert_contains "$out" "配置已备份并移除" "备份成功时给出明确提示"
+  missing=1
+  for f in "$T11_OUT_DIR"/backup/config.json.*; do
+    [[ -e "$f" ]] && missing=0
+  done
+  assert_true "$missing" "备份成功时备份文件真的生成了"
+  if [[ ! -f "$T11_CONFIG" ]]; then rc=0; else rc=1; fi
+  assert_true "$rc" "备份成功时原配置真的被删除了"
+
+  # 删配置失败 → 必须报错（备份已在，但不能悄悄说成功）
+  : > "$T11_LOG"
+  out=$( ( t11_load
+           rm() { return 1; }
+           backup_and_remove_config ) 2>&1 ); rc=$?
+  assert_status 1 "$rc" "backup_and_remove_config 在删除原配置失败时返回非零"
+  assert_contains "$out" "原配置删除失败" "删除原配置失败时给出明确提示"
+  missing=1
+  for f in "$T11_OUT_DIR"/backup/config.json.*; do
+    [[ -e "$f" ]] && missing=0
+  done
+  assert_true "$missing" "删除原配置失败时备份文件已经存在（没有回滚丢失）"
+
+  test_case "uninstall：撤销防火墙规则"
+
+  # ufw 处于 active → 必须删规则
+  : > "$T11_LOG"
+  out=$( ( t11_load
+           have_cmd() { case "$1" in ufw) return 0 ;; iptables|nft) return 1 ;; *) return 0 ;; esac; }
+           ufw() { case "$1" in status) printf 'Status: active\n' ;; *) printf 'MOCK_UFW %s\n' "$*" >> "$T11_LOG" ;; esac; return 0; }
+           load_state() { PORT=443; return 0; }
+           revoke_firewall ) 2>&1 ); rc=$?
+  calls=$(cat "$T11_LOG")
+  assert_status 0 "$rc" "revoke_firewall 在 ufw 分支正常返回 0"
+  assert_contains "$out" "已撤销 ufw 规则 443/tcp" "revoke_firewall 如实报告撤销了 ufw 规则"
+  assert_contains "$calls" "MOCK_UFW delete allow 443/tcp" "revoke_firewall 真的调用了 ufw delete allow"
+
+  # ufw 存在但没激活 → 不删 ufw 规则
+  : > "$T11_LOG"
+  out=$( ( t11_load
+           have_cmd() { case "$1" in ufw) return 0 ;; iptables|nft) return 1 ;; *) return 0 ;; esac; }
+           ufw() { case "$1" in status) printf 'Status: inactive\n' ;; *) printf 'MOCK_UFW %s\n' "$*" >> "$T11_LOG" ;; esac; return 0; }
+           load_state() { PORT=443; return 0; }
+           revoke_firewall ) 2>&1 ); rc=$?
+  calls=$(cat "$T11_LOG")
+  assert_status 0 "$rc" "revoke_firewall 在 ufw 未激活时正常返回 0"
+  assert_not_contains "$calls" "MOCK_UFW delete" "ufw 未激活时不删 ufw 规则"
+
+  # iptables 分支：必须【数一数】真删了几条，不能只说「已撤销」
+  : > "$T11_LOG"
+  out=$( ( t11_load
+           have_cmd() { case "$1" in iptables) return 0 ;; ufw|nft) return 1 ;; *) return 0 ;; esac; }
+           IPT_C=0
+           iptables() { case "$1" in
+               -C) IPT_C=$((IPT_C+1)); [[ $IPT_C -le 2 ]] && return 0; return 1 ;;
+               -D) printf 'MOCK_IPTABLES %s\n' "$*" >> "$T11_LOG"; return 0 ;;
+               *) return 0 ;; esac; }
+           load_state() { PORT=443; return 0; }
+           revoke_firewall ) 2>&1 ); rc=$?
+  calls=$(cat "$T11_LOG")
+  assert_status 0 "$rc" "revoke_firewall 在 iptables 分支正常返回 0"
+  assert_contains "$out" "已撤销 iptables 规则 443/tcp" "revoke_firewall 如实报告撤销了 iptables 规则"
+  assert_contains "$out" "2 条" "revoke_firewall 如实报告撤销的条数"
+  assert_contains "$calls" "MOCK_IPTABLES -D INPUT" "revoke_firewall 真的调用了 iptables -D"
+
+  # iptables 分支一条都没有 → 不能谎报「已撤销」
+  : > "$T11_LOG"
+  out=$( ( t11_load
+           have_cmd() { case "$1" in iptables) return 0 ;; ufw|nft) return 1 ;; *) return 0 ;; esac; }
+           iptables() { case "$1" in -C) return 1 ;; *) return 0 ;; esac; }
+           load_state() { PORT=443; return 0; }
+           revoke_firewall ) 2>&1 ); rc=$?
+  assert_status 0 "$rc" "revoke_firewall 在没有 iptables 规则时正常返回 0"
+  assert_contains "$out" "未找到 iptables 规则" "没有 iptables 规则时如实说明未找到"
+
+  # nft 分支：必须用【handle】而不是行号
+  : > "$T11_LOG"
+  out=$( ( t11_load
+           have_cmd() { case "$1" in nft) return 0 ;; ufw|iptables) return 1 ;; *) return 0 ;; esac; }
+           nft() { case "$1" in
+               -a) printf 'table inet filter {\n chain input {\n  tcp dport 443 accept # handle 7\n }\n}\n' ;;
+               *) printf 'MOCK_NFT %s\n' "$*" >> "$T11_LOG" ;; esac; return 0; }
+           load_state() { PORT=443; return 0; }
+           revoke_firewall ) 2>&1 ); rc=$?
+  calls=$(cat "$T11_LOG")
+  assert_status 0 "$rc" "revoke_firewall 在 nft 分支正常返回 0"
+  assert_contains "$out" "handle 7" "revoke_firewall 用 nft 的 handle（不是行号）删除规则"
+  assert_contains "$calls" "MOCK_NFT delete rule inet filter input handle 7" "revoke_firewall 按 handle 删除 nft 规则"
+
+  # 状态文件读不到 → 必须提示，且【不碰】防火墙
+  : > "$T11_LOG"
+  out=$( ( t11_load
+           load_state() { return 1; }
+           revoke_firewall ) 2>&1 ); rc=$?
+  calls=$(cat "$T11_LOG")
+  assert_status 0 "$rc" "revoke_firewall 在状态文件读不到时正常返回 0"
+  assert_contains "$out" "状态文件读取失败" "状态文件读不到时给出明确提示"
+  assert_not_contains "$calls" "MOCK_UFW" "状态文件读不到时不碰防火墙"
+
+  # 端口未知（状态文件里没有端口）→ 跳过防火墙，且说明原因
+  : > "$T11_LOG"
+  out=$( ( t11_load
+           load_state() { PORT=''; return 0; }
+           revoke_firewall ) 2>&1 ); rc=$?
+  calls=$(cat "$T11_LOG")
+  assert_status 0 "$rc" "revoke_firewall 在端口未知时正常返回 0"
+  assert_contains "$out" "未能确定监听端口" "端口未知时如实说明跳过了防火墙撤销"
+  assert_not_contains "$calls" "MOCK_UFW" "端口未知时不碰 ufw"
+
+  test_case "uninstall：网络调优与状态清理"
+
+  # sysctl 文件路径必须与 enable_bbr 用的是同一个变量
+  : > "$T11_LOG"
+  out=$( ( t11_load
+           remove_tuning ) 2>&1 ); rc=$?
+  calls=$(cat "$T11_LOG")
+  assert_status 0 "$rc" "remove_tuning 正常返回 0"
+  if [[ ! -f "$T11_SYSCTL_CONF" ]]; then rc=0; else rc=1; fi
+  assert_true "$rc" "remove_tuning 真的删掉了 sysctl 调优文件"
+  assert_contains "$calls" "MOCK_SYSCTL --system" "remove_tuning 重载了 sysctl"
+
+  # --purge → 删状态文件
+  : > "$T11_LOG"
+  out=$( ( t11_load
+           PURGE=1
+           clean_state ) 2>&1 ); rc=$?
+  assert_status 0 "$rc" "clean_state 在 --purge 下正常返回 0"
+  assert_contains "$out" "已删除状态文件" "clean_state 在 --purge 下给出明确提示"
+  if [[ ! -f "$T11_STATE_FILE" ]]; then rc=0; else rc=1; fi
+  assert_true "$rc" "clean_state 在 --purge 下真的删掉了状态文件"
+
+  # 不加 --purge → 保留状态文件
+  : > "$T11_LOG"
+  out=$( ( t11_load
+           PURGE=0
+           clean_state ) 2>&1 ); rc=$?
+  assert_status 0 "$rc" "clean_state 在默认模式下正常返回 0"
+  assert_contains "$out" "保留状态文件" "clean_state 在默认模式下说明状态文件被保留"
+  if [[ -f "$T11_STATE_FILE" ]]; then rc=0; else rc=1; fi
+  assert_true "$rc" "不加 --purge 时状态文件仍在"
+
+  test_case "uninstall：主流程与卸载前确认"
+
+  # 用户不确认 → 必须取消，且【一步都不许做】
+  : > "$T11_LOG"
+  out=$( ( t11_load
+           require_root() { return 0; }
+           tui_confirm() { printf 'MOCK_CONFIRM %s\n' "$*" >> "$T11_LOG"; return 1; }
+           ASSUME_YES=0
+           main ) 2>&1 ); rc=$?
+  calls=$(cat "$T11_LOG")
+  assert_status 0 "$rc" "用户在卸载前取消时退出码为 0"
+  assert_contains "$out" "已取消" "用户取消时给出明确提示"
+  assert_not_contains "$calls" "MOCK_SYSTEMCTL" "用户取消时不停止服务"
+  if [[ -f "$T11_CONFIG" ]]; then rc=0; else rc=1; fi
+  assert_true "$rc" "用户取消时不删除服务端配置"
+  if [[ -f "$T11_STATE_FILE" ]]; then rc=0; else rc=1; fi
+  assert_true "$rc" "用户取消时不删除状态文件"
+
+  # --yes → 走完整流程
+  : > "$T11_LOG"
+  out=$( ( t11_load
+           require_root() { return 0; }
+           ASSUME_YES=1
+           main ) 2>&1 ); rc=$?
+  calls=$(cat "$T11_LOG")
+  assert_status 0 "$rc" "main 在 --yes 下返回 0"
+  assert_contains "$calls" "MOCK_SYSTEMCTL disable --now xray" "main 停用了 xray 服务"
+  assert_contains "$out" "卸载完成" "main 结束时打印卸载完成"
+
+  # --yes + --purge → 状态文件也被删
+  : > "$T11_LOG"
+  out=$( ( t11_load
+           require_root() { return 0; }
+           ASSUME_YES=1
+           PURGE=1
+           main ) 2>&1 ); rc=$?
+  assert_status 0 "$rc" "main 在 --yes --purge 下返回 0"
+  assert_contains "$out" "已删除状态文件" "main 在 --purge 下删除了状态文件"
+  if [[ ! -f "$T11_STATE_FILE" ]]; then rc=0; else rc=1; fi
+  assert_true "$rc" "main 在 --purge 下真的删掉了状态文件"
+
+  test_case "uninstall：可执行位（定点修订）"
+
+  # ⚠️ 仓库里所有 .sh 的提交模式都是 100644（core.fileMode=false）→
+  #    新克隆的仓库里 uninstall.sh 【不可执行】→ 用 -x 判定会永远判成「没有」，
+  #    卸载入口就是死的。必须用 -f 判定 + `bash` 显式执行。
+  inst=$(cat "$ROOT/install.sh")
+  assert_not_contains "$inst" 'if [[ -x "$ROOT_DIR/uninstall.sh" ]]' "install.sh 不再用 -x 判定 uninstall.sh"
+  assert_contains "$inst" 'exec bash "$ROOT_DIR/uninstall.sh"' "install.sh 用 bash 显式执行 uninstall.sh（不依赖执行位）"
+  dep=$(cat "$ROOT/lib/deploy.sh")
+  assert_not_contains "$dep" 'if [[ ! -x "$ROOT_DIR/uninstall.sh" ]]' "menu_uninstall 不再用 -x 判定 uninstall.sh"
+  assert_contains "$dep" 'exec bash "$ROOT_DIR/uninstall.sh"' "menu_uninstall 用 bash 显式执行 uninstall.sh（不依赖执行位）"
+
+else
+  assert_eq "mktemp -d 能创建唯一临时目录" "失败（mktemp -d 返回空路径）" \
+    "Task 11 用例前提：mktemp -d 必须能创建唯一临时目录"
+fi
+rm -rf "$T11_TMP"
+
+
 test_summary

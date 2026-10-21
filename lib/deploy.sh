@@ -891,12 +891,15 @@ menu_rotate_keys() {
 
 menu_uninstall() {
   # 单文件分发版（dist/install.sh）里没有 uninstall.sh → exec 会失败并让菜单崩掉。
-  if [[ ! -x "$ROOT_DIR/uninstall.sh" ]]; then
+  # 用 -f 判定而不是 -x：仓库里所有 .sh 的提交模式都是 100644（core.fileMode=false），
+  # 新克隆的仓库里 uninstall.sh 【不可执行】→ -x 永远判成「没有」→ 卸载入口是死的。
+  # 用 `exec bash` 显式执行 → 完全不依赖执行位。
+  if [[ ! -f "$ROOT_DIR/uninstall.sh" ]]; then
     tui_warn "当前目录没有 uninstall.sh（单文件分发版不含卸载脚本）。"
     tui_tip "请手动执行：systemctl disable --now xray && rm -f $XRAY_CONFIG"
     return 1
   fi
-  exec "$ROOT_DIR/uninstall.sh"
+  exec bash "$ROOT_DIR/uninstall.sh"
 }
 
 management_menu() {

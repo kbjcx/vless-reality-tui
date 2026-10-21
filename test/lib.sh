@@ -60,3 +60,20 @@ test_summary() {
   printf '  \033[31m失败 %d 项\033[0m（通过 %d 项）\n' "$TEST_FAIL" "$TEST_PASS"
   return 1
 }
+
+# 「不包含子串」断言：Task 11 用来证明「某些危险动作【没有】发生」
+# （例如备份失败时绝不删除原配置、用户取消时绝不碰服务与文件）。
+# 必须与 assert_contains 成对存在：只断言「包含」区分不了
+# 「根本没做」与「做了但输出被吞了」—— 而这正是卸载脚本最需要分清的两件事。
+assert_not_contains() {
+  local haystack="$1" needle="$2" msg="${3:-不包含子串}"
+  if [[ "$haystack" != *"$needle"* ]]; then
+    TEST_PASS=$((TEST_PASS + 1))
+    printf '    \033[32m✔\033[0m %s\n' "$msg"
+  else
+    TEST_FAIL=$((TEST_FAIL + 1))
+    printf '    \033[31m✘\033[0m %s\n' "$msg"
+    printf '        期望不包含: %s\n' "$needle"
+    printf '        实际: %s\n' "$haystack"
+  fi
+}
