@@ -2554,6 +2554,95 @@ git commit -m "feat(core): 网络探测——公网 IP、端口占用、TLS1.3 �
 6. `lib/tui.sh`、`test/lib.sh`、`lib/core.sh` **一字未动**。
 7. 计划文件实施者一个字都不许改。
 
+#### 修订轮 2 的逐项发现与处置
+
+> 本节由**控制器**在 Task 5 实施完成后的**独立复评**之后写入。
+> 复评结论：**FAIL** —— 10 条实施缺陷 + 4 条计划缺陷。
+> 责任方：**实施缺陷**归实施者（本轮重新实施修掉）；**计划缺陷**归控制器（本节处置）。
+>
+> 复评报告：`.superpowers/sdd/2026-10-21-vless-reality-deploy/task-5-review.md`
+> 复评用的唯一真相版本 = 提交 `28aa7d4`（实施 `1c0f995` + 计划修正 `28aa7d4`）。
+
+**实施缺陷（4 条实现层 + 6 条测试零判别力）**
+
+| # | 级别 | 发现 | 处置 |
+|---|---|---|---|
+| **D1** | **Important** | `xray_test_config` 留下的是**最后一次**尝试的 stderr，而那次恰是最不可能被支持的写法 → 在只认 `run -test -c` 的版本上，用户看到的是 `unknown flag: -test` / `unknown command`，**而不是**真实的 `failed to parse config: …`。**计划 T5-7 声称已修复的目标根本没有达成** —— T5-7 写的是「把**最后一次**尝试的 stderr 留在 `XRAY_TEST_ERR` 里」，但「最后一次」恰恰是最误导的那一次 | Step 3 新增 `xray_err_is_unsupported` 判定函数，把失败分成两类：①「这个写法不被支持」（unknown flag / unknown command / …）②「配置本身有问题」。三种写法依次尝试，**遇到第一个 ② 就立刻用它**；三种都是 ① 才退回第一次的报错 |
+| **D2** | Minor | 目标路径是**已存在的目录**时，`mv -f "$tmp" "$outfile"` 会把文件**移进目录里**而不是替换目标 → `mv` 返回 0（看起来成功）但配置**根本没落位**（`render_server_config` 与 `write_config_atomic` 两处都有） | Step 3 两处都加 `[[ -d "$outfile" ]]` 前置守卫 → `tui_err` + 返回 1 + 不落盘；Step 1 补 2 组断言 |
+| **D3** | Minor | `cp` 失败分支不清理**半截的** `.new`（cp 可能已写出一部分内容）→ 下一次写配置的校验会去校验一份残缺文件 | Step 3 的 `cp` 失败分支加 `rm -f "$tmp"`；Step 1 补断言（mock `cp` 先写半截文件再返回 1） |
+| **D4** | Minor | xray 的报错被加了 6 个空格的缩进（`sed 's/^/      /'`），与全局约束「不通过则保留旧配置并**原样输出** xray 报错」的字面要求不一致 | Step 3 改成**原样输出**，不加缩进 |
+| **TG1** | Minor | `xray_parse_keys` 的 `key=value` 分支**零覆盖** → 控制器变异实测：把该分支删掉，0 条红 | Step 1 补 `PrivateKey=…` / `Password=…` 的解析断言 |
+| **TG2** | Minor | `gen_keys` 的 `random_hex` 失败分支**不可区分**：去掉 `SHORT_ID=$(random_hex 4) || {…}` 这道检查后，random_hex 返回非零但**有输出**时 SHORT_ID 非空 → 第二道检查也放行 → 函数返回 0 → 两条断言仍然全绿 | Step 1 补 3 条：mock random_hex「返回非零但有输出」→ 必须返回非零且提示「生成 ShortID 失败」；「返回零但输出为空」→ 提示「ShortID 为空」。**判据是错误提示的文本**，两条提示必须能分开 |
+| **TG3** | Minor | `chmod` 早于 `mv`（计划 T5-6 的修复）**零覆盖** → 变异实测：把 chmod 挪回 mv 之后，0 条红 | Step 1 补断言：mock `chmod` 失败 → 必须返回非零**且目标文件没被动过** |
+| **TG4** | Minor | `.render` / `.new` 暂存名分离（计划 T5-10 的修复）**零覆盖** → 变异实测：把 `.render` 改回 `.new`，0 条红 | Step 1 mock `mv` 记录它的**源参数**，分别断言 render 用 `.render`、write 用 `.new` |
+| **TG5** | Minor | 服务端配置 `chmod 600`（全局约束：含 REALITY 私钥）**零覆盖** → 变异实测：删掉那行，0 条红 | Step 1 mock `chmod` 记录参数，断言出现过 `chmod 600 <最终配置路径>`。**必须整行精确匹配**（临时文件那次的参数是 `600 <目标>.new`，它**包含** `600 <目标>` → 子串匹配会误判成通过）。**不**断言文件权限位 —— MSYS 的 chmod 是模拟的，权限位在本机不可达 |
+| **TG6** | Minor | 失败时输出 xray 原始报错（计划 T5-7 的修复）**零覆盖** → 这正是 D1 长期未被发现的原因 | Step 1 补断言：必须输出「配置本身有问题」那条，且**不得**出现 `unknown flag` / `unknown command` |
+
+**计划缺陷（4 条，责任方是控制器）**
+
+| # | 级别 | 发现 | 处置 |
+|---|---|---|---|
+| **P1** | **Important** | T5-7 的处置与它自己陈述的目标**自相矛盾**：目标是「消除只认 `-c` 的版本上的误导性报错」，而处置写的是「保留**最后一次**尝试的 stderr」—— 最后一次恰恰是最误导的那一次 | 见 D1 的处置：改成「挑出最有信息量的那条」 |
+| **P2** | Important | 验收标准第 5 条的 8 条红灯**漏掉了 5 处「计划自己声称已修复」的行为**（T5-6 / T5-7 / T5-10 + chmod 600 + 原样输出） | 见下方「修订轮 2 的验收标准」：红灯清单扩到 14 条 |
+| **P3** | Minor | `Interfaces` 段没有定义「目标路径不是普通文件」时的契约 | 见 D2：契约写进 Step 3 的函数注释 —— 目标路径是目录 → 报错 + 不落盘 |
+| **P4** | Minor | 全局约束第 33 行「原样输出」与 Step 3 块的缩进实现不一致 | 见 D4：改**代码**（原样输出），不改约束 —— 约束的字面要求就是权威 |
+
+> **控制器的自我记账（第 3 条）**：这一轮里，复评**自己**也踩了一个坑 ——
+> 它把「Task 6 的 Step 1 块里有一处 `assert_false "$out" "$needle" "$msg"`」漏掉了。
+> 控制器后来独立核对 `test/lib.sh` 的真实签名才发现：
+> `assert_false "$1" "$msg"` 的语义是「**退出码非 0**」，**根本没有**「子串不存在」这个语义；
+> 那个三参用法把 needle 当成了描述 → **恒真**。
+> 教训：**断言辅助函数的签名必须回 `test/lib.sh` 核对**，不能凭名字猜。
+
+#### 修订轮 2 的验收标准
+
+1. `lib/deploy.sh` 的内容与上面 **Step 3 代码块逐字节一致**。
+2. `test/unit.sh` 里 Task 5 的插入段与上面 **Step 1 代码块逐字节一致**
+   （追加在 `test_summary` **之前**；`source "$ROOT/lib/deploy.sh"` 放在顶部 source 区域）。
+3. `bash test/unit.sh` 全部通过、退出码 0。
+4. 断言总数必须恒定，且**连跑 4 次条数相同**。
+   平台差异：本机（Windows + MSYS）与 Debian/CI 的条数差 **4 条** ——
+   4 条权限相关行为断言在 MSYS 上被自动跳过（`chmod` 是模拟的）。
+   报告里必须写明是哪个平台的数字。
+   **预期条数**：本机 **259**、Debian/CI **263**（修订轮 1 的 239 / 243 + 本轮新增 20 条）。
+5. 红灯证据（**14 条**，每条都要贴出**变红的断言原文**）：
+   - 把 `xray_parse_keys` 的 `key=value` 分支删掉
+     → 「解析 key=value 写法（PrivateKey/Password）」必须变红；
+   - 把 `gen_keys` 里 `SHORT_ID=$(random_hex 4) || {…}` 的退出码检查去掉
+     → 「gen_keys 在 random_hex 返回非零（即使它有输出）时返回非零」必须变红；
+   - 把 `xray_test_config` 改回「只留最后一次尝试的 stderr」
+     → 「write_config_atomic 必须输出 xray 的真实报错（而不是『写法不被支持』那类）」必须变红；
+   - 把 `xray_test_config` 里 `xray_err_is_unsupported` 的判定去掉（永远当 ①）
+     → 同上一条必须变红；
+   - 把 `write_config_atomic` 的 `[[ -d "$outfile" ]]` 守卫删掉
+     → 「write_config_atomic 在目标路径是目录时返回非零」必须变红；
+   - 把 `render_server_config` 的 `[[ -d "$outfile" ]]` 守卫删掉
+     → 「render_server_config 在目标路径是目录时返回非零」必须变红；
+   - 把 `write_config_atomic` 的 `cp` 失败分支里的 `rm -f "$tmp"` 删掉
+     → 「write_config_atomic 在 cp 失败时清理半截的临时文件」必须变红；
+   - 把 `write_config_atomic` 里的 `chmod 600 "$outfile"` 删掉
+     → 「write_config_atomic 必须对最终配置文件执行 chmod 600（含 REALITY 私钥）」必须变红；
+   - 把 `write_config_atomic` 里的 `chmod 600 "$tmp"` 挪到 `mv` 之后
+     → 「write_config_atomic 在 chmod 失败时不得落位（chmod 必须早于 mv）」必须变红；
+   - 把 `render_server_config` 的暂存名 `.render` 改回 `.new`
+     → 「render_server_config 的暂存名必须是 .render（不得与 write 的 .new 撞名）」必须变红；
+   - 把 `write_config_atomic` 的暂存名 `.new` 改成 `.render`
+     → 「write_config_atomic 的暂存名必须是 .new」必须变红；
+   - 把 `write_config_atomic` 里输出 xray 报错时的 `sed -e 's/^/      /'` 加回去
+     → 必须有断言变红。⚠️ **这条要特别小心**：D4 的修复是「原样输出」，
+       判据不能写成「输出里没有 6 个空格」（xray 自己的报错也可能带缩进）。
+       判据只能是**别的**东西 —— 若实在找不到能区分的判据，
+       **如实报告「这条红灯证据拿不出来」**，不要硬凑一个恒绿的断言。
+   - 把 `write_config_atomic` 里输出 xray 报错的那段整个删掉
+     → 「write_config_atomic 必须输出 xray 的真实报错」必须变红；
+   - 把 `gen_keys` 里 `[[ "$UUID" =~ … ]]` 的格式校验删掉
+     → 「gen_keys 在 xray uuid 输出的不是合法 UUID 时返回非零」必须变红。
+   ⚠️ **点名的断言必须与预演结果里【实际变红的那一条】逐字对上**，不能只看「红了几条」。
+   ⚠️ 「正向断言（期望码 0）」在把函数换成 `return 0` 时**不会变红** ——
+   真正变红的是它的**反向断言**（Task 4 的 F4-16、Task 5 的 T5-12 已经各犯过一次）。
+6. `lib/tui.sh`、`test/lib.sh`、`lib/core.sh` **一字未动**。
+7. 计划文件实施者一个字都不许改。
+
 **Step 1: 写失败的测试**
 
 追加到 `test/unit.sh`（`source "$ROOT/lib/deploy.sh"` 一行放在**顶部 source 区域**，见 Task 3 的约定）：
@@ -2570,6 +2659,12 @@ assert_eq "aaaBBB111ccc|dddEEE222fff" "$out" "解析旧版 Private/Public key �
 out=$(xray_parse_keys "PrivateKey: xxxYYY222zzz
 Password: wwwVVV333uuu")
 assert_eq "xxxYYY222zzz|wwwVVV333uuu" "$out" "解析新版 PrivateKey/Password 格式"
+
+# key=value 写法：有的版本输出的是 "PrivateKey=xxx" 而非 "PrivateKey: xxx"。
+# 这条分支此前【一条断言都没有】—— 控制器变异实测：把该分支删掉，0 条红。
+out=$(xray_parse_keys "PrivateKey=aaaBBB111ccc
+Password=dddEEE222fff")
+assert_eq "aaaBBB111ccc|dddEEE222fff" "$out" "解析 key=value 写法（PrivateKey/Password）"
 
 # 单行、带多余空白的脏输出
 out=$(xray_parse_keys "  Private key :   qqq444   ")
@@ -2638,6 +2733,12 @@ else
   rc=0
   render_server_config "$cfg.inj5" "11111111-2222-3333-4444-555555555555" '$(echo PWNED)' "www.microsoft.com" "443" "a1b2c3d4" >/dev/null 2>&1 || rc=$?
   assert_status 1 "$rc" "render_server_config 拒绝含命令替换的私钥"
+  # ── D2：目标路径是【已存在的目录】时必须报错，不得把配置移进目录里 ──────────────
+  mkdir -p "$cfg.dir"
+  out=$(render_server_config "$cfg.dir" "11111111-2222-3333-4444-555555555555" "$PRIVKEY" "www.microsoft.com" "443" "a1b2c3d4" 2>&1); rc=$?
+  assert_status 1 "$rc" "render_server_config 在目标路径是目录时返回非零"
+  assert_contains "$out" "目录" "render_server_config 在目标路径是目录时给出明确提示"
+  rm -rf "$cfg.dir"
   rm -f "$cfg" "$cfg.inj" "$cfg.inj2" "$cfg.inj3" "$cfg.inj4" "$cfg.inj5"
 
   # 目标目录不存在时，cat 的重定向会失败 —— 必须返回非零并给出【我们自己的】提示
@@ -2715,6 +2816,17 @@ assert_status 1 "$rc" "gen_keys 在 random_hex 失败时返回非零"
 out=$( ( XRAY_BIN=xray; FAKE_XRAY_MODE=ok; random_hex() { printf ''; return 0; }; gen_keys ) 2>&1 ); rc=$?
 assert_status 1 "$rc" "gen_keys 在 random_hex 输出空串时返回非零"
 
+# 上面两条断言【区分不了】random_hex 的两种失败：去掉 `SHORT_ID=$(random_hex 4) || {...}`
+# 这道检查后，random_hex 返回非零但【有输出】时 SHORT_ID 非空 → 第二道检查也放行
+# → 函数返回 0 → 那两条断言仍然全绿（控制器变异实测：0 条红）。
+# 判据必须是【错误提示的文本】：返回非零的那条报「生成 ShortID 失败」，
+# 返回零但输出为空的那条报「生成的 ShortID 为空」—— 两者的提示必须能分开。
+out=$( ( XRAY_BIN=xray; FAKE_XRAY_MODE=ok; random_hex() { printf 'deadbeef'; return 1; }; gen_keys ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "gen_keys 在 random_hex 返回非零（即使它有输出）时返回非零"
+assert_contains "$out" "生成 ShortID 失败" "gen_keys 在 random_hex 返回非零时提示『生成 ShortID 失败』"
+out=$( ( XRAY_BIN=xray; FAKE_XRAY_MODE=ok; random_hex() { printf ''; return 0; }; gen_keys ) 2>&1 ); rc=$?
+assert_contains "$out" "ShortID 为空" "gen_keys 在 random_hex 输出空串时提示『ShortID 为空』"
+
 # ── xray_test_config：四种子命令写法都要认 ──────────────
 out=$( ( XRAY_BIN=xray; FAKE_XRAY_MODE=cfg; xray_test_config "/tmp/whatever.json" ) 2>&1 ); rc=$?
 assert_status 0 "$rc" "xray_test_config 识别 run -test -config 写法"
@@ -2760,6 +2872,100 @@ if [[ -n "$atomic_dir" ]]; then
   # 源文件不存在时【不得碰目标文件】—— 上面那条只查退出码，
   # 若实现写成「先覆盖目标再校验」，退出码仍可能对，但正式配置已经被毁了。
   assert_eq "OLD-CONTENT" "$(cat "$atarget")" "write_config_atomic 在源文件不存在时不得覆盖目标文件"
+
+  # ── TG3：chmod 必须【早于】mv ──────────────────────────────
+  # 计划 T5-6 的修复（chmod 600 写在 mv 之前）此前【零覆盖】——
+  # 控制器变异实测：把 chmod 挪回 mv 之后，0 条红。
+  # 判据：chmod 失败时【目标文件必须没被动过】。
+  printf 'OLD-CONTENT-2\n' >"$atarget"
+  out=$( ( chmod() { return 1; }; xray_test_config() { return 0; }
+           write_config_atomic "$atarget" "$atomic_dir/src.json" ) 2>&1 ); rc=$?
+  assert_status 1 "$rc" "write_config_atomic 在 chmod 失败时返回非零"
+  assert_eq "OLD-CONTENT-2" "$(cat "$atarget")" "write_config_atomic 在 chmod 失败时不得落位（chmod 必须早于 mv）"
+
+  # ── TG5：服务端配置必须 chmod 600 ──────────────────────────────
+  # 本机（MSYS）的 chmod 是【模拟的】→ 断言文件权限位在本机不可达
+  # → 改断言【传给 chmod 的参数】：chmod 600 <最终配置路径> 必须出现过。
+  # 必须整行精确匹配：临时文件那次的参数是 "600 $atarget.new"，
+  # 它【包含】"600 $atarget" → 用子串匹配会误判成通过。
+  chmod_log="$atomic_dir/chmod.log"
+  : > "$chmod_log"
+  out=$( ( chmod() { printf '%s\n' "$*" >> "$chmod_log"; command chmod "$@"; }
+           xray_test_config() { return 0; }
+           write_config_atomic "$atarget" "$atomic_dir/src.json" ) 2>&1 ); rc=$?
+  assert_status 0 "$rc" "write_config_atomic 在 chmod 可用时正常写入"
+  assert_eq "1" "$(grep -Fxc "600 $atarget" "$chmod_log" 2>/dev/null || printf 0)" \
+    "write_config_atomic 必须对最终配置文件执行 chmod 600（含 REALITY 私钥）"
+
+  # ── TG4：render 与 write 必须用【不同】的暂存名 ──────────────────────────────
+  # 碰撞的后果：render 写的 $outfile.new 会被 write_config_atomic 的 cp 直接覆盖
+  # → 被 xray 校验的从来不是渲染出来的那份配置 → 渲染层的校验形同虚设。
+  # 做法：mock mv 记录它的【源参数】，分别看两个函数各自用的是哪个后缀。
+  mv_log="$atomic_dir/mv.log"
+  : > "$mv_log"
+  out=$( ( mv() { printf '%s\n' "$*" >> "$mv_log"; command mv "$@"; }
+           render_server_config "$atomic_dir/rendered.json" \
+             "11111111-2222-3333-4444-555555555555" \
+             "PRIVKEY0123456789abcdefghijklmnopqrstuvwxyzABCDE" \
+             "www.microsoft.com" "443" "a1b2c3d4" ) 2>&1 ); rc=$?
+  assert_status 0 "$rc" "render_server_config 渲染到指定路径成功"
+  # 用【子串】匹配而不是整行匹配：mv 的调用形状是 `mv -f <src> <dst>`，
+  # mock 记录的是整行参数（"-f <src> <dst>"）→ 整行匹配必然对不上。
+  # 两个断言之间日志是清空过的 → 子串匹配不会互相污染。
+  assert_eq "1" "$(grep -Fc "$atomic_dir/rendered.json.render" "$mv_log" 2>/dev/null || printf 0)" \
+    "render_server_config 的暂存名必须是 .render（不得与 write 的 .new 撞名）"
+  : > "$mv_log"
+  out=$( ( mv() { printf '%s\n' "$*" >> "$mv_log"; command mv "$@"; }
+           xray_test_config() { return 0; }
+           write_config_atomic "$atomic_dir/rendered.json" "$atomic_dir/src.json" ) 2>&1 ); rc=$?
+  assert_eq "1" "$(grep -Fc "$atomic_dir/rendered.json.new" "$mv_log" 2>/dev/null || printf 0)" \
+    "write_config_atomic 的暂存名必须是 .new"
+
+  # ── TG6 + D1：校验失败时必须【原样输出】xray 的真实报错 ──────────────────────────────
+  # 旧实现只保留【最后一次】尝试的报错 → 现代 xray 上最后一次用的是旧语法
+  # → 必然报 "unknown flag: -test" / "unknown command" → 用户看到的是
+  # 完全无关的误导性报错。判据：必须是「配置本身有问题」那条。
+  # 假 xray 必须在【本用例的子 shell 内】定义：前一个用例末尾为了不影响后续用例
+  # 已经 `unset -f xray` 了 —— 在外面定义等于把假 xray 泄漏给后面的用例。
+  # 它模拟「只认 run -test -c 的版本」：第 1 种写法报「写法不被支持」，
+  # 第 2 种写法报【真实原因】，第 3 种（旧语法）报「写法不被支持」。
+  out=$( ( xray() { case "$3" in
+                      -config) printf 'unknown flag: -test\n' >&2; return 1 ;;
+                      -c)      printf 'failed to parse config: invalid json\n' >&2; return 1 ;;
+                      *)       printf 'unknown command\n' >&2; return 1 ;;
+                    esac; }
+           XRAY_BIN=xray
+           write_config_atomic "$atarget" "$atomic_dir/broken.json" ) 2>&1 ); rc=$?
+  assert_status 1 "$rc" "write_config_atomic 在配置校验失败时返回非零"
+  assert_contains "$out" "failed to parse config" \
+    "write_config_atomic 必须输出 xray 的真实报错（而不是『写法不被支持』那类）"
+  # 「原样输出」的判据：xray 的报错必须【整行原样】出现。
+  # 只断言「包含某子串」是不够的 —— 早先的实现给每行加了 6 个空格的前缀，
+  # 子串照样包含 → 那条断言恒绿、钉不住 D4。
+  # 整行精确匹配才能区分「原样」与「加了缩进」。
+  assert_eq "1" "$(printf '%s\n' "$out" | grep -Fxc "failed to parse config: invalid json" 2>/dev/null || printf 0)" \
+    "write_config_atomic 必须【原样】输出 xray 的报错（不得加缩进或改写）"
+  case "$out" in
+    *"unknown flag"*|*"unknown command"*) misled=1 ;;
+    *) misled=0 ;;
+  esac
+  assert_eq "0" "$misled" "write_config_atomic 不得输出『写法不被支持』这类误导性报错"
+
+  # ── D2：目标路径是【已存在的目录】时必须报错 ──────────────────────────────
+  # `mv -f "$tmp" "$outfile"` 在 outfile 是目录时会把文件【移进目录里】
+  # → mv 返回 0（看起来成功）但配置根本没落到 outfile。
+  mkdir -p "$atomic_dir/asdir"
+  out=$( ( xray_test_config() { return 0; }
+           write_config_atomic "$atomic_dir/asdir" "$atomic_dir/src.json" ) 2>&1 ); rc=$?
+  assert_status 1 "$rc" "write_config_atomic 在目标路径是目录时返回非零"
+  assert_contains "$out" "目录" "write_config_atomic 在目标路径是目录时给出明确提示"
+
+  # ── D3：cp 失败必须清理半截的临时文件 ──────────────────────────────
+  out=$( ( cp() { printf 'PARTIAL\n' >"$atarget.new"; return 1; }
+           write_config_atomic "$atarget" "$atomic_dir/src.json" ) 2>&1 ); rc=$?
+  assert_status 1 "$rc" "write_config_atomic 在 cp 失败时返回非零"
+  if [[ -e "$atarget.new" ]]; then leftover=1; else leftover=0; fi
+  assert_eq "0" "$leftover" "write_config_atomic 在 cp 失败时清理半截的临时文件"
 else
   assert_eq "mktemp -d 能创建唯一临时目录" "失败（mktemp -d 返回空路径）" \
     "write_config_atomic 用例前提：mktemp -d 必须能创建唯一临时目录"
@@ -2873,6 +3079,10 @@ render_server_config() {
     || { tui_err "ShortID 格式非法（只允许十六进制，长度 2-16）：$sid"; return 1; }
   validate_hostname "$sni" || { tui_err "SNI 主机名非法：$sni"; return 1; }
 
+  # 目标路径如果是【已存在的目录】：后面的 `mv -f "$tmp" "$outfile"` 会把文件
+  # 【移进目录里】而不是替换目标 → mv 返回 0（看起来成功）但配置根本没落到
+  # outfile → 调用方以为渲染成功，实际拿到的不是配置。必须先挡住。
+  [[ -d "$outfile" ]] && { tui_err "目标路径是目录，不能作为配置文件：$outfile"; return 1; }
   local tmp="$outfile.render"
   # cat 的退出码必须检查：目标目录不存在时，重定向失败会漏出原始 bash 报错，
   # 用户看到的是「No such file or directory」而不是我们自己的提示。
@@ -2974,13 +3184,32 @@ EOF
   mv -f "$tmp" "$outfile" || { tui_err "无法写入配置：$outfile"; rm -f "$tmp"; return 1; }
 }
 
+# 判断一段 xray 报错是不是「这个写法不被支持」而不是「配置本身有问题」。
+# 只认 -c 的旧版本上，`xray run -test -config f` 报 "unknown flag: -test"；
+# 现代版本上 `xray -test -config f` 报同类错 —— 它们只说明【我们试的写法不对】，
+# 对用户毫无价值。用户要看的永远是「配置本身有问题」的那条。
+xray_err_is_unsupported() {
+  case "$1" in
+    *"unknown flag"*|*"flag provided but not defined"*|*"unknown shorthand flag"*|\
+    *"unknown command"*|*"invalid command"*|*"unknown syntax"*|*"unrecognized"*)
+      return 0 ;;
+  esac
+  return 1
+}
+
 # 校验配置可用。兼容不同 xray 版本的子命令写法。
-# 失败时把【最后一次尝试】的 stderr 留在 XRAY_TEST_ERR 里 ——
-# 写配置失败时要把 xray 的原始报错给用户看，而不同版本认的子命令不同，
-# 只打印其中一种写法会给出误导性的报错（比如只认 -c 的版本上会显示 unknown flag）。
+# 失败时把【最有信息量】的 stderr 留在 XRAY_TEST_ERR 里 ——
+# 写配置失败时要把 xray 的原始报错给用户看，而不同版本认的子命令不同。
+# 关键：三种写法依次尝试时必须区分两种失败 ——
+#   ①「这个写法不被支持」（unknown flag / unknown command 等）
+#   ②「配置本身有问题」（failed to parse config: ...）
+# 用户要看的永远是 ②。① 只说明我们试的写法不对。
+# 旧实现只保留【最后一次】尝试的报错 → 现代 xray 上最后一次用的是旧语法
+# → 必然报 "unknown flag: -test" / "unknown command" → 用户看到的是
+# 完全无关的误导性报错（控制器独立复评 D1 实证）。
 XRAY_TEST_ERR=''
 xray_test_config() {
-  local cfg="$1" e=''
+  local cfg="$1" e='' first=''
   XRAY_TEST_ERR=''
   # 注意：stderr 必须用【命令替换】捕获，不能写成 2>"$XRAY_TEST_ERR" ——
   # 变量为空时那是一次「重定向到空文件名」，bash 报的是
@@ -2988,11 +3217,21 @@ xray_test_config() {
   # 而且命令根本没被执行。控制器实测踩过。
   e=$( { "$XRAY_BIN" run -test -config "$cfg" >/dev/null; } 2>&1 )
   if [[ $? -eq 0 ]]; then XRAY_TEST_ERR="$e"; return 0; fi
+  first="$e"
+  # 判定条件是【有内容】且【不是「写法不被支持」】才停在这里：
+  #   · stderr 为空 → 这一种写法没给出任何信息 → 必须继续试下一种，
+  #     否则「只认 -c 的版本」上第 1 种写法失败就直接返回 1 → 后面两种根本没试。
+  #   · stderr 是「写法不被支持」→ 同理，继续试下一种。
+  # 只有「确实有内容、且说的是配置本身有问题」才停 —— 那才是用户要看的。
+  if [[ -n "$e" ]] && ! xray_err_is_unsupported "$e"; then XRAY_TEST_ERR="$e"; return 1; fi
   e=$( { "$XRAY_BIN" run -test -c "$cfg" >/dev/null; } 2>&1 )
   if [[ $? -eq 0 ]]; then XRAY_TEST_ERR="$e"; return 0; fi
+  if [[ -n "$e" ]] && ! xray_err_is_unsupported "$e"; then XRAY_TEST_ERR="$e"; return 1; fi
   e=$( { "$XRAY_BIN" -test -config "$cfg" >/dev/null; } 2>&1 )
   if [[ $? -eq 0 ]]; then XRAY_TEST_ERR="$e"; return 0; fi
-  XRAY_TEST_ERR="$e"
+  if [[ -n "$e" ]] && ! xray_err_is_unsupported "$e"; then XRAY_TEST_ERR="$e"; return 1; fi
+  # 三种写法都不被支持 → 只能给出第一次的报错（至少证明我们试过）
+  XRAY_TEST_ERR="$first"
   return 1
 }
 
@@ -3006,16 +3245,25 @@ write_config_atomic() {
   local outfile="$1" src="$2"
   local tmp="$outfile.new"
   [[ -f "$src" ]] || { tui_err "源配置不存在：$src"; return 1; }
-  cp "$src" "$tmp" || { tui_err "无法写入临时文件：$tmp"; return 1; }
+  # 同 render_server_config：目标路径是【已存在的目录】时，
+  # `mv -f "$tmp" "$outfile"` 会把文件移进目录里 → mv 返回 0（看起来成功）
+  # 但配置根本没落位。必须先挡住。
+  [[ -d "$outfile" ]] && { tui_err "目标路径是目录，不能作为配置文件：$outfile"; return 1; }
+  # cp 失败时必须清理【半截的】临时文件：cp 可能已经写出了一部分内容，
+  # 留着它会让下一次写配置的校验去校验一份残缺文件。
+  cp "$src" "$tmp" || { tui_err "无法写入临时文件：$tmp"; rm -f "$tmp"; return 1; }
   # 服务端配置含 REALITY 私钥 → 权限必须 600（计划里其余含密文件一律 600）。
   # systemd unit 没有 User= → xray 以 root 运行 → 600 不会挡住它读配置。
   chmod 600 "$tmp" || { tui_err "无法设置临时文件权限：$tmp"; rm -f "$tmp"; return 1; }
   if ! xray_test_config "$tmp"; then
     tui_err "配置校验未通过，已保留原有配置不变。"
+    # 全局约束要求【原样输出】xray 的报错 → 这里不加任何缩进/改写。
+    # 早先的实现在这里加了 6 个空格的缩进（sed 's/^/      /'），
+    # 与约束的字面要求不一致（控制器独立复评 D4）。
     if [[ -n "$XRAY_TEST_ERR" ]]; then
-      printf '%s\n' "$XRAY_TEST_ERR" | sed -e 's/^/      /'
+      printf '%s\n' "$XRAY_TEST_ERR"
     else
-      "$XRAY_BIN" run -test -config "$tmp" 2>&1 | sed -e 's/^/      /' || true
+      "$XRAY_BIN" run -test -config "$tmp" 2>&1 || true
     fi
     rm -f "$tmp"
     return 1
