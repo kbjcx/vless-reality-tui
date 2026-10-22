@@ -3144,8 +3144,10 @@ assert_status 0 "$rc" "单文件产物语法正确"
 
 test_case "Task 12：可执行位与用法文案（定点修订）"
 
-# ⚠️ 仓库里所有 .sh 的提交模式曾经是 100644（core.fileMode=false）→
-#    `./install.sh` 会 Permission denied → 用法文案必须写 `sudo bash install.sh`。
+# ⚠️ 用法文案必须写 `sudo bash install.sh`（**不是** `./install.sh`）：
+#    `curl -o` 下载下来的文件**没有执行位** → `./install.sh` 会 Permission denied。
+#    （仓库里的 install.sh 提交模式是 100755，clone 下来就带执行位；
+#      但 `bash install.sh` 两种情况都成立。）
 inst=$(cat "$ROOT/install.sh")
 assert_not_contains "$inst" "sudo ./install.sh" "install.sh 的用法文案不写 sudo ./install.sh"
 assert_contains "$inst" "sudo bash install.sh" "install.sh 的用法文案写 sudo bash install.sh"
