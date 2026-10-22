@@ -28,14 +28,24 @@
   `dist/install.sh`，拷贝到任何 Debian 机器上 `sudo bash install.sh` 即可。
 - **自带测试**：`bash test/unit.sh` 是纯 bash 的单元测试套件，
   `bash test/integration-debian.sh` 在 Debian 容器里跑端到端流程。
+- **界面可预览**：`bash demo.sh` 离线渲染 TUI 的真实效果，不触碰系统任何配置
+  （见[界面预览](#界面预览)）。
 
 ## 快速开始
+
+> 📌 命令里的 `<你的GitHub用户名>/<你的仓库名>` 是**占位符** —— 换成你实际发布到 GitHub 的地址即可。
+> 全部出现位置用**同一个标记**，一条命令就能全部替换：
+>
+> ```bash
+> sed -i -e 's|<你的GitHub用户名>/<你的仓库名>|你的用户名/你的仓库名|g' \
+>        -e 's|<你的仓库名>|你的仓库名|g' README.md
+> ```
 
 ### 方式一：clone 仓库运行
 
 ```bash
-git clone https://github.com/<owner>/<repo>.git
-cd <repo>
+git clone https://github.com/<你的GitHub用户名>/<你的仓库名>.git
+cd <你的仓库名>
 sudo bash install.sh
 ```
 
@@ -44,7 +54,7 @@ sudo bash install.sh
 先下载、再执行，**不用管道**：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/dist/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/<你的GitHub用户名>/<你的仓库名>/main/dist/install.sh -o install.sh
 sudo bash install.sh
 ```
 
@@ -53,11 +63,17 @@ sudo bash install.sh
 > （仓库里的 `install.sh` 提交模式是 `100755`，clone 下来就带执行位；
 > 但 `bash install.sh` 两种情况都成立。）
 
+### 一行命令（最常用）
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/<你的GitHub用户名>/<你的仓库名>/main/dist/install.sh -o install.sh && sudo bash install.sh
+```
+
 ## curl 单文件方式的完整命令
 
 ```bash
 # 1) 下载单文件分发版（dist/install.sh 由 build.sh 生成）
-curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/dist/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/<你的GitHub用户名>/<你的仓库名>/main/dist/install.sh -o install.sh
 
 # 2) 以 root 执行（部署要写 /etc、注册 systemd 服务、放行防火墙端口）
 sudo bash install.sh
@@ -71,9 +87,66 @@ sudo bash install.sh --status
 
 > ⚠️ `dist/install.sh` 是**单文件分发版**，它**不含** `uninstall.sh` ——
 > 卸载请看 [卸载说明](#卸载说明)。
->
-> ⚠️ 把上面的 `<owner>/<repo>` 换成实际仓库地址。
 
+## 界面预览
+
+下面是 `bash demo.sh` 的**真实输出**（原样剥掉 ANSI 颜色码）——
+`demo.sh` **不触碰系统任何配置**，纯离线渲染，可以放心随便跑：
+
+```text
+  ╭────────────────────────────────────────────────────────────────────────────╮
+  │ VLESS + REALITY 部署工具                                                   │
+  │ TUI 界面预览 · 本脚本不会修改系统任何配置                                  │
+  ╰────────────────────────────────────────────────────────────────────────────╯
+
+  ● 区块标题与状态行
+  ────────────────────────────────────────────────────────────────────────────
+  ℹ 这是一条信息提示
+  ✔ 这是一条成功提示
+  ▲ 这是一条警告提示
+  ✖ 这是一条错误提示
+  ▷ 这是一条补充说明
+  ▸ 这是一步进行中的操作
+
+  ● 键值对与结果面板
+  ────────────────────────────────────────────────────────────────────────────
+  服务器地址                                             203.0.113.10
+  监听端口                                               443
+
+  ╭ 示例配置 ──────────────────────────────────────────────────────────────────╮
+  │ 地址               203.0.113.10:443                                        │
+  │ UUID               8f3a1c22-4b6d-4e51-9b2c-7a0e5d3f1c88                    │
+  │ SNI                www.microsoft.com                                       │
+  │ 公钥 pbk           xQ0G2k7F0l3mN8pQ2rS5tU7vW9xY1zA3bC5dE7fG                │
+  ╰────────────────────────────────────────────────────────────────────────────╯
+
+  ● 超宽内容（放不下就不画框，整行输出）
+  ────────────────────────────────────────────────────────────────────────────
+
+  ● 分享链接（示例）
+  ────────────────────────────────────────────────────────────────────────────
+  vless://8f3a1c22-4b6d-4e51-9b2c-7a0e5d3f1c88@203.0.113.10:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=chrome&pbk=xQ0G2k7F0l3mN8pQ2rS5tU7vW9xY1zA3bC5dE7fG&sid=1a2b3c4d&type=tcp#my-node
+
+  ● 菜单（方向键移动 / 数字直选 / Enter 确认 / q 取消）
+  ────────────────────────────────────────────────────────────────────────────
+
+  ● 示例菜单
+  ────────────────────────────────────────────────────────────────────────────
+      1) 部署 VLESS + REALITY 服务
+      2) 查看客户端分享链接
+      3) 重启服务
+      4) 实时日志
+      5) 退出
+  请输入序号 [1-5]: 
+```
+
+两处值得注意的细节：
+
+- **框线宽度恒为 80 列**：每一行的显示宽度都精确等于 `TUI_WIDTH`，
+  框线才合得拢（仓库自带 `tui_dwidth` 按显示宽度算，CJK 记 2 列）。
+- **超宽内容不撑破边框**：真实分享链接有 150+ 字符（上面示例里那条有 225 列），
+  放不进内容框就**整行输出**——终端软换行不影响复制出来的内容。
+  在窄屏上这条会横向滚动，这是**故意**的：要保证复制出来的链接一个字符都不少。
 ## 目录结构
 
 ```
@@ -285,7 +358,9 @@ sudo bash install.sh --menu
 11. **`ss` 的过滤语法未在真实环境验证** —— `ss -ltn "sport = :$port"` 这条过滤语法
     本机没有 `ss`、无法实测；退化分支 `netstat -ltn` 同理。
 
-### 已知风险（已确知、无法在本工具内消除；同样必须【逐条】点名）
+### 已知风险
+
+> 以下是**已确知、无法在本工具内消除**的风险 —— 同样必须**逐条**点名。
 
 12. **以 root 执行 GitHub `main` 分支上的脚本、没有校验和校验** ——
     安装或更新 Xray-core 时，工具会下载
