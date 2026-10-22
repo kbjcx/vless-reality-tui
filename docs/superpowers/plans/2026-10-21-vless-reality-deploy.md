@@ -447,10 +447,10 @@ tui_banner() {
   printf '\n'
   printf '  %s%s%s%s%s\n' "$C_CYAN" "$B_TL" "$(tui_repeat "$B_H" $rw)" "$B_TR" "$C_RESET"
   printf '  %s%s%s %s%s%s %s%s%s\n' "$C_CYAN" "$B_V" "$C_RESET" "$C_BOLD$C_WHITE" \
-    "$(tui_pad "$title" $cw)" "$C_RESET" "$C_CYAN$B_V" "$C_RESET"
+    "$(tui_pad "$title" $cw)" "$C_RESET" "$C_CYAN" "$B_V" "$C_RESET"
   if [[ -n "$subtitle" ]]; then
     printf '  %s%s%s %s%s%s %s%s%s\n' "$C_CYAN" "$B_V" "$C_RESET" "$C_GRAY" \
-      "$(tui_pad "$subtitle" $cw)" "$C_RESET" "$C_CYAN$B_V" "$C_RESET"
+      "$(tui_pad "$subtitle" $cw)" "$C_RESET" "$C_CYAN" "$B_V" "$C_RESET"
   fi
   printf '  %s%s%s%s%s\n' "$C_CYAN" "$B_BL" "$(tui_repeat "$B_H" $rw)" "$B_BR" "$C_RESET"
 }
@@ -479,7 +479,7 @@ tui_box_line() {
   local text="$1" color="${2:-$C_WHITE}" cw
   cw=$(tui_content_width)
   printf '  %s%s%s %s%s%s %s%s%s\n' "$C_ACCENT" "$B_V" "$C_RESET" "$color" \
-    "$(tui_pad "$text" $cw)" "$C_RESET" "$C_ACCENT$B_V" "$C_RESET"
+    "$(tui_pad "$text" $cw)" "$C_RESET" "$C_ACCENT" "$B_V" "$C_RESET"
 }
 
 tui_box_end() {
@@ -779,9 +779,9 @@ tui_run() {
   wait "$pid" || rc=$?
 
   if [[ $rc -eq 0 ]]; then
-    printf '\r  %s%s%s %s%s%s%s\n' "$C_OK" "$I_OK" "$C_RESET" "$C_GRAY" "$msg" "$C_RESET"
+    printf '\r  %s%s%s %s%s%s\n' "$C_OK" "$I_OK" "$C_RESET" "$C_GRAY" "$msg" "$C_RESET"
   else
-    printf '\r  %s%s%s %s%s%s%s\n' "$C_ERR" "$I_ERR" "$C_RESET" "$C_GRAY" "$msg" "$C_RESET"
+    printf '\r  %s%s%s %s%s%s\n' "$C_ERR" "$I_ERR" "$C_RESET" "$C_GRAY" "$msg" "$C_RESET"
     [[ -n "$tmp" && -s "$tmp" ]] && sed -e 's/^/      /' "$tmp"
   fi
   [[ -n "$tmp" ]] && { rm -f "$tmp" 2>/dev/null || true; }
@@ -1133,7 +1133,7 @@ t_state="$t_dir/deploy.env"
 back=$( ( STATE_FILE="$t_state"; REMARK=''; load_state >/dev/null 2>&1; printf '%s' "$REMARK" ) )
 assert_eq '$(touch '"$t_dir"'/pwned)' "$back" "load_state 读回的 REMARK 逐字节一致"
 assert_contains "$(cat "$t_state")" "REMARK='" "状态文件以单引号字面量保存 REMARK"
-[[ -e "$t_dir/pwned" ]]; rc=$?
+if [[ -e "$t_dir/pwned" ]]; then rc=0; else rc=1; fi
 assert_false "$rc" "load_state 不得执行状态文件中的命令替换"
 rm -rf "$t_dir"
 ```
@@ -1948,7 +1948,8 @@ assert_false "$rc" "port_in_use 不得把 :8080 误判成 :80 已占用（按字
 # 且是否触发取决于时序 → 【不能】写成一条依赖时序的运行期断言。
 # 因此用【源码静态断言】锁住实现形状（确定性，权威判据）。
 port_in_use_body="$(awk '/^port_in_use\(\) *\{/,/^\}/' "$ROOT/lib/core.sh")"
-[[ -n "$port_in_use_body" ]]; assert_true "$?" \
+if [[ -n "$port_in_use_body" ]]; then rc=0; else rc=1; fi
+assert_true "$rc" \
   "core.sh 里必须存在 port_in_use 函数（下面那条静态断言的前提）"
 # 检查前必须先去掉整行注释：函数的说明性注释里会写「不能写成 `ss | awk | grep -q`」
 # 这类字样 —— 那是【说明】不是【代码】，不去掉会把自己判成违规（实测踩过）。
@@ -3623,7 +3624,8 @@ rm -rf "$bbr_dir"
 # 真实 `ufw status` 的输出要超过管道缓冲（约 8KB）且是否触发取决于时序
 # → 不能写成依赖时序的运行期断言。权威判据是这条静态断言（与 Task 4 的 F4-1 同款）。
 open_firewall_body="$(awk '/^open_firewall\(\) *\{/,/^\}/' "$ROOT/lib/deploy.sh")"
-[[ -n "$open_firewall_body" ]]; assert_true "$?" \
+if [[ -n "$open_firewall_body" ]]; then rc=0; else rc=1; fi
+assert_true "$rc" \
   "deploy.sh 里必须存在 open_firewall 函数（下面那条静态断言的前提）"
 # 检查前必须先去掉整行注释：函数的说明性注释里会写「不能写成 ufw status | grep -q」
 # 这类字样 —— 那是【说明】不是【代码】，不去掉会把自己判成违规（Task 4 实测踩过）。
@@ -4997,6 +4999,7 @@ bash test/unit.sh
 
 ```bash
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 # install.sh — VLESS + REALITY 一键部署工具（入口）
 #
 # 用法:
@@ -6771,7 +6774,8 @@ rm -rf "$T10_TMP"
 #    —— 预设值会被保留 → 传进来一个假路径就能确定地测「未部署」分支，
 #    不受「这台机器上是不是真的部署过」的影响。
 export STATE_FILE="${T10_STATE_FILE:-/nonexistent/vless-reality-test/deploy.env}"
-export STATE_DIR="$(dirname "$STATE_FILE")"
+STATE_DIR="$(dirname "$STATE_FILE")"
+export STATE_DIR
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck source=lib/tui.sh
@@ -7167,11 +7171,11 @@ if [[ -n "$T11_TMP" ]]; then
            backup_and_remove_config ) 2>&1 ); rc=$?
   assert_status 0 "$rc" "backup_and_remove_config 在备份成功时返回 0"
   assert_contains "$out" "配置已备份并移除" "备份成功时给出明确提示"
-  missing=1
+  backup_missing=1
   for f in "$T11_OUT_DIR"/backup/config.json.*; do
-    [[ -e "$f" ]] && missing=0
+    [[ -e "$f" ]] && backup_missing=0
   done
-  assert_true "$missing" "备份成功时备份文件真的生成了"
+  assert_true "$backup_missing" "备份成功时备份文件真的生成了"
   if [[ ! -f "$T11_CONFIG" ]]; then rc=0; else rc=1; fi
   assert_true "$rc" "备份成功时原配置真的被删除了"
 
@@ -7182,11 +7186,11 @@ if [[ -n "$T11_TMP" ]]; then
            backup_and_remove_config ) 2>&1 ); rc=$?
   assert_status 1 "$rc" "backup_and_remove_config 在删除原配置失败时返回非零"
   assert_contains "$out" "原配置删除失败" "删除原配置失败时给出明确提示"
-  missing=1
+  backup_missing=1
   for f in "$T11_OUT_DIR"/backup/config.json.*; do
-    [[ -e "$f" ]] && missing=0
+    [[ -e "$f" ]] && backup_missing=0
   done
-  assert_true "$missing" "删除原配置失败时备份文件已经存在（没有回滚丢失）"
+  assert_true "$backup_missing" "删除原配置失败时备份文件已经存在（没有回滚丢失）"
 
   test_case "uninstall：撤销防火墙规则"
 
@@ -7467,7 +7471,8 @@ backup_and_remove_config() {
     return 1
   fi
   # 备份名带 PID：同一秒内卸载两次也不会互相覆盖。
-  local backup_file="$OUT_DIR/backup/config.json.$(date +%Y%m%d%H%M%S).$$"
+  local backup_file
+  backup_file="$OUT_DIR/backup/config.json.$(date +%Y%m%d%H%M%S).$$"
   if ! cp -f "$XRAY_CONFIG" "$backup_file"; then
     tui_err "备份配置失败：$XRAY_CONFIG"
     tui_err "为避免丢失配置，未删除原配置。请检查 $OUT_DIR 的剩余空间与权限。"
@@ -7671,7 +7676,7 @@ git commit -m "feat(uninstall): 停止服务、备份配置、撤销防火墙规
 | T11-2 | ~~非缺陷~~ | **「`ufw status \| grep -q` 会因 SIGPIPE 误判」这条怀疑被实测推翻。** `ufw status` 的输出只有几行，一次 write 就进了管道缓冲，producer 先写完退出 → grep -q 命中即退也不会让它收到 SIGPIPE → 管道 rc=0、条件判定为真、**ufw 分支正常进入**。<br>→ **不登记为缺陷。**（但仍改成「先收进变量再匹配」，与本仓库 `open_firewall` 的既定约定一致 —— 那是**风格**问题，不是 bug） | Step 3 顺手改成先收进变量；**不算缺陷，不进验收标准** |
 | **T11-3** | **Important** | **`nft delete rule inet filter input handle "$local_rule"` 里的 `local_rule` 是【行号】不是 nft 的 handle。** 计划用 `grep -n "tcp dport $PORT" \| head -1 \| cut -d: -f1` 取行号 → nft 的 `handle` 是**规则自身的编号**（要用 `nft -a list chain ...` 才能看到）→ 删除会失败或删错规则。另外 `\| head -1` 又是一个**提前退出的管道**（SIGPIPE 风险）。 | Step 3 改用 `nft -a list chain inet filter input` 抓匹配规则里的 `handle N`，再 `nft delete rule inet filter input handle N`；Step 1 补正反两条断言（用的是 handle 7 / 真的按 handle 删），并用变异 **C5** 复现「拿行号冒充 handle」 |
 | **T11-4** | **Important** | **Step 1 只有 4 条断言，只测了参数解析。** 整个卸载流程（停服务 / 备份 / 删配置 / 撤防火墙 / purge / root 检查）**一条断言都没有** —— 而这是全项目**最危险**的脚本（它会删东西）。与 T9-1、T10-1 同款缺陷 | Step 1 重写：4 → **67 条**（源码 68 个 `assert_*` 调用点，其中 1 个在 `mktemp -d` 失败分支的 `else` 里、正常路径不执行）断言，覆盖 8 个函数的全部分支；**全部 mock**（`systemctl` `ufw` `iptables` `nft` `sysctl` `tui_confirm` `tui_panel` `tui_banner` `tui_init` 全部假实现），**一次网络请求都不发、一次防火墙命令都不执行、一次真服务都不停**；`cp` / `rm` / `mkdir` **不 mock** —— 它们的操作目标全在临时目录里，用真命令跑还能验证「文件真的被删了」而不只是「调用了 rm」 |
-| **T11-5** | **Important** | **`uninstall.sh` 不可被 source → 测试在非 root 机器上根本走不到主流程。** `if [[ ${EUID:-$(id -u)} -ne 0 ]]` 在测试机（非 root）上直接 `exit 1`；而 `EUID` 是 bash **只读**变量，**无法注入**。 | Step 3 改成 `main` 函数 + `BASH_SOURCE[0] == $0` 双条件守卫（与 `install.sh` 同一套，Task 8 已定此约定）→ 测试可 source 后逐个函数测；Step 1 补「非 root 时给出明确提示」等 4 条**源码级**断言（`EUID` 是只读变量，「非 root 时返回非零」这条断言在��机与 Debian 上结果相反，写进单元测试就会让条数随平台漂移） |
+| **T11-5** | **Important** | **`uninstall.sh` 不可被 source → 测试在非 root 机器上根本走不到主流程。** `if [[ ${EUID:-$(id -u)} -ne 0 ]]` 在测试机（非 root）上直接 `exit 1`；而 `EUID` 是 bash **只读**变量，**无法注入**。 | Step 3 改成 `main` 函数 + `BASH_SOURCE[0] == $0` 双条件守卫（与 `install.sh` 同一套，Task 8 已定此约定）→ 测试可 source 后逐个函数测；Step 1 补「非 root 时给出明确提示」等 4 条**源码级**断言（`EUID` 是只读变量，「非 root 时返回非零」这条断言在本机与 Debian 上结果相反，写进单元测试就会让条数随平台漂移） |
 | **T11-6** | **Important** | **`[[ -x "$ROOT_DIR/uninstall.sh" ]]` 的可执行位问题 → 卸载入口是死的。** 实测仓库里**所有** `.sh` 都是 **100644**（`core.fileMode=false`）→ **新克隆的仓库里 `uninstall.sh` 不可执行** → `install.sh --uninstall` 与 `menu_uninstall` 都会判定「当前目录没有 uninstall.sh」→ **用户永远卸载不了**。<br>（`menu_uninstall` 那处在 Task 10 的 Step 3 块里 → 属于**跨任务**的定点修订） | 三处一起改：<br>(a) 作为**定点修订 P1**（`install.sh`）与 **P2**（`lib/deploy.sh` 的 `menu_uninstall`）：`-x` 判定改 `-f`，`exec "$ROOT_DIR/uninstall.sh"` 改 `exec bash "$ROOT_DIR/uninstall.sh"`（**不依赖执行位**）；<br>(b) Task 11 提交时 `git update-index --chmod=+x uninstall.sh` → 提交模式变 **100755** → 新克隆就有执行位；<br>(c) README 统一 `sudo bash install.sh`（Task 13） |
 | T11-7 | Minor | **`rm -f /etc/sysctl.d/99-vless-reality-bbr.conf` 硬编码路径**，而 `enable_bbr` 用的是 `${VLESS_REALITY_SYSCTL_CONF:-/etc/sysctl.d/99-vless-reality-bbr.conf}`。默认一致 ✓，但环境变量覆盖后会**漏删** | Step 3 用同一个变量 |
 | T11-8 | Minor | **`sysctl --system` 会重载 `/etc/sysctl.conf` 里的【全部】设置**，而我们只想撤销自己那一条 | 保留（重载自己的文件必须靠它），但在注释里写明「会连带重载 /etc/sysctl.conf 里的其它设置，通常无害」 |
@@ -7923,7 +7928,7 @@ assert_eq "0" "$(grep -c 'source.*lib/' "$dist" 2>/dev/null || true)" \
 # 两条 → 后一条可能把 -u 关掉
 assert_eq "1" "$(grep -c '^set -uo pipefail$' "$dist" 2>/dev/null || true)" \
   "单文件产物里恰好一条 set -uo pipefail"
-# shellcheck 注释也要剥掉（否则产物里留着「这个文件来自 lib/」的误导性注释）
+# 这条 shellcheck 注释也要剥掉（否则产物里留着「这个文件来自 lib/」的误导性注释）
 assert_eq "0" "$(grep -c 'shellcheck source=lib/' "$dist" 2>/dev/null || true)" \
   "单文件产物里没有 shellcheck source 注释"
 # ROOT_DIR 必须由头部定义（install.sh 自己那行被剥掉了）
@@ -7977,7 +7982,8 @@ assert_eq "1" "$(grep -c 'git diff --exit-code' "$ROOT/.github/workflows/ci.yml"
   "CI 用 git diff 判定产物是否脱节"
 assert_eq "1" "$(grep -cE '^[[:space:]]*- name: ShellCheck$' "$ROOT/.github/workflows/ci.yml" 2>/dev/null || true)" \
   "CI 跑 ShellCheck"
-# shellcheck 的豁免要看【disable= 行】，不能看整文件：
+# 这条 shellcheck 的豁免要看【disable= 行】，不能看整文件（行首不能是「# shellcheck」，
+# 否则会被当成 shellcheck 指令解析并报 error）：
 # .shellcheckrc 的注释里就写着 SC1090/SC1091 → 整文件查找恒真。
 assert_eq "1" "$(grep -cE '^disable=.*SC1090' "$ROOT/.shellcheckrc" 2>/dev/null || true)" \
   "shellcheck 豁免运行时 source（SC1090）"
@@ -8055,6 +8061,7 @@ tmp="$OUT.tmp"
 {
   cat <<HEADER
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 # VLESS + REALITY 一键部署工具 —— 单文件分发版
 #
 # 本文件由 build.sh 自动生成，请勿手工编辑。
@@ -8082,6 +8089,7 @@ HEADER
   # install.sh 的入口部分：剥离 shebang、source 行、重复的 set/ROOT_DIR
   printf '\n# ==================== 入口 (install.sh) ====================\n'
   sed -e '1{/^#!/d;}' \
+      -e '/^# SPDX-License-Identifier:/d' \
       -e '/^# shellcheck source=lib\//d' \
       -e '/^source "\$ROOT_DIR\/lib\//d' \
       -e '/^ROOT_DIR=.*BASH_SOURCE/d' \
@@ -9332,6 +9340,26 @@ core.sh ──> tui.sh
 
 ⚠️ **纯计划文本改动**：Step 1 / Step 3 / Step 4 任何代码块**一字未动** → 断言条数仍是 **772**（底座 718 + 本轮 54）；
 ⚠️ 实现**不动**（**不需要实施者**）；已跑过的 **40 条**变异结果**继续有效**（变异目标文件与本轮改动零交集）。
+
+### 修订轮 7：发布元数据 —— MIT 协议、SPDX 标识与仓库地址填实（P13-1 / P13-2 / P13-3）
+
+> 本轮发生在**发布前**：仓库已在 GitHub 上建好（`kbjcx/vless-reality-tui`），
+> 用户在建仓时用 GitHub 模板选定了 **MIT 协议**（`Copyright (c) 2026 kbjcx`）。
+> 本轮把协议落到仓库里，让**单文件分发物**也带上 SPDX 标识，并把 README 里
+> 面向「发布者」的占位符换成**面向读者的真实地址**。
+
+| # | 级别 | 发现 | 处置 |
+|---|---|---|---|
+| **P13-1** | **Minor** | 仓库**没有任何协议声明** —— 无 `LICENSE` 文件、全仓库无一处协议文字。公开仓在这种情况下默认**保留全部权利**，别人连复制一段函数都不敢；GitHub 的 License 检测也会显示 `NOASSERTION`。<br>另一头：`dist/install.sh` 是**会被单独拷走**的产物，脱离仓库后没有任何协议线索 | ① 根目录加 `LICENSE`（MIT 全文，`Copyright (c) 2026 kbjcx`，与 GitHub 建仓时选的一致）；② `install.sh` 顶部加 `# SPDX-License-Identifier: MIT`；③ `build.sh` 的 dist HEADER 加同一行，**并在抽取 install.sh 入口时剥掉那一行** → dist 里 SPDX 只出现一次 |
+| **P13-2** | **Minor** | README 里 4 处 `<你的GitHub用户名>/<你的仓库名>` + 1 处 `cd <你的仓库名>` 是**面向发布者**的占位符。**替换说明本身不能进 README** —— 它会把自己的模式串也替换掉（README 打磨 v2 时已实测：替换后指令变成 `s\|andrew/vless-reality-deploy\|你的用户名/你的仓库名\|g`），发布出去就是坏指令 | ① 占位符**直接填实**为 `kbjcx/vless-reality-tui` / `vless-reality-tui`；② README **不含**任何替换步骤 —— 那属于发布者，不属于读者；③ 补一个 `## 开源协议` 小节，把协议、SPDX 标识、以及「本仓库不含 Xray 内核代码」三件事写清楚；④ H1 改成仓库名 `vless-reality-tui` 并在其下补 Description 一行（与 GitHub 仓库 Description 一致） |
+| **P13-3** | **Minor** | 计划文档的 T11-5 表格行里有 **2 个 U+FFFD 替换字符** —— 是 `822f8d4` 写入时损坏的（字节 `E6 9C AC`「本」被写坏成 2 个替换字符）。这是**发布前**的全仓库扫描抓到的 —— 不修就会被推到公开仓库 | 依据**同一提交内另一处完好**的同源表述（本文件第 7134 行：「这条断言在**本机**与 Debian 上的结果【相反】」）还原为「本」，并把「全仓库 U+FFFD = 0」纳入发布前检查 |
+
+| **P13-4** | **Important** | **CI 的 ShellCheck 步骤会让【第一次推送就红】。** 该步骤此前**从未真实跑过**（开发机没有 shellcheck）。本轮用 shellcheck 0.11.0 按 CI **同款命令**（`find … \| xargs -0 -r shellcheck --severity=warning`，批量形式）跑，抓到 4 类共 14 处问题：<br>① **SC2183 ×5**（`lib/tui.sh`）：printf 格式串比实参多一个 `%s` —— 右边框那组只给了 2 个实参，多出来的 `%s` 拿到空串。**输出本身没错**（多出的 `%s` 打印 0 字符），但格式串与实参个数对不上。<br>② **SC2155 ×2**（`test/helpers/menu_management.sh` / `uninstall.sh`）：声明与赋值写成一句，掩盖了 `dirname` / `date` 的返回码。<br>③ **SC1073/SC1072 ×2**（`test/unit.sh`）：两行以「`# shellcheck`」开头的中文**注释**被当成 shellcheck **指令**解析 → 报 **error**。<br>④ **SC2178/SC2128 ×6**（`test/unit.sh`）：标量 `missing` 与 `lib/core.sh` 的 `ensure_packages()` 里 `local missing=()` **数组同名** → 跨文件分析时类型冲突。<br>⑤ **SC2319 ×3**（`test/unit.sh`）：`[[ … ]]; rc=$?` 紧跟条件取 `$?` | ① 把 `"$C_CYAN$B_V"` 拆成 `"$C_CYAN" "$B_V"`、spinner 完成行删掉多余的 `%s` —— **界面输出逐字节不变**（改前改后 `demo.sh` 输出的 md5 均为 `3b3f632ba0ac6c3cac04564fa2bb4764`）；② 声明与赋值分成两句；③ 改写措辞让行首不再是「`# shellcheck`」；④ 把 `test/unit.sh` 里的标量改名为 `backup_missing`（**不碰** `core.sh` 的数组）；⑤ 改用本文件自有的 `if …; then rc=0; else rc=1; fi` 写法。<br>修完 shellcheck（CI 同款命令）= **rc=0** |
+
+⚠️ **断言条数不变**（仍是 **772**）：本轮**没有新增或删除任何断言** —— README 的断言全是**包含型**
+（无条数判据、无精确小节数判据），所以「加一个小节 / 改标题 / 换占位符」都不破坏判据。
+⚠️ **必须重新构建并提交 `dist/install.sh`**：`build.sh` 的 HEADER 变了。
+⚠️ 本轮**改了实现**（3 个源文件 + 1 个新文件 + 计划文件本身），所以 23 条 README 变异要在新树上**重跑**。
 
 #### 修订轮 1 的验收标准
 

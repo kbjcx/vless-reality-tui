@@ -400,7 +400,7 @@ t_state="$t_dir/deploy.env"
 back=$( ( STATE_FILE="$t_state"; REMARK=''; load_state >/dev/null 2>&1; printf '%s' "$REMARK" ) )
 assert_eq '$(touch '"$t_dir"'/pwned)' "$back" "load_state 读回的 REMARK 逐字节一致"
 assert_contains "$(cat "$t_state")" "REMARK='" "状态文件以单引号字面量保存 REMARK"
-[[ -e "$t_dir/pwned" ]]; rc=$?
+if [[ -e "$t_dir/pwned" ]]; then rc=0; else rc=1; fi
 assert_false "$rc" "load_state 不得执行状态文件中的命令替换"
 
 # 全字段往返：每个字段都必须逐字节一致（含单引号与换行）
@@ -664,7 +664,8 @@ assert_false "$rc" "port_in_use 不得把 :8080 误判成 :80 已占用（按字
 # 且是否触发取决于时序 → 【不能】写成一条依赖时序的运行期断言。
 # 因此用【源码静态断言】锁住实现形状（确定性，权威判据）。
 port_in_use_body="$(awk '/^port_in_use\(\) *\{/,/^\}/' "$ROOT/lib/core.sh")"
-[[ -n "$port_in_use_body" ]]; assert_true "$?" \
+if [[ -n "$port_in_use_body" ]]; then rc=0; else rc=1; fi
+assert_true "$rc" \
   "core.sh 里必须存在 port_in_use 函数（下面那条静态断言的前提）"
 # 检查前必须先去掉整行注释：函数的说明性注释里会写「不能写成 `ss | awk | grep -q`」
 # 这类字样 —— 那是【说明】不是【代码】，不去掉会把自己判成违规（实测踩过）。
@@ -1300,7 +1301,8 @@ rm -rf "$bbr_dir"
 # 真实 `ufw status` 的输出要超过管道缓冲（约 8KB）且是否触发取决于时序
 # → 不能写成依赖时序的运行期断言。权威判据是这条静态断言（与 Task 4 的 F4-1 同款）。
 open_firewall_body="$(awk '/^open_firewall\(\) *\{/,/^\}/' "$ROOT/lib/deploy.sh")"
-[[ -n "$open_firewall_body" ]]; assert_true "$?" \
+if [[ -n "$open_firewall_body" ]]; then rc=0; else rc=1; fi
+assert_true "$rc" \
   "deploy.sh 里必须存在 open_firewall 函数（下面那条静态断言的前提）"
 # 检查前必须先去掉整行注释：函数的说明性注释里会写「不能写成 ufw status | grep -q」
 # 这类字样 —— 那是【说明】不是【代码】，不去掉会把自己判成违规（Task 4 实测踩过）。
@@ -2874,11 +2876,11 @@ if [[ -n "$T11_TMP" ]]; then
            backup_and_remove_config ) 2>&1 ); rc=$?
   assert_status 0 "$rc" "backup_and_remove_config 在备份成功时返回 0"
   assert_contains "$out" "配置已备份并移除" "备份成功时给出明确提示"
-  missing=1
+  backup_missing=1
   for f in "$T11_OUT_DIR"/backup/config.json.*; do
-    [[ -e "$f" ]] && missing=0
+    [[ -e "$f" ]] && backup_missing=0
   done
-  assert_true "$missing" "备份成功时备份文件真的生成了"
+  assert_true "$backup_missing" "备份成功时备份文件真的生成了"
   if [[ ! -f "$T11_CONFIG" ]]; then rc=0; else rc=1; fi
   assert_true "$rc" "备份成功时原配置真的被删除了"
 
@@ -2889,11 +2891,11 @@ if [[ -n "$T11_TMP" ]]; then
            backup_and_remove_config ) 2>&1 ); rc=$?
   assert_status 1 "$rc" "backup_and_remove_config 在删除原配置失败时返回非零"
   assert_contains "$out" "原配置删除失败" "删除原配置失败时给出明确提示"
-  missing=1
+  backup_missing=1
   for f in "$T11_OUT_DIR"/backup/config.json.*; do
-    [[ -e "$f" ]] && missing=0
+    [[ -e "$f" ]] && backup_missing=0
   done
-  assert_true "$missing" "删除原配置失败时备份文件已经存在（没有回滚丢失）"
+  assert_true "$backup_missing" "删除原配置失败时备份文件已经存在（没有回滚丢失）"
 
   test_case "uninstall：撤销防火墙规则"
 
@@ -3116,7 +3118,7 @@ assert_eq "0" "$(grep -c 'source.*lib/' "$dist" 2>/dev/null || true)" \
 # 两条 → 后一条可能把 -u 关掉
 assert_eq "1" "$(grep -c '^set -uo pipefail$' "$dist" 2>/dev/null || true)" \
   "单文件产物里恰好一条 set -uo pipefail"
-# shellcheck 注释也要剥掉（否则产物里留着「这个文件来自 lib/」的误导性注释）
+# 这条 shellcheck 注释也要剥掉（否则产物里留着「这个文件来自 lib/」的误导性注释）
 assert_eq "0" "$(grep -c 'shellcheck source=lib/' "$dist" 2>/dev/null || true)" \
   "单文件产物里没有 shellcheck source 注释"
 # ROOT_DIR 必须由头部定义（install.sh 自己那行被剥掉了）
@@ -3172,7 +3174,8 @@ assert_eq "1" "$(grep -c 'git diff --exit-code' "$ROOT/.github/workflows/ci.yml"
   "CI 用 git diff 判定产物是否脱节"
 assert_eq "1" "$(grep -cE '^[[:space:]]*- name: ShellCheck$' "$ROOT/.github/workflows/ci.yml" 2>/dev/null || true)" \
   "CI 跑 ShellCheck"
-# shellcheck 的豁免要看【disable= 行】，不能看整文件：
+# 这条 shellcheck 的豁免要看【disable= 行】，不能看整文件（行首不能是「# shellcheck」，
+# 否则会被当成 shellcheck 指令解析并报 error）：
 # .shellcheckrc 的注释里就写着 SC1090/SC1091 → 整文件查找恒真。
 assert_eq "1" "$(grep -cE '^disable=.*SC1090' "$ROOT/.shellcheckrc" 2>/dev/null || true)" \
   "shellcheck 豁免运行时 source（SC1090）"

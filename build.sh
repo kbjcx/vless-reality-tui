@@ -35,6 +35,7 @@ tmp="$OUT.tmp"
 {
   cat <<HEADER
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 # VLESS + REALITY 一键部署工具 —— 单文件分发版
 #
 # 本文件由 build.sh 自动生成，请勿手工编辑。
@@ -62,6 +63,7 @@ HEADER
   # install.sh 的入口部分：剥离 shebang、source 行、重复的 set/ROOT_DIR
   printf '\n# ==================== 入口 (install.sh) ====================\n'
   sed -e '1{/^#!/d;}' \
+      -e '/^# SPDX-License-Identifier:/d' \
       -e '/^# shellcheck source=lib\//d' \
       -e '/^source "\$ROOT_DIR\/lib\//d' \
       -e '/^ROOT_DIR=.*BASH_SOURCE/d' \

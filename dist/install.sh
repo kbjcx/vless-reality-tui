@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 # VLESS + REALITY 一键部署工具 —— 单文件分发版
 #
 # 本文件由 build.sh 自动生成，请勿手工编辑。
@@ -206,10 +207,10 @@ tui_banner() {
   printf '\n'
   printf '  %s%s%s%s%s\n' "$C_CYAN" "$B_TL" "$(tui_repeat "$B_H" $rw)" "$B_TR" "$C_RESET"
   printf '  %s%s%s %s%s%s %s%s%s\n' "$C_CYAN" "$B_V" "$C_RESET" "$C_BOLD$C_WHITE" \
-    "$(tui_pad "$title" $cw)" "$C_RESET" "$C_CYAN$B_V" "$C_RESET"
+    "$(tui_pad "$title" $cw)" "$C_RESET" "$C_CYAN" "$B_V" "$C_RESET"
   if [[ -n "$subtitle" ]]; then
     printf '  %s%s%s %s%s%s %s%s%s\n' "$C_CYAN" "$B_V" "$C_RESET" "$C_GRAY" \
-      "$(tui_pad "$subtitle" $cw)" "$C_RESET" "$C_CYAN$B_V" "$C_RESET"
+      "$(tui_pad "$subtitle" $cw)" "$C_RESET" "$C_CYAN" "$B_V" "$C_RESET"
   fi
   printf '  %s%s%s%s%s\n' "$C_CYAN" "$B_BL" "$(tui_repeat "$B_H" $rw)" "$B_BR" "$C_RESET"
 }
@@ -238,7 +239,7 @@ tui_box_line() {
   local text="$1" color="${2:-$C_WHITE}" cw
   cw=$(tui_content_width)
   printf '  %s%s%s %s%s%s %s%s%s\n' "$C_ACCENT" "$B_V" "$C_RESET" "$color" \
-    "$(tui_pad "$text" $cw)" "$C_RESET" "$C_ACCENT$B_V" "$C_RESET"
+    "$(tui_pad "$text" $cw)" "$C_RESET" "$C_ACCENT" "$B_V" "$C_RESET"
 }
 
 tui_box_end() {
@@ -372,9 +373,9 @@ tui_run() {
   wait "$pid" || rc=$?
 
   if [[ $rc -eq 0 ]]; then
-    printf '\r  %s%s%s %s%s%s%s\n' "$C_OK" "$I_OK" "$C_RESET" "$C_GRAY" "$msg" "$C_RESET"
+    printf '\r  %s%s%s %s%s%s\n' "$C_OK" "$I_OK" "$C_RESET" "$C_GRAY" "$msg" "$C_RESET"
   else
-    printf '\r  %s%s%s %s%s%s%s\n' "$C_ERR" "$I_ERR" "$C_RESET" "$C_GRAY" "$msg" "$C_RESET"
+    printf '\r  %s%s%s %s%s%s\n' "$C_ERR" "$I_ERR" "$C_RESET" "$C_GRAY" "$msg" "$C_RESET"
     [[ -n "$tmp" && -s "$tmp" ]] && sed -e 's/^/      /' "$tmp"
   fi
   [[ -n "$tmp" ]] && { rm -f "$tmp" 2>/dev/null || true; }

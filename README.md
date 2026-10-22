@@ -1,4 +1,6 @@
-# VLESS + REALITY 部署工具
+# vless-reality-tui
+
+纯 bash + 零第三方依赖的 VLESS + REALITY 一键部署工具：TUI 向导、事后管理菜单、单文件 install.sh。
 
 一个面向 **Debian** 服务器的 VLESS + REALITY 一键部署工具：交互式向导负责预检、
 生成 REALITY 密钥、写入服务端配置、注册 systemd 服务、放行防火墙端口，
@@ -36,8 +38,8 @@
 ### 方式一：clone 仓库运行
 
 ```bash
-git clone https://github.com/<你的GitHub用户名>/<你的仓库名>.git
-cd <你的仓库名>
+git clone https://github.com/kbjcx/vless-reality-tui.git
+cd vless-reality-tui
 sudo bash install.sh
 ```
 
@@ -46,7 +48,7 @@ sudo bash install.sh
 先下载、再执行，**不用管道**：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<你的GitHub用户名>/<你的仓库名>/main/dist/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/kbjcx/vless-reality-tui/main/dist/install.sh -o install.sh
 sudo bash install.sh
 ```
 
@@ -58,14 +60,14 @@ sudo bash install.sh
 ### 一行命令（最常用）
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<你的GitHub用户名>/<你的仓库名>/main/dist/install.sh -o install.sh && sudo bash install.sh
+curl -fsSL https://raw.githubusercontent.com/kbjcx/vless-reality-tui/main/dist/install.sh -o install.sh && sudo bash install.sh
 ```
 
 ## curl 单文件方式的完整命令
 
 ```bash
 # 1) 下载单文件分发版（dist/install.sh 由 build.sh 生成）
-curl -fsSL https://raw.githubusercontent.com/<你的GitHub用户名>/<你的仓库名>/main/dist/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/kbjcx/vless-reality-tui/main/dist/install.sh -o install.sh
 
 # 2) 以 root 执行（部署要写 /etc、注册 systemd 服务、放行防火墙端口）
 sudo bash install.sh
@@ -143,6 +145,7 @@ sudo bash install.sh --status
 
 ```
 .
+├── LICENSE                       # 开源协议（MIT）
 ├── install.sh                    # 入口：参数解析、预检、调用向导
 ├── uninstall.sh                  # 卸载与清理（带备份）
 ├── build.sh                      # 把 install.sh + lib/ 打成单文件 dist/install.sh
@@ -418,3 +421,15 @@ sudo bash install.sh --uninstall
 
 本工具不包含上游任何代码，只是把「装内核 → 写配置 → 起服务 → 放行端口 →
 导出客户端配置」这条链路脚本化，并在上面加了一层终端界面。
+
+## 开源协议
+
+本项目采用 [MIT 协议](LICENSE) 发布。
+
+- 协议全文见仓库根目录的 [`LICENSE`](LICENSE) 文件。
+- 单文件分发版 `dist/install.sh` 的头部带有 `SPDX-License-Identifier: MIT` 标识 ——
+  那个文件被单独拷走时，协议线索也跟着走。
+- 允许自由使用、复制、修改、合并、再发布与商业使用；唯一的硬性要求是
+  在再发布的副本里保留版权声明与许可声明。
+- 本仓库**不包含** Xray 内核代码 —— 内核由安装脚本从
+  [XTLS/Xray-install](https://github.com/XTLS/Xray-install) 拉取，其版权归上游所有。

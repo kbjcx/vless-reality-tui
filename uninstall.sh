@@ -85,7 +85,8 @@ backup_and_remove_config() {
     return 1
   fi
   # 备份名带 PID：同一秒内卸载两次也不会互相覆盖。
-  local backup_file="$OUT_DIR/backup/config.json.$(date +%Y%m%d%H%M%S).$$"
+  local backup_file
+  backup_file="$OUT_DIR/backup/config.json.$(date +%Y%m%d%H%M%S).$$"
   if ! cp -f "$XRAY_CONFIG" "$backup_file"; then
     tui_err "备份配置失败：$XRAY_CONFIG"
     tui_err "为避免丢失配置，未删除原配置。请检查 $OUT_DIR 的剩余空间与权限。"

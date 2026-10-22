@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 # install.sh — VLESS + REALITY 一键部署工具（入口）
 #
 # 用法:

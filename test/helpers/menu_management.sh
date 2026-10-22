@@ -8,7 +8,8 @@
 #    —— 预设值会被保留 → 传进来一个假路径就能确定地测「未部署」分支，
 #    不受「这台机器上是不是真的部署过」的影响。
 export STATE_FILE="${T10_STATE_FILE:-/nonexistent/vless-reality-test/deploy.env}"
-export STATE_DIR="$(dirname "$STATE_FILE")"
+STATE_DIR="$(dirname "$STATE_FILE")"
+export STATE_DIR
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck source=lib/tui.sh
