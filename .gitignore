@@ -8,3 +8,4 @@ dist/*.new
 
 # SDD 隔离工作区
 .worktrees
+.superpowers
