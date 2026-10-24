@@ -290,6 +290,295 @@ xray_version() {
   "$XRAY_BIN" version 2>/dev/null | head -1 | tr -d '\r'
 }
 
+# ══════════════════════════════════════════════════════════════════════
+# Xray 内核安装（自包含，不依赖上游安装脚本）
+# ══════════════════════════════════════════════════════════════════════
+# 为什么不再用上游 XTLS/Xray-install 的 install-release.sh：
+#   上游的在线安装分支必须访问 api.github.com 拉版本列表，而 api.github.com
+#   【只有 IPv4 地址】。没有公网 IPv4 的机器（IPv6-only，或落在
+#   100.64.0.0/10 这类 CGNAT 网段）必然卡在这一步，报错是
+#   "Failed to get release list, please check your network." —— 这句提示
+#   把人引到「检查网络」的错误方向，而真实结论是「这台机器没有公网 IPv4」。
+#   （本项目实测：IPv6 走 raw.githubusercontent.com 能通，api.github.com 通不了。）
+#
+# 现在的做法：整条链路不依赖上游脚本，也不碰 api.github.com。
+#   ① 架构名 → release 资产名；
+#   ② 资产压缩包多源回退下载（用户镜像 → 直连 → 内置镜像），可走代理；
+#   ③ 用官方 .dgst 做 SHA-256 校验（校验文件优先从直连 GitHub 取）；
+#   ④ 自己解压、自己装二进制、自己建 xray 用户、自己写 systemd unit。
+# 于是「无 IPv4」「有代理」「完全离线（有 zip 就够）」三种环境都能装。
+
+# 上游 release 资产名用的机器名（与 XTLS/Xray-install 的映射保持一致）
+xray_asset_machine() {
+  local m
+  m=$(uname -m 2>/dev/null)
+  case "$m" in
+    x86_64|amd64)    printf '64\n' ;;
+    i386|i686)       printf '32\n' ;;
+    armv5tel)        printf 'arm32-v5\n' ;;
+    armv6l)          if xray_cpu_has_vfp; then printf 'arm32-v6\n'; else printf 'arm32-v5\n'; fi ;;
+    armv7|armv7l)    if xray_cpu_has_vfp; then printf 'arm32-v7a\n'; else printf 'arm32-v5\n'; fi ;;
+    armv8|armv8l|aarch64) printf 'arm64-v8a\n' ;;
+    mips)            printf 'mips32\n' ;;
+    mipsle)          printf 'mips32le\n' ;;
+    mips64)          printf 'mips64\n' ;;
+    mips64le)        printf 'mips64le\n' ;;
+    ppc64)           printf 'ppc64\n' ;;
+    ppc64le)         printf 'ppc64le\n' ;;
+    riscv64)         printf 'riscv64\n' ;;
+    s390x)           printf 's390x\n' ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+
+# ARM 机器是否带 vfp 指令（上游据此把 arm32-v6 / arm32-v7a 降级成 arm32-v5）
+# 先把 Features 行整行收进变量再判断：写成 `grep ... | grep -q` 的话，
+# 后面的 grep -q 命中即退出会给上游 grep 送来 SIGPIPE，管道状态变 141。
+xray_cpu_has_vfp() {
+  local features=''
+  features=$(grep '^Features' /proc/cpuinfo 2>/dev/null || printf '')
+  [[ "$features" == *vfp* ]]
+}
+
+# release 资产地址（latest 版本，不需要预先知道版本号）
+xray_release_asset_url() {
+  printf 'https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-%s.zip' "$1"
+}
+
+# 生成候选下载 URL（每行一个），按优先级排列。
+# $1 = 原始 URL；$2 = 顺序：direct = 直连优先，mirror = 用户镜像优先
+xray_download_candidates() {
+  local url="$1" order="${2:-mirror}" prefix
+  if [[ "$order" == 'direct' ]]; then
+    printf '%s\n' "$url"
+    if [[ -n "$GITHUB_MIRROR" ]]; then
+      printf '%s\n' "${GITHUB_MIRROR%/}/${url}"
+    fi
+  else
+    if [[ -n "$GITHUB_MIRROR" ]]; then
+      printf '%s\n' "${GITHUB_MIRROR%/}/${url}"
+    fi
+    printf '%s\n' "$url"
+  fi
+  for prefix in "${BUILTIN_GITHUB_MIRRORS[@]}"; do
+    printf '%s\n' "${prefix%/}/${url}"
+  done
+  return 0
+}
+
+# 按候选源依次尝试下载；成功返回 0，实际使用的源写进 DOWNLOAD_SOURCE_USED。
+# $1 = URL；$2 = 输出路径；$3 = 顺序（direct|mirror）
+xray_download_to() {
+  local url="$1" out="$2" order="${3:-mirror}" src='' rc=0
+  DOWNLOAD_SOURCE_USED=''
+  while IFS= read -r src; do
+    if [[ -z "$src" ]]; then
+      continue
+    fi
+    if [[ -n "$XRAY_PROXY" ]]; then
+      curl -fsSL --connect-timeout 10 --max-time 900 -x "$XRAY_PROXY" "$src" -o "$out"
+      rc=$?
+    else
+      curl -fsSL --connect-timeout 10 --max-time 900 "$src" -o "$out"
+      rc=$?
+    fi
+    if [[ $rc -eq 0 ]] && [[ -s "$out" ]]; then
+      DOWNLOAD_SOURCE_USED="$src"
+      return 0
+    fi
+    rm -f "$out"
+    tui_warn "下载源不可用（curl rc=$rc）：$src"
+  done < <(xray_download_candidates "$url" "$order")
+  return 1
+}
+
+# 用官方 .dgst 校验安装包。
+# 返回：0 = 校验通过；1 = 校验不通过（必须中止）；2 = 没有可比对的校验文件（只警告）
+xray_verify_sha256() {
+  local zip="$1" url="$2" dgst='' expect='' actual=''
+  if ! have_cmd openssl; then
+    tui_warn "openssl 不可用，跳过安装包 SHA-256 校验。"
+    return 2
+  fi
+  dgst=$(mktemp 2>/dev/null) || return 2
+  if [[ -z "$dgst" ]]; then
+    return 2
+  fi
+  # .dgst 优先从【直连 GitHub】取：镜像站一旦被污染，它给的包与校验文件会一起被改，
+  # 只有直连取到的校验文件才能真正发现篡改；直连取不到再退回同源。
+  if ! xray_download_to "${url}.dgst" "$dgst" 'direct'; then
+    rm -f "$dgst"
+    tui_warn "取不到官方校验文件（.dgst），安装包未经校验。"
+    return 2
+  fi
+  # 官方 .dgst 是 4 行：MD5= / SHA1= / SHA2-256= / SHA2-512=，
+  # 这里只取 SHA2-256 那行（同时兼容单行排布的变体）。
+  expect=$(sed -n 's/.*\(SHA2\{0,1\}-256\|SHA256\)=[^0-9a-fA-F]*\([0-9a-fA-F]\{64\}\).*/\2/p' "$dgst" 2>/dev/null)
+  rm -f "$dgst"
+  if [[ -z "$expect" ]]; then
+    tui_warn "校验文件格式异常，安装包未经校验。"
+    return 2
+  fi
+  actual=$(openssl dgst -sha256 "$zip" 2>/dev/null | awk '{print $NF}')
+  if [[ -z "$actual" ]]; then
+    tui_warn "无法计算安装包 SHA-256，跳过校验。"
+    return 2
+  fi
+  if [[ "$expect" != "$actual" ]]; then
+    tui_err "安装包 SHA-256 校验不通过（期望 $expect，实际 $actual）"
+    return 1
+  fi
+  tui_ok "安装包 SHA-256 校验通过"
+  return 0
+}
+
+# 下载彻底失败时给出的可操作方案（不能只说「请检查网络」）。
+xray_download_hint() {
+  tui_tip "三种绕开方式，任选其一："
+  tui_tip "  1) 走代理：   bash install.sh --proxy http://127.0.0.1:7890"
+  tui_tip "  2) 走镜像：   bash install.sh --mirror https://gh.llkk.cc/"
+  tui_tip "  3) 离线包：   在能上网的机器上下载 Xray-linux-<架构>.zip，"
+  tui_tip "               传到本机后执行 bash install.sh --local /root/Xray-linux-64.zip"
+  tui_tip "常见根因：GitHub 主站与 release 资源只有 IPv4，IPv6-only 或 CGNAT 网段的机器到不了。"
+}
+
+# 建 xray 系统用户（systemd unit 以它运行）
+xray_ensure_user() {
+  if id xray >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! have_cmd groupadd || ! have_cmd useradd; then
+    tui_warn "缺少 groupadd/useradd，无法创建 xray 用户，服务可能起不来。"
+    return 1
+  fi
+  groupadd --system xray 2>/dev/null || true
+  if ! useradd --system --gid xray --no-create-home --home-dir /var/lib/xray \
+        --shell /usr/sbin/nologin xray 2>/dev/null; then
+    tui_warn "创建 xray 用户失败，服务可能起不来。"
+    return 1
+  fi
+  return 0
+}
+
+# 写 systemd unit（自己写，不依赖上游脚本）
+xray_write_service_unit() {
+  local unit="$XRAY_SERVICE_UNIT" tmp=''
+  tmp=$(mktemp 2>/dev/null) || tmp=''
+  if [[ -z "$tmp" ]]; then
+    tui_err "无法创建临时文件，systemd unit 写入中止。"
+    return 1
+  fi
+  # 这里的两个变量都是本项目自己的绝对路径（可被环境变量覆盖），
+  # 不是用户输入，不存在 heredoc 注入问题。
+  cat >"$tmp" <<EOF
+[Unit]
+Description=Xray Service
+Documentation=https://xtls.github.io/
+After=network.target nss-lookup.target
+
+[Service]
+User=xray
+Group=xray
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+NoNewPrivileges=yes
+UMask=0077
+ExecStart=$XRAY_BIN run -config $XRAY_CONFIG
+Restart=on-failure
+RestartPreventExitStatus=23
+LimitNPROC=10000
+LimitNOFILE=1000000
+RuntimeDirectory=xray
+RuntimeDirectoryMode=0755
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  if ! cp -f "$tmp" "$unit"; then
+    rm -f "$tmp"
+    tui_err "无法写入 systemd unit：$unit"
+    return 1
+  fi
+  rm -f "$tmp"
+  chmod 644 "$unit" 2>/dev/null || true
+  # 单元文件刚被换过，systemd 手里还是旧的 → 必须重载，否则 enable/start 用的是旧版本。
+  systemctl daemon-reload 2>/dev/null || true
+  return 0
+}
+
+# 从安装包（zip）安装内核：解压 → 装二进制 → 建用户 → 写 unit → 自检
+# $1 = zip 路径
+xray_install_from_zip() {
+  local zip="$1" workdir='' rc=0
+  if [[ ! -f "$zip" ]] || [[ ! -s "$zip" ]]; then
+    tui_err "安装包不存在或为空：$zip"
+    return 1
+  fi
+  workdir=$(mktemp -d 2>/dev/null) || workdir=''
+  if [[ -z "$workdir" ]]; then
+    tui_err "无法创建临时目录，安装中止。"
+    return 1
+  fi
+  tui_run "解压 Xray 安装包" unzip -o -q "$zip" -d "$workdir"
+  rc=$?
+  if [[ $rc -ne 0 ]] || [[ ! -f "$workdir/xray" ]]; then
+    rm -rf "$workdir"
+    tui_err "解压安装包失败（文件不是有效的 Xray 安装包？）"
+    return 1
+  fi
+  if ! cp -f "$workdir/xray" "$XRAY_BIN"; then
+    rm -rf "$workdir"
+    tui_err "无法安装二进制到 $XRAY_BIN"
+    return 1
+  fi
+  rm -rf "$workdir"
+  chmod 755 "$XRAY_BIN" || { tui_err "无法设置二进制权限：$XRAY_BIN"; return 1; }
+  # 二进制必须真的能跑：架构不匹配时 xray version 会直接失败，
+  # 而那正是「装上了但服务起不来」最常见的原因。
+  if ! "$XRAY_BIN" version >/dev/null 2>&1; then
+    tui_err "安装的 xray 二进制无法执行（架构不匹配？）"
+    return 1
+  fi
+  xray_ensure_user || true
+  xray_write_service_unit || return 1
+  if mkdir -p "$LOG_DIR" 2>/dev/null; then
+    chown xray:xray "$LOG_DIR" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# 下载并校验 release 压缩包；成功后路径写进 XRAY_FETCHED_ZIP，临时目录写进 XRAY_FETCHED_TMPDIR。
+# $1 = 机器名（xray_asset_machine 的输出）
+xray_fetch_release_zip() {
+  local machine="$1" url='' zip='' tmpdir='' rc=0
+  url=$(xray_release_asset_url "$machine")
+  tmpdir=$(mktemp -d 2>/dev/null) || tmpdir=''
+  if [[ -z "$tmpdir" ]]; then
+    tui_err "无法创建临时目录，下载中止。"
+    return 1
+  fi
+  zip="$tmpdir/Xray-linux-$machine.zip"
+  tui_info "下载 Xray 安装包（$machine）…"
+  if ! xray_download_to "$url" "$zip" 'mirror'; then
+    rm -rf "$tmpdir"
+    tui_err "无法下载 Xray 安装包。"
+    xray_download_hint
+    return 1
+  fi
+  tui_ok "安装包下载完成：$DOWNLOAD_SOURCE_USED"
+  xray_verify_sha256 "$zip" "$url"
+  rc=$?
+  if [[ $rc -eq 1 ]]; then
+    rm -rf "$tmpdir"
+    tui_err "安装包校验未通过，已中止。"
+    return 1
+  fi
+  XRAY_FETCHED_ZIP="$zip"
+  XRAY_FETCHED_TMPDIR="$tmpdir"
+  return 0
+}
+
 install_xray() {
   if xray_installed; then
     tui_ok "Xray 已安装：$(xray_version)"
@@ -298,27 +587,28 @@ install_xray() {
   fi
   # 依赖装不上就必须中止：ensure_packages 会透传 apt 的失败码。
   ensure_packages curl ca-certificates || return 1
-  local installer
-  installer=$(mktemp 2>/dev/null)
-  # mktemp 必须有空值守卫：失败时 installer 为空 → curl -o "" 失败，
-  # 报错会指向「网络」而真实原因是 mktemp 不可用。
-  if [[ -z "$installer" ]]; then
-    tui_err "无法创建临时文件，Xray 安装中止。"
+  # unzip 是解压安装包用的。必须【先】装好：否则后面报的是「解压失败」，
+  # 而真实原因是系统里没有 unzip，与网络、与安装包都无关。
+  ensure_packages unzip || { tui_err "缺少 unzip，无法安装 Xray。"; return 1; }
+
+  local machine=''
+  machine=$(xray_asset_machine) || {
+    tui_err "不支持的 CPU 架构：$(uname -m 2>/dev/null || printf '未知')"
     return 1
+  }
+
+  # 路径 A：用户自带离线安装包（完全不联网）
+  if [[ -n "$XRAY_LOCAL_FILE" ]]; then
+    tui_info "使用离线安装包：$XRAY_LOCAL_FILE"
+    xray_install_from_zip "$XRAY_LOCAL_FILE" || return 1
+    tui_ok "Xray 安装完成：$(xray_version)"
+    return 0
   fi
-  if ! curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o "$installer"; then
-    tui_err "下载 Xray 安装脚本失败，请检查网络连通性"
-    rm -f "$installer"
-    return 1
-  fi
-  chmod +x "$installer"
-  tui_run "安装 Xray 内核" bash "$installer" install
-  local rc=$?
-  rm -f "$installer"
-  if [[ $rc -ne 0 ]] || ! xray_installed; then
-    tui_err "Xray 安装失败"
-    return 1
-  fi
+
+  # 路径 B：自己下载 release 压缩包（多源回退 + 代理 + SHA-256 校验）
+  xray_fetch_release_zip "$machine" || return 1
+  xray_install_from_zip "$XRAY_FETCHED_ZIP" || { rm -rf "$XRAY_FETCHED_TMPDIR"; return 1; }
+  rm -rf "$XRAY_FETCHED_TMPDIR"
   tui_ok "Xray 安装完成：$(xray_version)"
   return 0
 }
@@ -820,25 +1110,33 @@ menu_logs() {
 }
 
 menu_update_xray() {
-  # 依赖装不上就必须停在这里：继续往下走会下载安装脚本、失败，
+  # 依赖装不上就必须停在这里：继续往下走会下载安装包、失败，
   # 报出来的却是「下载失败」——错误信息与真实原因无关。
   ensure_packages curl ca-certificates || { tui_err "依赖安装失败，无法更新 Xray。"; return 1; }
-  local installer
-  # mktemp 可能失败（磁盘满 / 目录不可写）→ 拿到空路径后 curl -o "" 会失败，
-  # 而且 rm -f "" 会报 "cannot remove ''"。必须先守卫。
-  installer=$(mktemp 2>/dev/null)
-  if [[ -z "$installer" ]]; then
-    tui_err "无法创建临时文件，更新中止。"
-    return 1
+  ensure_packages unzip || { tui_err "缺少 unzip，无法更新 Xray。"; return 1; }
+  local machine='' old_version='' new_version=''
+  machine=$(xray_asset_machine) || { tui_err "不支持的 CPU 架构。"; return 1; }
+  old_version=$(xray_version)
+
+  # 与首次安装走【同一条下载链】：用户镜像 → 直连 → 内置镜像，可带代理，
+  # 也支持 --local 的离线包。更新不能在网络受限时唯一下载失败。
+  if [[ -n "$XRAY_LOCAL_FILE" ]]; then
+    tui_info "使用离线安装包：$XRAY_LOCAL_FILE"
+    xray_install_from_zip "$XRAY_LOCAL_FILE" || return 1
+  else
+    xray_fetch_release_zip "$machine" || return 1
+    xray_install_from_zip "$XRAY_FETCHED_ZIP" || { rm -rf "$XRAY_FETCHED_TMPDIR"; return 1; }
+    rm -rf "$XRAY_FETCHED_TMPDIR"
   fi
-  curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o "$installer" || {
-    tui_err "下载安装脚本失败"; rm -f "$installer"; return 1; }
-  chmod +x "$installer" || { tui_err "无法设置安装脚本权限"; rm -f "$installer"; return 1; }
-  tui_run "更新 Xray 内核" bash "$installer" install
-  local rc=$?
-  rm -f "$installer"
-  [[ $rc -eq 0 ]] && restart_service
-  return $rc
+
+  new_version=$(xray_version)
+  if [[ -n "$old_version" ]] && [[ "$old_version" == "$new_version" ]]; then
+    tui_ok "Xray 已是最新版本：$new_version"
+    return 0
+  fi
+  tui_ok "Xray 已更新：$old_version → $new_version"
+  restart_service
+  return $?
 }
 
 menu_tune() {

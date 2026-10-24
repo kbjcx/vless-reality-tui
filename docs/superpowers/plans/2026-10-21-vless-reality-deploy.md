@@ -18,13 +18,14 @@
 
 - 纯 bash 4.2+，**零第三方 TUI 依赖**（不装 dialog / whiptail / gum / ncurses）
 - 允许使用的外部命令仅限（**运行时 / 分发物内**，即 `dist/install.sh` 与 `lib/`）：
-  - 基础系统工具（Debian 基础系统自带，coreutils 等）：`awk` `sed` `grep` `tr` `cat` `od` `cut` `head` `sort` `seq` `sleep` `date` `uname` `hostname` `env` `timeout` `id` `sysctl` `dirname` `bash`（`bash` 就是本工具的解释器本身，Task 6 用 `bash "$installer" install` 调官方安装脚本）
+  - 基础系统工具（Debian 基础系统自带，coreutils 等）：`awk` `sed` `grep` `tr` `cat` `od` `cut` `head` `sort` `seq` `sleep` `date` `uname` `hostname` `env` `timeout` `id` `sysctl` `dirname` `bash`
   - 文件与权限：`mktemp` `cp` `mv` `rm` `mkdir` `chmod` `chown`
   - 网络与系统：`curl` `openssl` `systemctl` `journalctl` `ss` `ip`
   - 防火墙（三选一，缺失时只提示不改规则）：`ufw` `iptables` `nft`
   - 包管理：`apt-get`
+  - 内核安装（**修订轮 8** 新增：工具不再调用上游安装脚本，自行完成解压与建用户）：`unzip`（解压 release 压缩包）`groupadd` `useradd`（建 `xray` 系统用户）
   - 可选：`qrencode`（二维码）`python3`（仅 urlencode 回退）`netstat`（仅 `ss` 不可用时的端口探测回退）
-  - 被部署的负载程序：`xray`（由官方 `install-release.sh` 安装，非系统自带，但显然是允许调用的）
+  - 被部署的负载程序：`xray`（本工具自行安装，非系统自带，但显然是允许调用的）
   - **CI / 开发期脚本**（不随分发物发布，可用范围更宽）：`git` `find` `xargs` `diff` `docker` `stat` `wc`
 - `lib/tui.sh` **不得**包含任何业务判断、文件写入或系统调用（例外仅两处：`mktemp`/`sed`/`rm` 用于 `tui_run` 捕获输出，`sleep` 用于 spinner 帧间隔）
 - 状态文件 `/etc/vless-reality/deploy.env` 权限 `600`，状态目录 `700`；客户端导出目录 `/root/vless-reality/` 权限 `700`
@@ -9522,6 +9523,66 @@ core.sh ──> tui.sh
     - **ShellCheck 本机没装** → `.shellcheckrc` 的豁免清单**未经真实 shellcheck 验证**；
     - **真实 `ss` 的端口过滤语法**未实测（本机没有 `ss`）；
     - **GitHub Actions 上的 CI 尚未实际跑过**（仓库还没推到远端）。
+
+### 修订轮 8：受限网络环境的内核安装 —— 去掉对 `api.github.com` 与第三方脚本的依赖（T14-1 / T14-2 / T14-3）
+
+> 本轮由**真机故障**触发：用户在真实的 Debian 13 (trixie) 服务器上跑本工具，
+> 卡在「① 安装 Xray 内核」。控制器 SSH 上那台机器做了逐项实测 ——
+> 根因**不是**代码 bug，而是**网络前提**与**安装方式**两件事叠加。
+>
+> **实测证据（目标机：Debian 13 trixie / x86_64 / 内核 6.12.113+deb13-amd64）**：
+>
+> | 观测项 | 结果 |
+> |---|---|
+> | `ping github.com` | `ping: connect: Network is unreachable` |
+> | `ip -4 route` | **无 default 路由** |
+> | IPv4 地址 | `100.68.106.71/18` —— **RFC 6598 CGNAT，无公网 IPv4** |
+> | IPv6 默认路由 | 经 `fe80::fc00:6ff:feee:6715`，**正常** |
+> | `github.com` 的 AAAA | **空**（`getaddrinfo(AF_INET6)` → `No address associated with hostname`） |
+> | `api.github.com` / `codeload` / `objects` / `release-assets` 的 AAAA | **全部为空** |
+> | `raw.githubusercontent.com` 的 AAAA | `2606:50c0:8000::154`（**原生 IPv6**）→ **直连 200 通** |
+> | `gh-proxy.com` / `ghfast.top` / `ghproxy.cn` 的 AAAA | **全部为空**（IPv4-only）→ 不可达 |
+> | `gh.llkk.cc` 的 AAAA | `2606:4700:3036::6815:4f28`（**原生 IPv6**）→ 脚本与 zip **均 200** |
+> | 上游 `install-release.sh` 的真实报错 | `curl: (7) Failed to connect to api.github.com port 443`<br>`error: Failed to get release list, please check your network.` |
+>
+> **根因（两条，叠加）**：
+> ① **网络前提**：GitHub 的**主站与 release 资源只有 IPv4**；目标机没有公网 IPv4 →
+>    `api.github.com`（上游拉版本列表的地方）**必然不可达**。
+> ② **安装方式**：旧版把「装内核」外包给上游 `install-release.sh`，
+>    而上游的在线分支**必须**访问 `api.github.com` → 失败点被**固化**在
+>    一个本工具既控制不了、也绕不开的外部依赖上。
+>
+> ⚠️ 旧版的报错文案（「请检查网络连通性」）把人引向**错误的排查方向**：
+> 那台机器的网络其实是**通的**（IPv6 通、`deb.debian.org` 通、`raw.githubusercontent.com` 通），
+> 通不过的只是**某一个只有 IPv4 的域名**。
+
+| # | 级别 | 发现 | 处置 |
+|---|---|---|---|
+| **T14-1** | **Critical** | `install_xray` 把内核安装**外包**给上游 `install-release.sh`（`bash "$installer" install`），而上游的在线分支**必须**访问 `api.github.com` → **没有公网 IPv4 的机器 100% 失败**。且旧版会**下载并以 root 执行** `main` 分支上的第三方脚本、**无校验和校验**（计划登记的 **T6-7** / **T10-7** 风险） | ① **彻底移除对上游安装脚本的依赖**：自己下载 release 压缩包 → 校验 SHA-256 → 解压 → 安装二进制 → 创建 `xray` 用户 → 写 systemd unit；② 下载走**多源回退链**（用户镜像 → 直连 → 内置镜像），可走代理，可完全离线；③ 旧的「以 root 执行未校验的第三方脚本」风险**随之消除** |
+| **T14-2** | **Important** | 下载链**没有代理、没有镜像、没有离线**这三条出路；下载彻底失败时只有一句「请检查网络连通性」，用户**无从下手** | ① 新增 `--mirror` / `--proxy` / `--local` 三个 CLI 选项（也可用环境变量 `GITHUB_MIRROR` / `XRAY_PROXY` / `XRAY_LOCAL_FILE`）；② 失败时给出**三条可操作的解法**（代理 / 镜像 / 离线包）与**真实根因**（GitHub 资源只有 IPv4）；③ `preflight` **打印实际走的下载通道** |
+| **T14-3** | **Important** | 下载到的安装包**无完整性校验** —— 镜像站被投毒时无从发现 | 用官方 `.dgst` 里的 SHA-256 校验：`.dgst` **优先从直连 GitHub 取**（直连取不到才退回同源，并**明确提示「未经校验」**）；校验**不通过直接中止**，绝不安装 |
+
+⚠️ **断言条数变了**：本轮新增断言 → **772 → 832**（**+60**）。
+   三个平台仍是**三个数**且**相等**（本轮无平台相关断言、无条件块）。
+⚠️ **必须重新构建并提交 `dist/install.sh`**（`lib/core.sh` 与 `lib/deploy.sh` 都改了）。
+⚠️ 本轮**改了实现**（`lib/core.sh` / `lib/deploy.sh` / `install.sh` / `test/unit.sh` / `README.md`）
+   —— 受影响的变异条目必须在新树上**重跑**。
+
+#### 修订轮 8 的验收标准
+
+1. `bash test/unit.sh` 全部通过、退出码 0，断言总数 **832**，**连跑 4 次条数相同**。
+2. `bash -n` 对全部 `.sh` 通过；**CI 同款** shellcheck 批量命令退出码 **0**。
+3. `bash build.sh` 重新生成 `dist/install.sh`，且与源码**同步**
+   （CI 的 `git diff --exit-code` 必须为 0）。
+4. **真机端到端**：在目标机（Debian 13 trixie / x86_64 / 只有 IPv6）上，
+   直连 GitHub **必须失败**，而 `install_xray` **必须成功**（下载 → SHA-256 校验 →
+   解压 → 安装二进制 → 建 `xray` 用户 → 写 systemd unit）。
+5. README 必须新增「网络受限环境下的安装」小节，并把**验证状态声明**里
+   ①第 10 条改写为「**内核安装已实测、完整部署未实测**」、
+   ②第 12 条风险改写为「安装包的信任链止于官方 `.dgst`」，
+   且**必须保留「校验和」一词**（旧风险虽已消除，但「本项目声明过哪些风险」
+   这件事必须留在文档里）。
+6. 版本号提到 **1.1.0**（行为有实质变化：不再执行第三方脚本 + 三个新 CLI 选项）。
 
 ---
 

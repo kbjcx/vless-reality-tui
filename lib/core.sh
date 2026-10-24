@@ -6,7 +6,7 @@
 # core.sh 不主动 source tui.sh，由 install.sh 统一按 tui → core 的顺序引入。
 
 APP_NAME='VLESS + REALITY 部署工具'
-APP_VERSION='1.0.0'
+APP_VERSION='1.1.0'
 
 LIB_DIR="${LIB_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
 STATE_DIR="${STATE_DIR:-/etc/vless-reality}"
@@ -14,6 +14,7 @@ STATE_FILE="${STATE_FILE:-$STATE_DIR/deploy.env}"
 OUT_DIR="${OUT_DIR:-/root/vless-reality}"
 XRAY_BIN="${XRAY_BIN:-/usr/local/bin/xray}"
 XRAY_CONFIG="${XRAY_CONFIG:-/usr/local/etc/xray/config.json}"
+XRAY_SERVICE_UNIT="${XRAY_SERVICE_UNIT:-/etc/systemd/system/xray.service}"
 LOG_DIR="${LOG_DIR:-/var/log/xray}"
 
 # 全局部署状态：Task 5/7/9 赋值，Task 3 的 save_state 负责持久化。
@@ -27,6 +28,34 @@ PORT="${PORT:-}"; UUID="${UUID:-}"; SNI="${SNI:-}"; TARGET="${TARGET:-}"
 PRIVATE_KEY="${PRIVATE_KEY:-}"; PUBLIC_KEY="${PUBLIC_KEY:-}"; SHORT_ID="${SHORT_ID:-}"
 SERVER_IP="${SERVER_IP:-}"; REMARK="${REMARK:-}"
 MODE="${MODE:-native}"; FLOW="${FLOW:-xtls-rprx-vision}"; FINGERPRINT="${FINGERPRINT:-chrome}"
+
+# ── 受限网络环境的下载参数 ─────────────────────────────────
+# 三个参数都可以用环境变量预设，也可以用命令行覆盖（install.sh --mirror/--proxy/--local）：
+#   GITHUB_MIRROR   镜像前缀（例：https://gh.llkk.cc/），拼在原始 URL 前面
+#   XRAY_PROXY      HTTP/SOCKS5 代理（例：http://127.0.0.1:7890）
+#   XRAY_LOCAL_FILE 本地已有的 Xray 离线安装包（zip）路径
+# 背景：上游 install-release.sh 安装时必须访问 api.github.com 拉版本列表，
+# 而 api.github.com 只有 IPv4 —— 没有公网 IPv4 的机器（IPv6-only / CGNAT 网段）
+# 必然失败（"Failed to get release list, please check your network."）。
+# 这里的做法是【我们自己】把 release 压缩包取回来，再交给上游走纯离线分支。
+GITHUB_MIRROR="${GITHUB_MIRROR:-}"
+XRAY_PROXY="${XRAY_PROXY:-}"
+XRAY_LOCAL_FILE="${XRAY_LOCAL_FILE:-}"
+
+# 下载链的运行期状态：实际用到的源、下载到本地待安装的包、它的临时目录。
+# 必须显式声明：install.sh 跑在 set -u 下，未声明又未赋值就会被当成未绑定变量。
+DOWNLOAD_SOURCE_USED="${DOWNLOAD_SOURCE_USED:-}"
+XRAY_FETCHED_ZIP="${XRAY_FETCHED_ZIP:-}"
+XRAY_FETCHED_TMPDIR="${XRAY_FETCHED_TMPDIR:-}"
+
+# 内置镜像：直连 GitHub 失败时按顺序尝试。
+# 全部是第三方站点，只用于取【安装包】；取到的包会用官方 .dgst 做 SHA-256 校验，
+# 校验文件优先从直连 GitHub 取（镜像同时被污染时不会一起被骗）。
+# 想固定用哪个镜像，用 GITHUB_MIRROR / --mirror 覆盖即可。
+BUILTIN_GITHUB_MIRRORS=(
+  'https://gh.llkk.cc/'
+  'https://gh-proxy.com/'
+)
 
 REALITY_TARGETS=(
   'www.microsoft.com'

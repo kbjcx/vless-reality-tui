@@ -26,6 +26,9 @@
   看实时日志、更新 Xray 内核、网络调优、轮换密钥、卸载。
 - **幂等与可回滚**：状态写入 `/etc/vless-reality/deploy.env`（单一真相），
   重复部署不会留下半成品；卸载前自动备份配置。
+- **网络受限也能装**：GitHub 只有 IPv4、没有公网 IPv4 的机器照样能装 ——
+  支持 `--proxy` 走代理、`--mirror` 走镜像、`--local` 用离线安装包；
+  内核安装包用官方 `.dgst` 做 SHA-256 校验，**不再执行任何第三方脚本**。
 - **可移植的单文件版**：`bash build.sh` 把 `install.sh` 与 `lib/` 打包成一个
   `dist/install.sh`，拷贝到任何 Debian 机器上 `sudo bash install.sh` 即可。
 - **自带测试**：`bash test/unit.sh` 是纯 bash 的单元测试套件，
@@ -187,6 +190,9 @@ sudo bash install.sh [选项]
 | `-n`, `--name <备注>` | 指定分享链接备注 |
 | `--uuid <UUID>` | 指定 UUID（默认自动生成） |
 | `--addr <地址>` | 指定对外地址（NAT 后的服务器用；默认自动探测公网 IP） |
+| `--mirror <前缀>` | GitHub 镜像前缀（例：`https://gh.llkk.cc/`） |
+| `--proxy <地址>` | 下载走 HTTP/SOCKS5 代理（例：`http://127.0.0.1:7890`） |
+| `--local <zip>` | 使用本地已有的 Xray 离线安装包（完全不联网） |
 | `-m`, `--menu` | 直接进入管理菜单 |
 | `--status` | 查看运行状态并退出（只读，不需要 root） |
 | `--uninstall` | 卸载并清理 |
@@ -199,6 +205,73 @@ sudo bash install.sh -y -p 443 -s www.microsoft.com -n my-node
 sudo bash install.sh --status
 sudo bash install.sh --menu
 ```
+
+## 网络受限环境下的安装
+
+Xray 内核要从 GitHub 下载。而 GitHub 的**主站与 release 资源**
+（`github.com`、`api.github.com`、`objects.githubusercontent.com`）**目前都只有 IPv4** ——
+如果你的机器**没有公网 IPv4**（纯 IPv6 的云主机、落在 `100.64.0.0/10` 这类 CGNAT 网段、
+或出站被防火墙挡住），下载必然失败。
+
+本工具为此准备了三条互不依赖的走法，任选其一：
+
+| 场景 | 命令 |
+| --- | --- |
+| 本机有可用代理 | `sudo bash install.sh --proxy http://127.0.0.1:7890` |
+| 想走 GitHub 镜像 | `sudo bash install.sh --mirror https://gh.llkk.cc/` |
+| 机器完全不能上网 | `sudo bash install.sh --local /root/Xray-linux-64.zip` |
+
+### 三条走法分别做了什么
+
+- **代理**（`--proxy`）：所有下载（内核压缩包 + 官方校验文件）都走这个代理。
+  支持 `http://` / `https://` / `socks5://` / `socks5h://` / `socks4://`。
+- **镜像**（`--mirror`）：镜像前缀会拼在原始下载地址前面，
+  例如 `https://gh.llkk.cc/` + `https://github.com/...`。
+  **没指定** `--mirror` 时，工具在直连失败后也会**自动**依次尝试内置镜像。
+- **离线包**（`--local`）：指向一个事先下载好的 `Xray-linux-<架构>.zip`，
+  工具**完全不联网**也能装好内核。
+
+### 架构名对照
+
+离线包的文件名必须与目标机器的架构对得上：
+
+| `uname -m` | 压缩包名 |
+| --- | --- |
+| `x86_64` | `Xray-linux-64.zip` |
+| `aarch64` | `Xray-linux-arm64-v8a.zip` |
+| `armv7l` | `Xray-linux-arm32-v7a.zip` |
+| `i686` | `Xray-linux-32.zip` |
+| `s390x` | `Xray-linux-s390x.zip` |
+
+不确定架构时，在**目标机器**上跑 `uname -m` 即可。
+
+### 安装包的校验
+
+下载到的压缩包会用官方发布的 `.dgst`（内含 SHA-256）校验：
+
+- 校验文件**优先从直连 GitHub 取** —— 镜像站一旦被污染，它给的包和校验文件会一起被改，
+  只有直连取到的校验文件才能发现篡改；
+- 直连取不到时退回同源，并**明确提示「安装包未经校验」**；
+- 校验**不通过时直接中止**，不会把来路不明的二进制装成 root 可执行的文件。
+
+### 内核安装不再执行第三方脚本
+
+从 **v1.1** 起，工具**不再下载并以 root 执行** `XTLS/Xray-install` 的 `install-release.sh`
+（旧版会下载 `main` 分支上的脚本直接跑，且**没有校验和校验** —— 该风险已在本版消除）。
+现在的流程是：自己下载 release 压缩包 → 校验 SHA-256 → 解压 → 安装二进制 →
+创建 `xray` 用户 → 写 systemd unit → 启动服务。全程只跑本仓库自己的代码。
+
+### 只有 IPv6 的服务器注意
+
+如果你的机器**只有 IPv6、没有公网 IPv4**，那么：
+
+- 内核安装照常可以完成（走镜像或离线包）；
+- 但**客户端必须也支持 IPv6** 才能连上这台机器 —— 分享链接里的地址是 IPv6，
+  形如 `vless://uuid@[2001:db8::1]:443?...`（IPv6 在链接里要加方括号）；
+- 此时请用 `--addr` **显式指定**这台机器的 IPv6 地址，例如
+  `sudo bash install.sh --addr 2001:db8::1`。
+  不指定的话，工具可能探测到 `100.64.0.0/10` 这类**内网/CGNAT 地址**，
+  写进分享链接后客户端根本连不上。
 
 ## 部署向导
 
@@ -348,8 +421,12 @@ sudo bash install.sh --menu
 8. **真实 systemd 的启停未验证** —— `systemctl disable --now xray`
    与 `systemctl enable --now xray` 的真实行为没在装了 systemd 的机器上跑过。
 9. **REALITY 握手未验证** —— 部署出来的节点没有与真实客户端握过手。
-10. **`apt-get` 安装 Xray-core 未验证** —— 安装脚本里对 Xray-core 的下载与
-    安装流程没有在真实 Debian 上跑过。
+10. **完整部署流程未在 Debian 真机上端到端跑过** —— 但**内核安装这一步已经实测**：
+    在一台真实的 Debian 13 (trixie) / x86_64 服务器上跑通了「直连 GitHub 失败 →
+    自动回退镜像 → 下载 → SHA-256 校验 → 解压 → 安装二进制 → 建 xray 用户 →
+    写 systemd unit」的完整链路（详见「已验证清单」）。
+    尚未在真机上跑过的是：配置生成与 `xray run -test` 校验、systemd 单元的启停、
+    防火墙放行、分享链接的客户端导入与 REALITY 握手。
 11. **`ss` 的过滤语法未在真实环境验证** —— `ss -ltn "sport = :$port"` 这条过滤语法
     本机没有 `ss`、无法实测；退化分支 `netstat -ltn` 同理。
 
@@ -357,27 +434,36 @@ sudo bash install.sh --menu
 
 > 以下是**已确知、无法在本工具内消除**的风险 —— 同样必须**逐条**点名。
 
-12. **以 root 执行 GitHub `main` 分支上的脚本、没有校验和校验** ——
-    安装或更新 Xray-core 时，工具会下载
-    `https://github.com/XTLS/Xray-install/raw/main/install-release.sh`
-    并**以 root 执行**它。这是 Xray 生态的通行做法，但用的是 **`main` 分支**
-    （内容可变）且**没有完整性校验**。
-    （这是计划里登记的 **T6-7**（Task 6 修订轮）与 **T10-7**（Task 10 修订轮）：
-    保留该行为，但**必须**让用户在自己的机器上看到这一条。）
+12. **安装包的信任链止于官方 `.dgst`** —— 工具会用官方发布的 `.dgst` 里的 SHA-256
+    校验内核压缩包，且校验文件**优先从直连 GitHub 取**；但当直连 GitHub 不可达时
+    （这正是要走镜像/离线的场景），校验文件只能退回**同源**取 ——
+    此时「包」与「校验文件」来自同一个镜像，校验只能发现**传输损坏**，
+    发现不了**镜像被系统性投毒**。
+    需要更强保证时，请用 `--local` 搭配**你自己从官方渠道另行核对过 SHA-256** 的安装包。
+    （旧版「以 root 执行 GitHub `main` 分支上的脚本、**没有校验和校验**」的风险
+    —— 计划里登记的 **T6-7** / **T10-7** —— 已从 **v1.1** 起**消除**：
+    现在**不再下载、也不再以 root 执行任何第三方脚本**。）
 
 ### 已验证清单
 
 - 所有 `.sh` 的 `bash -n` 语法检查通过；
 - `bash test/unit.sh` 单元测试全部通过；
 - 用 `TUI_KEY_TIMEOUT=2` / `TUI_DIGIT_TIMEOUT=2` 放大按键超时后，
-  以 `TUI_TTY=1` + 管道喂按键模拟真终端的 TUI 渲染与交互路径。
+  以 `TUI_TTY=1` + 管道喂按键模拟真终端的 TUI 渲染与交互路径；
+- **真机（Debian 13 trixie / x86_64 / 只有 IPv6、无公网 IPv4）实测**：
+  - 直连 `github.com` 失败（`curl: (7) Could not connect`）；
+  - 新下载链**自动回退**到内置镜像并成功取到 `Xray-linux-64.zip`；
+  - 官方 `.dgst` 的 **SHA-256 校验通过**；
+  - 解压、安装二进制（`/usr/local/bin/xray`，Xray 26.10.21）、创建 `xray` 用户、
+    写入 `/etc/systemd/system/xray.service` —— 全流程 **3 秒**完成。
 
 ### 整体验证边界
 
 **Debian 真机端到端部署尚未在本开发环境验证** —— 开发环境是 Windows + Git Bash，
 没有 Debian、没有 Docker、没有真 TTY。因此以下环节**都没有**在真实目标机上跑过：
-`apt-get` 安装 Xray-core、systemd 单元的启停、防火墙放行（ufw/iptables/nft）、
+配置生成与 `xray run -test` 校验、systemd 单元的启停、防火墙放行（ufw/iptables/nft）、
 REALITY 握手、真实终端下的 TUI 交互与按键响应、`ss` 的端口过滤。
+**内核安装**这一环已单独在真机上实测通过（见上）。
 **已验证**的只有上面「已验证清单」里列出的那几项。
 
 ## 卸载说明
@@ -408,16 +494,16 @@ sudo bash install.sh --uninstall
 > 那种情况下请手动清理：`systemctl disable --now xray` 与删除
 > `/usr/local/etc/xray/config.json`。
 >
-> ⚠️ 卸载**不会**删除 Xray 内核本体 —— 内核是共享依赖，手动删除请用
-> `apt-get remove xray` 或直接删 `/usr/local/bin/xray`。
+> ⚠️ 卸载**不会**删除 Xray 内核本体 —— 内核是共享依赖，手动删除请直接
+> `rm -f /usr/local/bin/xray`（并按需 `systemctl disable xray`）。
 
 ## 致谢与上游项目链接
 
 - [XTLS/Xray-core](https://github.com/XTLS/Xray-core) —— 实际的代理内核，
   本工具只负责把它配置起来。
-- [XTLS/Xray-install](https://github.com/XTLS/Xray-install) —— 内核安装脚本
-  （⚠️ 工具会以 root 执行它 `main` 分支上的版本，**没有校验和校验**，
-  详见 [已知风险](#已知风险) 第 12 条）。
+- [XTLS/Xray-install](https://github.com/XTLS/Xray-install) —— 上游的官方内核安装脚本。
+  本工具**从 v1.1 起不再执行它**（内核的下载、校验、解压、安装全部由本仓库自己的代码完成）；
+  这里保留链接，是说明 systemd 单元与 `xray` 用户的约定沿用了上游的惯例。
 
 本工具不包含上游任何代码，只是把「装内核 → 写配置 → 起服务 → 放行端口 →
 导出客户端配置」这条链路脚本化，并在上面加了一层终端界面。
@@ -431,5 +517,5 @@ sudo bash install.sh --uninstall
   那个文件被单独拷走时，协议线索也跟着走。
 - 允许自由使用、复制、修改、合并、再发布与商业使用；唯一的硬性要求是
   在再发布的副本里保留版权声明与许可声明。
-- 本仓库**不包含** Xray 内核代码 —— 内核由安装脚本从
-  [XTLS/Xray-install](https://github.com/XTLS/Xray-install) 拉取，其版权归上游所有。
+- 本仓库**不包含** Xray 内核代码 —— 内核从
+  [XTLS/Xray-core](https://github.com/XTLS/Xray-core) 的 release 下载，其版权归上游所有。

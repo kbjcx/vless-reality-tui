@@ -434,7 +434,7 @@ fi
 
 test_case "core 常量与文件边界"
 
-assert_eq "1.0.0" "$APP_VERSION" "core.sh 的 APP_VERSION 统一为 1.0.0"
+assert_eq "1.1.0" "$APP_VERSION" "core.sh 的 APP_VERSION 统一为 1.1.0"
 assert_eq "/etc/vless-reality" "$STATE_DIR" "STATE_DIR 默认值"
 assert_eq "/etc/vless-reality/deploy.env" "$STATE_FILE" "STATE_FILE 默认跟随 STATE_DIR"
 assert_eq "/root/vless-reality" "$OUT_DIR" "OUT_DIR 默认值（客户端导出目录）"
@@ -1169,13 +1169,18 @@ out=$( ( XRAY_BIN=/nonexistent/xray; xray_installed() { return 0; }
 assert_status 0 "$rc" "install_xray 在已安装时返回 0"
 assert_contains "$out" "已安装" "install_xray 在已安装时给出提示"
 
-# ── install_xray：下载安装脚本失败必须返回非零（不得谎报已安装）──
+# ── install_xray：下载安装包失败必须返回非零（不得谎报已安装）──
 # ensure_packages 与 curl 都必须 mock：前者会真的调 apt-get，后者会真的联网。
+# 注意：新版 install_xray 不再下载「上游安装脚本」，而是直接取 release 压缩包；
+#      彻底失败时必须给出【可操作】的三条解法，而不是让人去「检查网络」。
 out=$( ( XRAY_BIN=/nonexistent/xray; xray_installed() { return 1; }
          ensure_packages() { return 0; }; curl() { return 22; }
          install_xray 2>&1 ) ); rc=$?
-assert_status 1 "$rc" "install_xray 在下载安装脚本失败时返回非零"
-assert_contains "$out" "下载 Xray 安装脚本失败" "install_xray 下载失败时给出明确提示"
+assert_status 1 "$rc" "install_xray 在下载安装包失败时返回非零"
+assert_contains "$out" "无法下载 Xray 安装包" "install_xray 下载失败时给出明确提示"
+assert_contains "$out" "--proxy" "install_xray 下载失败时提示代理走法"
+assert_contains "$out" "--mirror" "install_xray 下载失败时提示镜像走法"
+assert_contains "$out" "--local" "install_xray 下载失败时提示离线包走法"
 # 注意：assert_false 的语义是「退出码非 0」，【没有】「子串不存在」这个语义。
 # 三参用法会把第 2 个参数当成描述 → 这条断言恒真（控制器核对 test/lib.sh 后发现）。
 # 「子串必须不存在」必须自己判断再断言。
@@ -1347,15 +1352,14 @@ assert_status 1 "$rc" "setup_systemd 在没有 systemctl 时返回非零"
 assert_contains "$out" "systemd 不可用" "setup_systemd 在没有 systemctl 时给出明确提示"
 
 # ── install_xray：下载与安装都成功时必须返回 0 并提示完成 ──────────────
-# xray_installed 的 mock 必须【前一次调用返回「未安装」、后一次返回「已安装」】——
-# install_xray 开头查一次（判断是否已安装），末尾还要再查一次（判断是否装上了）。
-# 用计数器实现，不能用固定返回值。
+# 新版 install_xray 的链路是「取包 → 装包」，两步都得 mock：
+#   xray_fetch_release_zip  取包（会真的联网）
+#   xray_install_from_zip   装包（会真的往 /usr/local/bin 写二进制）
 out=$( ( XRAY_BIN=/nonexistent/xray
-         _calls=0
-         xray_installed() { _calls=$((_calls + 1)); [[ $_calls -ge 2 ]]; }
+         xray_installed() { return 1; }
          ensure_packages() { return 0; }
-         curl() { return 0; }
-         tui_run() { return 0; }
+         xray_fetch_release_zip() { XRAY_FETCHED_ZIP=/tmp/fake-xray.zip; XRAY_FETCHED_TMPDIR=/tmp/fake-xray-dir; return 0; }
+         xray_install_from_zip() { return 0; }
          xray_version() { printf 'Xray 1.8.0\n'; }
          install_xray 2>&1 ) ); rc=$?
 assert_status 0 "$rc" "install_xray 在下载与安装都成功时返回 0"
@@ -1369,7 +1373,7 @@ out=$( ( XRAY_BIN=/nonexistent/xray
          curl() { return 0; }
          install_xray 2>&1 ) ); rc=$?
 assert_status 1 "$rc" "install_xray 在 mktemp 失败时返回非零"
-assert_contains "$out" "无法创建临时文件" "install_xray 在 mktemp 失败时给出明确提示"
+assert_contains "$out" "无法创建临时目录" "install_xray 在 mktemp 失败时给出明确提示"
 
 # ── open_firewall：iptables 分支 ──────────────
 # 判据必须点【该分支独有的东西】：「iptables」这三个字在兜底提示
@@ -2389,7 +2393,11 @@ service_status() { printf 'MOCK_STATUS\n'; return 0; }
 open_firewall() { printf 'MOCK_FIREWALL PORT=%s\n' "$1"; return 0; }
 enable_bbr() { printf 'MOCK_BBR\n'; return 0; }
 ensure_packages() { printf 'MOCK_ENSURE_PKGS %s\n' "$*"; return 0; }
-curl() { printf 'MOCK_CURL %s\n' "$*"; return 0; }
+# curl 必须【真的写出目标文件】：下载链判成功的条件是「curl 退出码为 0 且目标文件非空」，
+# 只打印标记不落文件的话，下载链会一直判失败 → 后面的安装步骤永远走不到。
+curl() { printf 'MOCK_CURL %s\n' "$*"; local o=''; while [[ $# -gt 0 ]]; do if [[ "$1" == '-o' ]]; then o="${2:-}"; shift 2; else shift; fi; done; if [[ -n "$o" ]]; then printf 'MOCK_DOWNLOADED\n' > "$o"; fi; return 0; }
+# 内核安装这一步会真的往 /usr/local/bin 与 /etc/systemd 写东西 → 必须 mock。
+xray_install_from_zip() { printf 'MOCK_INSTALL_ZIP\n'; return 0; }
 journalctl() { printf 'MOCK_JOURNALCTL %s\n' "$*"; return 0; }
 tui_run() { printf 'MOCK_TUI_RUN %s\n' "$*"; return 0; }
 tui_banner() { printf 'MOCK_BANNER\n'; return 0; }
@@ -2501,15 +2509,15 @@ out=$( ( eval "$(t10_mocks; t10_mocks_menu)"
 assert_status 0 "$rc" "管理菜单选择「实时日志」时正常返回"
 assert_contains "$out" "MOCK_JOURNALCTL" "management_menu 第 3 项调用 journalctl"
 
-# 第 4 项：更新内核 → 调 ensure_packages + curl + tui_run
+# 第 4 项：更新内核 → 调 ensure_packages + 下载 + 安装 + 重启
 out=$( ( eval "$(t10_mocks; t10_mocks_menu)"
          MENU_PICK=4
          t10_menu_pick
          management_menu ) 2>&1 ); rc=$?
 assert_status 0 "$rc" "管理菜单选择「更新内核」时正常返回"
 assert_contains "$out" "MOCK_ENSURE_PKGS" "management_menu 第 4 项先补齐依赖"
-assert_contains "$out" "MOCK_CURL" "management_menu 第 4 项下载安装脚本"
-assert_contains "$out" "MOCK_TUI_RUN" "management_menu 第 4 项执行安装脚本"
+assert_contains "$out" "MOCK_CURL" "management_menu 第 4 项下载安装包"
+assert_contains "$out" "MOCK_INSTALL_ZIP" "management_menu 第 4 项执行安装"
 assert_contains "$out" "MOCK_RESTART" "management_menu 第 4 项更新成功后重启服务"
 
 # 第 5 项：网络调优 → 已部署时放行防火墙 + 开 BBR
@@ -2637,34 +2645,35 @@ assert_status 0 "$rc" "menu_rotate_keys 在用户取消时返回 0"
 assert_contains "$out" "已取消" "menu_rotate_keys 在用户取消时给出明确提示"
 assert_not_contains "$out" "MOCK_GEN_KEYS" "menu_rotate_keys 在用户取消时不生成新密钥"
 
-# menu_update_xray：依赖装不上 → 必须停在这里（不能去下载脚本）
+# menu_update_xray：依赖装不上 → 必须停在这里（不能去下载安装包）
 out=$( ( eval "$(t10_mocks; t10_mocks_menu)"
          ensure_packages() { printf 'MOCK_ENSURE_PKGS %s\n' "$*"; return 1; }
          menu_update_xray ) 2>&1 ); rc=$?
 assert_status 1 "$rc" "menu_update_xray 在依赖安装失败时返回非零"
 assert_contains "$out" "依赖安装失败" "menu_update_xray 在依赖安装失败时给出明确提示"
-assert_not_contains "$out" "MOCK_CURL" "menu_update_xray 在依赖安装失败后不下载安装脚本"
+assert_not_contains "$out" "MOCK_CURL" "menu_update_xray 在依赖安装失败后不下载安装包"
 
-# menu_update_xray：下载失败 → 必须报错
+# menu_update_xray：下载失败 → 必须报错，并给出三条可操作的解法
 out=$( ( eval "$(t10_mocks; t10_mocks_menu)"
          curl() { printf 'MOCK_CURL %s\n' "$*"; return 1; }
          menu_update_xray ) 2>&1 ); rc=$?
-assert_status 1 "$rc" "menu_update_xray 在下载安装脚本失败时返回非零"
-assert_contains "$out" "下载安装脚本失败" "menu_update_xray 在下载失败时给出明确提示"
-assert_not_contains "$out" "MOCK_TUI_RUN" "menu_update_xray 在下载失败后不执行安装脚本"
+assert_status 1 "$rc" "menu_update_xray 在下载安装包失败时返回非零"
+assert_contains "$out" "无法下载 Xray 安装包" "menu_update_xray 在下载失败时给出明确提示"
+assert_contains "$out" "--local" "menu_update_xray 在下载失败时提示离线包走法"
+assert_not_contains "$out" "MOCK_INSTALL_ZIP" "menu_update_xray 在下载失败后不执行安装"
 
 # menu_update_xray：mktemp 失败 → 必须中止（否则 curl -o "" 会失败、rm -f "" 会报错）
 out=$( ( eval "$(t10_mocks; t10_mocks_menu)"
          mktemp() { return 1; }
          menu_update_xray ) 2>&1 ); rc=$?
 assert_status 1 "$rc" "menu_update_xray 在 mktemp 失败时返回非零"
-assert_contains "$out" "无法创建临时文件" "menu_update_xray 在 mktemp 失败时给出明确提示"
+assert_contains "$out" "无法创建临时目录" "menu_update_xray 在 mktemp 失败时给出明确提示"
 
-# menu_update_xray：安装脚本执行失败 → 必须返回非零且不重启
+# menu_update_xray：安装失败 → 必须返回非零且不重启
 out=$( ( eval "$(t10_mocks; t10_mocks_menu)"
-         tui_run() { printf 'MOCK_TUI_RUN %s\n' "$*"; return 1; }
+         xray_install_from_zip() { printf 'MOCK_INSTALL_ZIP\n'; return 1; }
          menu_update_xray ) 2>&1 ); rc=$?
-assert_status 1 "$rc" "menu_update_xray 在安装脚本执行失败时返回非零"
+assert_status 1 "$rc" "menu_update_xray 在安装失败时返回非零"
 assert_not_contains "$out" "MOCK_RESTART" "menu_update_xray 在安装失败后不重启服务"
 
 test_case "向导：手动指定端口的占用复查"
@@ -3329,11 +3338,12 @@ assert_contains "$rmd" "v2rayNG" "客户端导入说明里点名 v2rayN / v2rayN
 assert_contains "$rmd" "Clash" "客户端导入说明里点名 Clash Verge"
 assert_contains "$rmd" "BBR" "常见问题里点名 BBR"
 assert_contains "$rmd" "二维码" "常见问题里点名二维码缺失"
-# ⚠️ T6-7：计划在【两处】登记了「README 的验证状态声明必须点名这一条」
-#   （Task 6 修订轮的 T6-7、Task 10 修订轮的 T10-7）：
-#   工具会以 root 执行一个从 GitHub main 分支下载的脚本，没有校验和校验。
-#   这条【不能漏】—— 漏了等于用户不知道自己的机器上跑过一段未经校验的代码。
-assert_contains "$rmd" "校验和" "声明里点名：以 root 执行 GitHub main 分支脚本、无校验和校验（T6-7）"
+# ⚠️ T6-7 的登记项在 v1.1 起【已被消除】：工具不再下载、也不再以 root 执行任何第三方脚本。
+#    但「本项目声明过哪些风险」这件事必须留在 README 里（读者要能看到风险是怎么变化的），
+#    所以仍要求 README 点名「校验和」，并说明现在改用 SHA-256 校验安装包。
+assert_contains "$rmd" "校验和" "声明里点名：安装包校验和的处理方式（旧版第三方脚本风险已消除）"
+assert_contains "$rmd" "SHA-256" "声明里点名：安装包改用 SHA-256 校验"
+assert_contains "$rmd" "不再下载并以 root 执行" "声明里点名：不再以 root 执行第三方脚本"
 
 test_case "Task 13：设计稿的依赖图补上 core.sh → tui.sh（F-18）"
 
@@ -3353,5 +3363,189 @@ assert_contains "$itg" "docker" "集成测试用 docker 起容器"
 assert_contains "$itg" "test/unit.sh" "集成测试在容器里跑单元测试"
 assert_contains "$itg" "build.sh" "集成测试在容器里构建单文件"
 assert_contains "$itg" "dist/install.sh" "集成测试在容器里验证单文件产物"
+
+# ══════════════════════════════════════════════════════════════
+# Task 14：受限网络环境的下载链与离线安装
+# ══════════════════════════════════════════════════════════════
+# 背景（本项目真机实测）：目标服务器只有 IPv6、没有公网 IPv4，
+# 而 api.github.com / github.com / objects.githubusercontent.com 全都只有 IPv4
+# → 上游 install-release.sh 的在线安装必然失败在
+#   "Failed to get release list, please check your network."。
+# 新版链路自己取 release 压缩包（多源回退 + 代理 + SHA-256 校验），
+# 并且支持完全离线的 --local 安装包。下面逐个函数点名断言。
+
+T14_TMP=$(mktemp -d 2>/dev/null)
+if [[ -n "$T14_TMP" && -d "$T14_TMP" ]]; then
+
+# ── xray_asset_machine：架构 → release 资产名 ──────────────────────
+# 映射错一个 = 在那台机器上下载到 404 的 zip，所以逐个架构点名断言。
+out=$( ( uname() { printf 'x86_64\n'; }; xray_asset_machine ) ); rc=$?
+assert_eq "64" "$out" "xray_asset_machine 把 x86_64 映射成 64"
+out=$( ( uname() { printf 'amd64\n'; }; xray_asset_machine ) )
+assert_eq "64" "$out" "xray_asset_machine 把 amd64 映射成 64"
+out=$( ( uname() { printf 'aarch64\n'; }; xray_asset_machine ) )
+assert_eq "arm64-v8a" "$out" "xray_asset_machine 把 aarch64 映射成 arm64-v8a"
+out=$( ( uname() { printf 'armv8l\n'; }; xray_asset_machine ) )
+assert_eq "arm64-v8a" "$out" "xray_asset_machine 把 armv8l 映射成 arm64-v8a"
+out=$( ( uname() { printf 'armv7l\n'; }; xray_cpu_has_vfp() { return 0; }; xray_asset_machine ) )
+assert_eq "arm32-v7a" "$out" "xray_asset_machine 把 armv7l 映射成 arm32-v7a"
+out=$( ( uname() { printf 'armv7l\n'; }; xray_cpu_has_vfp() { return 1; }; xray_asset_machine ) )
+assert_eq "arm32-v5" "$out" "xray_asset_machine 在没有 vfp 时把 armv7l 降级成 arm32-v5"
+out=$( ( uname() { printf 'armv6l\n'; }; xray_cpu_has_vfp() { return 0; }; xray_asset_machine ) )
+assert_eq "arm32-v6" "$out" "xray_asset_machine 把 armv6l 映射成 arm32-v6"
+out=$( ( uname() { printf 'i686\n'; }; xray_asset_machine ) )
+assert_eq "32" "$out" "xray_asset_machine 把 i686 映射成 32"
+out=$( ( uname() { printf 's390x\n'; }; xray_asset_machine ) )
+assert_eq "s390x" "$out" "xray_asset_machine 把 s390x 映射成 s390x"
+out=$( ( uname() { printf 'riscv64\n'; }; xray_asset_machine ) )
+assert_eq "riscv64" "$out" "xray_asset_machine 把 riscv64 映射成 riscv64"
+out=$( ( uname() { printf 'ppc64le\n'; }; xray_asset_machine ) )
+assert_eq "ppc64le" "$out" "xray_asset_machine 把 ppc64le 映射成 ppc64le"
+out=$( ( uname() { printf 'mips64le\n'; }; xray_asset_machine ) )
+assert_eq "mips64le" "$out" "xray_asset_machine 把 mips64le 映射成 mips64le"
+out=$( ( uname() { printf 'mips\n'; }; xray_asset_machine ) )
+assert_eq "mips32" "$out" "xray_asset_machine 把 mips 映射成 mips32"
+out=$( ( uname() { printf 'sparc64\n'; }; xray_asset_machine ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "xray_asset_machine 对未知架构返回非零"
+assert_eq "" "$out" "xray_asset_machine 对未知架构不输出资产名"
+
+# ── xray_download_candidates：候选源的顺序与拼接 ──────────────────
+out=$( ( GITHUB_MIRROR=''; xray_download_candidates 'https://example.com/a.zip' 'mirror' ) | head -1 )
+assert_eq "https://example.com/a.zip" "$out" "未设镜像时第一个候选源是直连地址"
+out=$( ( GITHUB_MIRROR='https://m.example/'; xray_download_candidates 'https://example.com/a.zip' 'mirror' ) | head -1 )
+assert_eq "https://m.example/https://example.com/a.zip" "$out" "设了镜像时第一个候选源是镜像地址"
+out=$( ( GITHUB_MIRROR='https://m.example/'; xray_download_candidates 'https://example.com/a.zip' 'direct' ) | head -1 )
+assert_eq "https://example.com/a.zip" "$out" "direct 顺序下直连地址排在镜像之前"
+out=$( ( GITHUB_MIRROR='https://m.example'; xray_download_candidates 'https://example.com/a.zip' 'mirror' ) | head -1 )
+assert_eq "https://m.example/https://example.com/a.zip" "$out" "镜像前缀末尾没有斜杠时不会拼出双斜杠"
+out=$( ( GITHUB_MIRROR=''; xray_download_candidates 'https://example.com/a.zip' 'mirror' ) | wc -l | tr -d ' ' )
+assert_eq "3" "$out" "未设镜像时候选源为「直连 + 两个内置镜像」"
+
+# ── xray_download_to：第一个源失败必须自动回退到下一个源 ──────────
+out=$( ( GITHUB_MIRROR=''
+         _n=0
+         curl() { _n=$((_n + 1)); if [[ $_n -eq 1 ]]; then return 22; fi
+                  local o=''; while [[ $# -gt 0 ]]; do if [[ "$1" == '-o' ]]; then o="${2:-}"; shift 2; else shift; fi; done
+                  printf 'PAYLOAD' > "$o"; return 0; }
+         xray_download_to 'https://example.com/a.zip' "$T14_TMP/a.zip" 'mirror'
+         printf 'USED=%s\n' "$DOWNLOAD_SOURCE_USED" ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "xray_download_to 在首个源失败后自动回退到下一个源"
+if [[ "$out" == *"USED=https://example.com/a.zip"* ]]; then same=1; else same=0; fi
+assert_eq "0" "$same" "xray_download_to 不会把失败的源记成已用源"
+assert_true "$([[ -s "$T14_TMP/a.zip" ]] && echo 0 || echo 1)" "xray_download_to 回退成功后落下了文件"
+
+# ── xray_download_to：所有源都失败时返回非零且不留半截文件 ──────────
+out=$( ( GITHUB_MIRROR=''; curl() { return 22; }
+         xray_download_to 'https://example.com/a.zip' "$T14_TMP/b.zip" 'mirror' ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "xray_download_to 在所有源都失败时返回非零"
+assert_true "$([[ ! -s "$T14_TMP/b.zip" ]] && echo 0 || echo 1)" "xray_download_to 失败后不留半截文件"
+
+# ── xray_download_to：代理必须透传给 curl ──────────────────────────
+out=$( ( GITHUB_MIRROR=''; XRAY_PROXY='http://127.0.0.1:7890'
+         curl() { printf 'CURL %s\n' "$*"
+                  local o=''; while [[ $# -gt 0 ]]; do if [[ "$1" == '-o' ]]; then o="${2:-}"; shift 2; else shift; fi; done
+                  printf 'PAYLOAD' > "$o"; return 0; }
+         xray_download_to 'https://example.com/a.zip' "$T14_TMP/c.zip" 'mirror' ) 2>&1 )
+assert_contains "$out" "-x http://127.0.0.1:7890" "xray_download_to 把代理透传给 curl"
+
+# ── xray_verify_sha256：用官方 .dgst 校验安装包 ────────────────────
+printf 'FAKE-PACKAGE-CONTENT' > "$T14_TMP/pkg.zip"
+if have_cmd openssl; then
+  real_sum=$(openssl dgst -sha256 "$T14_TMP/pkg.zip" 2>/dev/null | awk '{print $NF}')
+  out=$( ( GITHUB_MIRROR=''
+           curl() { local o='' u=''; while [[ $# -gt 0 ]]; do
+                      if [[ "$1" == '-o' ]]; then o="${2:-}"; shift 2
+                      elif [[ "$1" == -* ]]; then shift
+                      else u="$1"; shift; fi; done
+                    case "$u" in *.dgst) printf 'SHA2-256= %s\n' "$real_sum" > "$o" ;; *) printf 'PAYLOAD' > "$o" ;; esac
+                    return 0; }
+           xray_verify_sha256 "$T14_TMP/pkg.zip" 'https://example.com/pkg.zip' ) 2>&1 ); rc=$?
+  assert_status 0 "$rc" "xray_verify_sha256 在哈希一致时返回 0"
+  assert_contains "$out" "校验通过" "xray_verify_sha256 校验通过时给出提示"
+
+  out=$( ( GITHUB_MIRROR=''
+           curl() { local o='' u=''; while [[ $# -gt 0 ]]; do
+                      if [[ "$1" == '-o' ]]; then o="${2:-}"; shift 2
+                      elif [[ "$1" == -* ]]; then shift
+                      else u="$1"; shift; fi; done
+                    case "$u" in *.dgst) printf 'SHA2-256= %s\n' "0000000000000000000000000000000000000000000000000000000000000000" > "$o" ;; *) printf 'PAYLOAD' > "$o" ;; esac
+                    return 0; }
+           xray_verify_sha256 "$T14_TMP/pkg.zip" 'https://example.com/pkg.zip' ) 2>&1 ); rc=$?
+  assert_status 1 "$rc" "xray_verify_sha256 在哈希不一致时返回 1"
+  assert_contains "$out" "校验不通过" "xray_verify_sha256 哈希不符时给出明确提示"
+
+  out=$( ( GITHUB_MIRROR=''; curl() { return 22; }
+           xray_verify_sha256 "$T14_TMP/pkg.zip" 'https://example.com/pkg.zip' ) 2>&1 ); rc=$?
+  assert_status 2 "$rc" "xray_verify_sha256 在取不到校验文件时返回 2（不阻断）"
+  if [[ "$out" == *"校验通过"* ]]; then lied=1; else lied=0; fi
+  assert_eq "0" "$lied" "xray_verify_sha256 取不到校验文件时不得谎报『校验通过』"
+
+  out=$( ( have_cmd() { return 1; }
+           xray_verify_sha256 "$T14_TMP/pkg.zip" 'https://example.com/pkg.zip' ) 2>&1 ); rc=$?
+  assert_status 2 "$rc" "xray_verify_sha256 在 openssl 不可用时返回 2（不阻断）"
+else
+  assert_eq "openssl 可用" "openssl 不可用" \
+    "SHA-256 校验用例前提：openssl 必须可用（random_hex 用例已覆盖其回退路径）"
+fi
+
+# ── xray_install_from_zip：离线安装包 → 二进制 + systemd unit ─────
+mkdir -p "$T14_TMP/bin"
+printf '#!/bin/sh\nprintf "Xray 1.8.0 (fake)\n"\n' > "$T14_TMP/fake-xray"
+chmod 755 "$T14_TMP/fake-xray"
+out=$( ( XRAY_BIN="$T14_TMP/bin/xray"; XRAY_SERVICE_UNIT="$T14_TMP/xray.service"
+         id() { return 0; }
+         unzip() { local d=''; while [[ $# -gt 0 ]]; do if [[ "$1" == '-d' ]]; then d="${2:-}"; shift 2; else shift; fi; done
+                   cp -f "$T14_TMP/fake-xray" "$d/xray"; return 0; }
+         xray_install_from_zip "$T14_TMP/pkg.zip" ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "xray_install_from_zip 从离线包安装成功时返回 0"
+assert_true "$([[ -x "$T14_TMP/bin/xray" ]] && echo 0 || echo 1)" "xray_install_from_zip 把二进制装到了目标位置"
+assert_true "$([[ -f "$T14_TMP/xray.service" ]] && echo 0 || echo 1)" "xray_install_from_zip 写出了 systemd unit"
+unit_txt=$(cat "$T14_TMP/xray.service" 2>/dev/null)
+assert_contains "$unit_txt" "ExecStart=$T14_TMP/bin/xray run -config" "systemd unit 的 ExecStart 指向实际二进制与配置"
+assert_contains "$unit_txt" "User=xray" "systemd unit 以 xray 用户运行"
+assert_contains "$unit_txt" "CAP_NET_BIND_SERVICE" "systemd unit 给了绑定特权端口的能力"
+
+# ── xray_install_from_zip：包不存在 / 不是有效安装包时必须明确报错 ──
+out=$( ( XRAY_BIN="$T14_TMP/bin/xray"; XRAY_SERVICE_UNIT="$T14_TMP/xray.service"
+         xray_install_from_zip "$T14_TMP/no-such-file.zip" ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "xray_install_from_zip 在安装包不存在时返回非零"
+assert_contains "$out" "不存在或为空" "xray_install_from_zip 在安装包不存在时给出明确提示"
+out=$( ( XRAY_BIN="$T14_TMP/bin/xray"; XRAY_SERVICE_UNIT="$T14_TMP/xray.service"
+         unzip() { return 9; }
+         xray_install_from_zip "$T14_TMP/pkg.zip" ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "xray_install_from_zip 在解压失败时返回非零"
+assert_contains "$out" "解压安装包失败" "xray_install_from_zip 在解压失败时给出明确提示"
+
+# ── install.sh 的三个新选项：解析与校验 ────────────────────────────
+out=$( ( INSTALL_SH_NO_MAIN=1; source "$ROOT/install.sh"
+         parse_args --mirror 'https://m.example/' --proxy 'http://127.0.0.1:7890'
+         printf 'MIRROR=%s\nPROXY=%s\n' "$GITHUB_MIRROR" "$XRAY_PROXY" ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "parse_args 解析 --mirror 与 --proxy 时返回 0"
+assert_contains "$out" "MIRROR=https://m.example/" "parse_args 把 --mirror 写进 GITHUB_MIRROR"
+assert_contains "$out" "PROXY=http://127.0.0.1:7890" "parse_args 把 --proxy 写进 XRAY_PROXY"
+
+printf 'FAKE-PACKAGE-CONTENT' > "$T14_TMP/local.zip"
+out=$( ( INSTALL_SH_NO_MAIN=1; source "$ROOT/install.sh"
+         parse_args --local "$T14_TMP/local.zip"
+         printf 'LOCAL=%s\n' "$XRAY_LOCAL_FILE" ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "parse_args 解析 --local 时返回 0"
+assert_contains "$out" "LOCAL=$T14_TMP/local.zip" "parse_args 把 --local 写进 XRAY_LOCAL_FILE"
+
+# 非法值必须在【参数解析口】就拒掉：不能等下载失败之后才发现写错了。
+out=$( ( INSTALL_SH_NO_MAIN=1; source "$ROOT/install.sh"; parse_args --mirror 'not-a-url' ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "parse_args 拒绝非 http(s) 的 --mirror"
+assert_contains "$out" "--mirror 必须是 http(s) 镜像地址" "parse_args 对非法 --mirror 给出明确提示"
+out=$( ( INSTALL_SH_NO_MAIN=1; source "$ROOT/install.sh"; parse_args --proxy 'not-a-url' ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "parse_args 拒绝非法的 --proxy"
+assert_contains "$out" "--proxy 必须是 http/https/socks5 代理地址" "parse_args 对非法 --proxy 给出明确提示"
+out=$( ( INSTALL_SH_NO_MAIN=1; source "$ROOT/install.sh"; parse_args --local "$T14_TMP/no-such-file.zip" ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "parse_args 拒绝不存在的 --local 文件"
+assert_contains "$out" "不存在或不可读" "parse_args 对不存在的 --local 给出明确提示"
+
+rm -rf "$T14_TMP"
+else
+  assert_eq "mktemp -d 能创建唯一临时目录" "失败（mktemp -d 返回空路径）" \
+    "Task 14 用例前提：mktemp -d 必须能创建唯一临时目录"
+fi
 
 test_summary

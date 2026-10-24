@@ -88,9 +88,9 @@ core.sh ──> tui.sh
 
 | 路径 | 内容 | 权限 |
 |---|---|---|
-| `/usr/local/bin/xray` | Xray 内核（官方 `install-release.sh`） | 755 |
+| `/usr/local/bin/xray` | Xray 内核（本工具自行下载 release 压缩包并安装，**不执行第三方安装脚本**） | 755 |
 | `/usr/local/etc/xray/config.json` | 服务端配置 | 644 |
-| `/etc/xray/` | 官方安装脚本附带的 `geosite.dat` / `geoip.dat`（**非依赖项**，本工具的配置不引用 geoip） | 644 |
+| `/etc/systemd/system/xray.service` | systemd 单元（本工具自己写） | 644 |
 | `/etc/vless-reality/deploy.env` | 工具状态 | **600** |
 | `/root/vless-reality/` | 客户端导出物料 | 700 |
 | `/var/log/xray/` | `access.log` / `error.log` | 按运行用户授权 |
@@ -209,7 +209,8 @@ one.one.one.one    www.cloudflare.com  time.akamai.com  addons.mozilla.org
 ### 7.3 第 3 步 · 执行序列
 
 ```
-① 安装 Xray 内核   官方 install-release.sh，幂等；已装则跳过并提示当前版本
+① 安装 Xray 内核   自行下载 release 压缩包（多源回退 + 代理 + SHA-256 校验）并安装；
+                   幂等；已装则跳过并提示当前版本
 ② 生成密钥与 UUID  xray x25519 / xray uuid
 ③ 写 config.json  → xray run -test 校验 → 通过才原子替换
 ④ systemd         enable --now + restart；读出 User= 授权日志目录

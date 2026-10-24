@@ -36,6 +36,9 @@ OPT_SNI=''
 OPT_NAME=''
 OPT_UUID=''
 OPT_ADDR=''
+OPT_MIRROR=''
+OPT_PROXY=''
+OPT_LOCAL=''
 
 usage() {
   cat <<EOF
@@ -51,10 +54,18 @@ ${APP_NAME} v${APP_VERSION}
   -n, --name <备注>   指定分享链接备注
       --uuid <UUID>   指定 UUID（默认自动生成）
       --addr <地址>   指定对外地址（NAT 后的服务器用；默认自动探测公网 IP）
+      --mirror <前缀> GitHub 镜像前缀（例：https://gh.llkk.cc/）
+      --proxy <地址>  下载走 HTTP/SOCKS5 代理（例：http://127.0.0.1:7890）
+      --local <zip>   使用本地已有的 Xray 离线安装包（完全不联网）
   -m, --menu          直接进入管理菜单
       --status        查看运行状态并退出
       --uninstall     卸载并清理
   -h, --help          显示本帮助
+
+网络受限时（GitHub 只有 IPv4、机器没有公网 IPv4）的三种走法：
+  --proxy http://127.0.0.1:7890        走本机代理
+  --mirror https://gh.llkk.cc/         走 GitHub 镜像
+  --local /root/Xray-linux-64.zip      用事先下载好的离线安装包
 
 文件位置:
   配置状态   $STATE_FILE
@@ -93,6 +104,31 @@ parse_args() {
                        exit 1
                      fi
                      shift 2 ;;
+      --mirror)       OPT_MIRROR="${2:-}"; [[ -n "$OPT_MIRROR" ]] || { tui_err "--mirror 缺少参数"; exit 1; }
+                     # 镜像前缀会被直接拼在下载 URL 前面 → 必须是 http(s) 绝对地址，
+                     # 否则拼出来的地址根本不是 URL，报错会指向 curl 的语法错误，
+                     # 而不是「镜像地址写错了」。
+                     if ! [[ "$OPT_MIRROR" =~ ^https?://[^[:space:]]+$ ]]; then
+                       tui_err "--mirror 必须是 http(s) 镜像地址：$OPT_MIRROR"
+                       tui_tip "示例：https://gh.llkk.cc/"
+                       exit 1
+                     fi
+                     shift 2 ;;
+      --proxy)        OPT_PROXY="${2:-}"; [[ -n "$OPT_PROXY" ]] || { tui_err "--proxy 缺少参数"; exit 1; }
+                     if ! [[ "$OPT_PROXY" =~ ^(https?|socks5h?|socks4)://[^[:space:]]+$ ]]; then
+                       tui_err "--proxy 必须是 http/https/socks5 代理地址：$OPT_PROXY"
+                       tui_tip "示例：http://127.0.0.1:7890 或 socks5://127.0.0.1:1080"
+                       exit 1
+                     fi
+                     shift 2 ;;
+      --local)        OPT_LOCAL="${2:-}"; [[ -n "$OPT_LOCAL" ]] || { tui_err "--local 缺少参数"; exit 1; }
+                     # 离线包必须【当场】可用：不能等到下载失败之后才发现路径写错了。
+                     if [[ ! -f "$OPT_LOCAL" ]] || [[ ! -r "$OPT_LOCAL" ]]; then
+                       tui_err "--local 指定的安装包不存在或不可读：$OPT_LOCAL"
+                       tui_tip "示例：--local /root/Xray-linux-64.zip"
+                       exit 1
+                     fi
+                     shift 2 ;;
       *) tui_err "未知参数：$1"; usage; exit 1 ;;
     esac
   done
@@ -103,6 +139,20 @@ parse_args() {
     tui_tip "示例：www.microsoft.com（只允许字母、数字、连字符与点，且必须含点）"
     exit 1
   fi
+  # 下载参数落到全局：命令行优先于环境变量（core.sh 里 GITHUB_MIRROR 等
+  # 已经能用环境变量预设，这里是覆盖而不是清空）。
+  # 必须放在 parse_args 里而不是 main 里：--menu 进管理菜单时同样要用得上，
+  # 因为菜单里的「更新 Xray 内核」走的是同一条下载链。
+  if [[ -n "$OPT_MIRROR" ]]; then
+    GITHUB_MIRROR="$OPT_MIRROR"
+  fi
+  if [[ -n "$OPT_PROXY" ]]; then
+    XRAY_PROXY="$OPT_PROXY"
+  fi
+  if [[ -n "$OPT_LOCAL" ]]; then
+    XRAY_LOCAL_FILE="$OPT_LOCAL"
+  fi
+  return 0
 }
 
 require_root() {
@@ -137,6 +187,21 @@ preflight() {
   ensure_packages openssl || rc=1
   if ! have_cmd qrencode; then
     ensure_packages qrencode || tui_tip "qrencode 安装失败，稍后仍可手动安装以生成二维码"
+  fi
+
+  # 下载通道：必须让用户看得见【实际走哪条路】，
+  # 否则「装不上」时用户根本不知道自己是直连、镜像、代理还是离线包。
+  if [[ -n "$XRAY_LOCAL_FILE" ]]; then
+    tui_ok "下载通道：离线安装包 $XRAY_LOCAL_FILE"
+  else
+    if [[ -n "$XRAY_PROXY" ]]; then
+      tui_ok "下载通道：代理 $XRAY_PROXY"
+    else
+      tui_ok "下载通道：直连（失败后自动回退内置镜像）"
+    fi
+    if [[ -n "$GITHUB_MIRROR" ]]; then
+      tui_ok "下载镜像：$GITHUB_MIRROR"
+    fi
   fi
 
   # 对外地址：优先用 --addr 指定的（NAT 后的服务器探测不到公网 IP，
