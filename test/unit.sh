@@ -3435,7 +3435,11 @@ assert_eq "0" "$same" "xray_download_to 不会把失败的源记成已用源"
 assert_true "$([[ -s "$T14_TMP/a.zip" ]] && echo 0 || echo 1)" "xray_download_to 回退成功后落下了文件"
 
 # ── xray_download_to：所有源都失败时返回非零且不留半截文件 ──────────
-out=$( ( GITHUB_MIRROR=''; curl() { return 22; }
+# curl 的假实现必须【真的写出半截文件】再失败：不落文件的话，
+# 「不留半截文件」这条断言是恒真的（文件压根就不存在）。
+out=$( ( GITHUB_MIRROR=''
+         curl() { local o=''; while [[ $# -gt 0 ]]; do if [[ "$1" == '-o' ]]; then o="${2:-}"; shift 2; else shift; fi; done
+                  if [[ -n "$o" ]]; then printf 'PARTIAL' > "$o"; fi; return 22; }
          xray_download_to 'https://example.com/a.zip' "$T14_TMP/b.zip" 'mirror' ) 2>&1 ); rc=$?
 assert_status 1 "$rc" "xray_download_to 在所有源都失败时返回非零"
 assert_true "$([[ ! -s "$T14_TMP/b.zip" ]] && echo 0 || echo 1)" "xray_download_to 失败后不留半截文件"
@@ -3515,6 +3519,17 @@ out=$( ( XRAY_BIN="$T14_TMP/bin/xray"; XRAY_SERVICE_UNIT="$T14_TMP/xray.service"
          xray_install_from_zip "$T14_TMP/pkg.zip" ) 2>&1 ); rc=$?
 assert_status 1 "$rc" "xray_install_from_zip 在解压失败时返回非零"
 assert_contains "$out" "解压安装包失败" "xray_install_from_zip 在解压失败时给出明确提示"
+
+# 二进制【跑不起来】必须被当场发现：架构不匹配时 xray 起不来，
+# 而那正是「装上了但服务起不来」最常见的原因 —— 不检查就会一路装到 systemd 才炸。
+printf 'THIS IS NOT AN EXECUTABLE\n' > "$T14_TMP/not-a-binary"
+out=$( ( XRAY_BIN="$T14_TMP/bin/xray"; XRAY_SERVICE_UNIT="$T14_TMP/xray.service"
+         id() { return 0; }
+         unzip() { local d=''; while [[ $# -gt 0 ]]; do if [[ "$1" == '-d' ]]; then d="${2:-}"; shift 2; else shift; fi; done
+                   cp -f "$T14_TMP/not-a-binary" "$d/xray"; chmod 755 "$d/xray"; return 0; }
+         xray_install_from_zip "$T14_TMP/pkg.zip" ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "xray_install_from_zip 在二进制无法执行时返回非零"
+assert_contains "$out" "无法执行" "xray_install_from_zip 在二进制无法执行时给出明确提示"
 
 # ── install.sh 的三个新选项：解析与校验 ────────────────────────────
 out=$( ( INSTALL_SH_NO_MAIN=1; source "$ROOT/install.sh"
