@@ -3422,14 +3422,18 @@ out=$( ( GITHUB_MIRROR=''; xray_download_candidates 'https://example.com/a.zip' 
 assert_eq "3" "$out" "未设镜像时候选源为「直连 + 两个内置镜像」"
 
 # ── xray_download_to：第一个源失败必须自动回退到下一个源 ──────────
+# ⚠️ 函数的退出码【必须在子 shell 内部就取下来】：
+#    若把 `printf` 放在函数调用之后，外层 `rc=$?` 取到的是 printf 的退出码（恒为 0）
+#    → 这条断言会变成【恒真】。变异矩阵的 A42 就是靠它抓出这个缺陷的。
 out=$( ( GITHUB_MIRROR=''
          _n=0
          curl() { _n=$((_n + 1)); if [[ $_n -eq 1 ]]; then return 22; fi
                   local o=''; while [[ $# -gt 0 ]]; do if [[ "$1" == '-o' ]]; then o="${2:-}"; shift 2; else shift; fi; done
                   printf 'PAYLOAD' > "$o"; return 0; }
          xray_download_to 'https://example.com/a.zip' "$T14_TMP/a.zip" 'mirror'
-         printf 'USED=%s\n' "$DOWNLOAD_SOURCE_USED" ) 2>&1 ); rc=$?
-assert_status 0 "$rc" "xray_download_to 在首个源失败后自动回退到下一个源"
+         rc2=$?
+         printf 'USED=%s\nRC=%s\n' "$DOWNLOAD_SOURCE_USED" "$rc2" ) 2>&1 )
+assert_contains "$out" "RC=0" "xray_download_to 在首个源失败后自动回退到下一个源"
 if [[ "$out" == *"USED=https://example.com/a.zip"* ]]; then same=1; else same=0; fi
 assert_eq "0" "$same" "xray_download_to 不会把失败的源记成已用源"
 assert_true "$([[ -s "$T14_TMP/a.zip" ]] && echo 0 || echo 1)" "xray_download_to 回退成功后落下了文件"
@@ -3532,18 +3536,21 @@ assert_status 1 "$rc" "xray_install_from_zip 在二进制无法执行时返回�
 assert_contains "$out" "无法执行" "xray_install_from_zip 在二进制无法执行时给出明确提示"
 
 # ── install.sh 的三个新选项：解析与校验 ────────────────────────────
+# ⚠️ 同款陷阱：退出码必须在子 shell 内部取，外层 `rc=$?` 拿到的是 printf 的退出码。
 out=$( ( INSTALL_SH_NO_MAIN=1; source "$ROOT/install.sh"
          parse_args --mirror 'https://m.example/' --proxy 'http://127.0.0.1:7890'
-         printf 'MIRROR=%s\nPROXY=%s\n' "$GITHUB_MIRROR" "$XRAY_PROXY" ) 2>&1 ); rc=$?
-assert_status 0 "$rc" "parse_args 解析 --mirror 与 --proxy 时返回 0"
+         rc2=$?
+         printf 'MIRROR=%s\nPROXY=%s\nRC=%s\n' "$GITHUB_MIRROR" "$XRAY_PROXY" "$rc2" ) 2>&1 )
+assert_contains "$out" "RC=0" "parse_args 解析 --mirror 与 --proxy 时返回 0"
 assert_contains "$out" "MIRROR=https://m.example/" "parse_args 把 --mirror 写进 GITHUB_MIRROR"
 assert_contains "$out" "PROXY=http://127.0.0.1:7890" "parse_args 把 --proxy 写进 XRAY_PROXY"
 
 printf 'FAKE-PACKAGE-CONTENT' > "$T14_TMP/local.zip"
 out=$( ( INSTALL_SH_NO_MAIN=1; source "$ROOT/install.sh"
          parse_args --local "$T14_TMP/local.zip"
-         printf 'LOCAL=%s\n' "$XRAY_LOCAL_FILE" ) 2>&1 ); rc=$?
-assert_status 0 "$rc" "parse_args 解析 --local 时返回 0"
+         rc2=$?
+         printf 'LOCAL=%s\nRC=%s\n' "$XRAY_LOCAL_FILE" "$rc2" ) 2>&1 )
+assert_contains "$out" "RC=0" "parse_args 解析 --local 时返回 0"
 assert_contains "$out" "LOCAL=$T14_TMP/local.zip" "parse_args 把 --local 写进 XRAY_LOCAL_FILE"
 
 # 非法值必须在【参数解析口】就拒掉：不能等下载失败之后才发现写错了。
