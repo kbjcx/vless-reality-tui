@@ -7,10 +7,7 @@ build_share_link() {
   enc=$(urlencode "$remark")
   # IPv6 地址在 URL 里必须写成 [addr]:port，否则 vless://uuid@2001:db8::1:443 是非法 URL
   # → 客户端导入即废。detect_public_ip 允许返回 IPv6，所以这里必须处理。
-  host="$ip"
-  if [[ "$host" == *:* && "$host" != \[*\] ]]; then
-    host="[$host]"
-  fi
+  host=$(host_for_url "$ip")
   # FLOW / FINGERPRINT 是全局状态（状态文件里也记着），不能在这里写死 ——
   # 写死就等于让状态文件里的这两个字段变成死状态。
   printf 'vless://%s@%s:%s?encryption=none&flow=%s&security=reality&sni=%s&fp=%s&pbk=%s&sid=%s&type=tcp&headerType=none#%s' \

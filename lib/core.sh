@@ -6,7 +6,7 @@
 # core.sh 不主动 source tui.sh，由 install.sh 统一按 tui → core 的顺序引入。
 
 APP_NAME='VLESS + REALITY 部署工具'
-APP_VERSION='1.1.0'
+APP_VERSION='1.1.1'
 
 LIB_DIR="${LIB_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
 STATE_DIR="${STATE_DIR:-/etc/vless-reality}"
@@ -137,6 +137,13 @@ read_file() {
   trim "$(cat "$f" 2>/dev/null)"
 }
 
+# SC2120: 本函数【确实】接受一个可选参数（os-release 路径）——
+#   生产路径调用它时不传参（用默认的 /etc/os-release），
+#   单元测试则传入临时构造的 os-release 文件。
+#   静态检查工具只看本文件内有没有「传参调用」，看不到测试文件里的调用 →
+#   误报「参数永远不会被传」。这里显式关掉该条检查。
+# 下面这行必须写成指令形式；注释里任何以「shellcheck」开头的行都会被当成指令解析。
+# shellcheck disable=SC2120
 detect_os() {
   local os_release="${1:-/etc/os-release}" id='' ver='' arch='' pair=''
   if [[ -r "$os_release" ]]; then
@@ -274,6 +281,40 @@ load_state() {
 }
 
 state_exists() { [[ -f "$STATE_FILE" ]]; }
+
+# 本机有没有全局 IPv6 地址。
+# 不用 `ip ... | grep -q`：grep 命中即退出 → 上游 ip 收到 SIGPIPE(141) →
+# set -o pipefail 下整条管道的退出码变成 141 → 条件判假（同一个坑见 open_firewall）。
+have_global_ipv6() {
+  local out
+  out=$(ip -6 addr show scope global 2>/dev/null || printf '')
+  [[ "$out" == *"inet6 "* ]]
+}
+
+# 决定 inbound 监听哪个地址。
+#
+# 真机事故（IPv6-only 的 Vultr 机器，IPv4 只有 CGNAT 地址、无 IPv4 出口）：
+# 模板把 listen 写死成 "0.0.0.0" → 只听 IPv4，而分享链接给的是
+# [2001:db8::1]:443 → 客户端的 IPv6 连接被直接拒绝 →
+# 服务「起来了、面板也显示已运行」，但客户端连不上。
+# 规则：
+#   · 对外地址是 IPv6 → 必须监听 "::"（否则 IPv6 客户端根本连不上）
+#   · 对外地址是 IPv4，但本机有全局 IPv6 且系统是双栈（bindv6only=0）
+#     → "::" 一次覆盖 IPv4/IPv6（IPv4 以映射地址进来）
+#   · 其余 → "0.0.0.0"
+choose_listen_addr() {
+  local pub="${SERVER_IP:-}" bindv6only
+  if [[ "$pub" == *:* ]]; then
+    printf '::'
+    return 0
+  fi
+  bindv6only=$(cat /proc/sys/net/ipv6/bindv6only 2>/dev/null || printf '0')
+  if [[ "$bindv6only" == "0" ]] && have_global_ipv6; then
+    printf '::'
+    return 0
+  fi
+  printf '0.0.0.0'
+}
 
 # 判定一个字符串是不是可用的对外地址。
 # 存在的理由：旧的判定 `^[0-9a-fA-F:]+$` 太宽 —— HTTP 状态码响应体
@@ -452,4 +493,25 @@ service_run_user() {
   u=$(systemctl show xray -p User --value 2>/dev/null || printf '')
   [[ -z "$u" || "$u" == '0' ]] && u='root'
   printf '%s' "$u"
+}
+
+# 服务实际以哪个【组】运行（读 unit 的 Group=，没有就取该用户的默认组）
+service_run_group() {
+  local run_user g
+  run_user=$(service_run_user)
+  [[ -z "$run_user" || "$run_user" == 'root' ]] && { printf ''; return 0; }
+  g=$(systemctl show xray -p Group --value 2>/dev/null || printf '')
+  [[ -z "$g" || "$g" == '0' ]] && g=$(id -gn "$run_user" 2>/dev/null || printf '')
+  printf '%s' "$g"
+}
+
+# IPv6 地址在 URL/「地址:端口」这种写法里必须加方括号，
+# 否则 2001:db8::1:443 会被解析成「地址 2001:db8::1、端口 443」以外的歧义值，
+# 客户端导入即废。真机部署（IPv6-only 的 Vultr 机器）上出现过这种显示。
+host_for_url() {
+  local host="$1"
+  if [[ "$host" == *:* && "$host" != \[*\] ]]; then
+    host="[$host]"
+  fi
+  printf '%s' "$host"
 }

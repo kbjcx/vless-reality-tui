@@ -434,7 +434,7 @@ fi
 
 test_case "core 常量与文件边界"
 
-assert_eq "1.1.0" "$APP_VERSION" "core.sh 的 APP_VERSION 统一为 1.1.0"
+assert_eq "1.1.1" "$APP_VERSION" "core.sh 的 APP_VERSION 统一为 1.1.1"
 assert_eq "/etc/vless-reality" "$STATE_DIR" "STATE_DIR 默认值"
 assert_eq "/etc/vless-reality/deploy.env" "$STATE_FILE" "STATE_FILE 默认跟随 STATE_DIR"
 assert_eq "/root/vless-reality" "$OUT_DIR" "OUT_DIR 默认值（客户端导出目录）"
@@ -1032,7 +1032,7 @@ if [[ -n "$atomic_dir" ]]; then
   out=$( ( XRAY_BIN="$atomic_dir/no-such-xray"; write_config_atomic "$atarget" "$atomic_dir/broken.json" ) 2>&1 ); rc=$?
   assert_status 1 "$rc" "write_config_atomic 在配置校验失败时返回非零"
   assert_eq "OLD-CONTENT" "$(cat "$atarget")" "write_config_atomic 校验失败时保留原有配置不变"
-  if [[ -e "$atarget.new" ]]; then leftover=1; else leftover=0; fi
+  if [[ -e "$atomic_dir/config.new.json" ]]; then leftover=1; else leftover=0; fi
   assert_eq "0" "$leftover" "write_config_atomic 校验失败时清理临时文件"
   # 校验通过：必须原子替换成新内容（注意 write_config_atomic 收的是【源文件】）
   printf '{"ok":1}\n' >"$atomic_dir/src.json"
@@ -1061,7 +1061,7 @@ if [[ -n "$atomic_dir" ]]; then
   # ── TG5：服务端配置必须 chmod 600 ──────────────────────────────
   # 本机（MSYS）的 chmod 是【模拟的】→ 断言文件权限位在本机不可达
   # → 改断言【传给 chmod 的参数】：chmod 600 <最终配置路径> 必须出现过。
-  # 必须整行精确匹配：临时文件那次的参数是 "600 $atarget.new"，
+  # 必须整行精确匹配：临时文件那次的参数是 "600 $atomic_dir/config.new.json"，
   # 它【包含】"600 $atarget" → 用子串匹配会误判成通过。
   chmod_log="$atomic_dir/chmod.log"
   : > "$chmod_log"
@@ -1073,7 +1073,7 @@ if [[ -n "$atomic_dir" ]]; then
     "write_config_atomic 必须对最终配置文件执行 chmod 600（含 REALITY 私钥）"
 
   # ── TG4：render 与 write 必须用【不同】的暂存名 ──────────────────────────────
-  # 碰撞的后果：render 写的 $outfile.new 会被 write_config_atomic 的 cp 直接覆盖
+  # 碰撞的后果：render 写的 $outfile.render 会被 write_config_atomic 的 cp 直接覆盖
   # → 被 xray 校验的从来不是渲染出来的那份配置 → 渲染层的校验形同虚设。
   # 做法：mock mv 记录它的【源参数】，分别看两个函数各自用的是哪个后缀。
   mv_log="$atomic_dir/mv.log"
@@ -1088,13 +1088,31 @@ if [[ -n "$atomic_dir" ]]; then
   # mock 记录的是整行参数（"-f <src> <dst>"）→ 整行匹配必然对不上。
   # 两个断言之间日志是清空过的 → 子串匹配不会互相污染。
   assert_eq "1" "$(grep -Fc "$atomic_dir/rendered.json.render" "$mv_log" 2>/dev/null || printf 0)" \
-    "render_server_config 的暂存名必须是 .render（不得与 write 的 .new 撞名）"
+    "render_server_config 的暂存名必须是 .render（不得与 write 的 .new.<ext> 撞名）"
   : > "$mv_log"
   out=$( ( mv() { printf '%s\n' "$*" >> "$mv_log"; command mv "$@"; }
            xray_test_config() { return 0; }
            write_config_atomic "$atomic_dir/rendered.json" "$atomic_dir/src.json" ) 2>&1 ); rc=$?
-  assert_eq "1" "$(grep -Fc "$atomic_dir/rendered.json.new" "$mv_log" 2>/dev/null || printf 0)" \
-    "write_config_atomic 的暂存名必须是 .new"
+  assert_eq "1" "$(grep -Fc "$atomic_dir/rendered.new.json" "$mv_log" 2>/dev/null || printf 0)" \
+    "write_config_atomic 的暂存名必须是 .new.<ext>（扩展名必须保留）"
+
+  # ── 回归：暂存文件的扩展名必须是 xray 认识的格式扩展名 ──────────────────────
+  # 真机事故（Xray 26.10.21）：暂存名写成 "config.json.new" → 扩展名 "new" 未注册
+  # → xray 报 "core: Failed to get format of .../config.json.new"
+  # → 表现为「配置校验未通过」，但配置本身完全正确。
+  # 判据：被交给 xray_test_config 的路径必须以 .json 结尾（xray 靠扩展名认格式）。
+  # 注意：xray_test_config 在【子 shell】里定义 → 它对 checked_cfg 的赋值
+  # 不会传回父 shell → 必须让它写文件再读回来。
+  checked_log="$atomic_dir/checked.log"
+  : > "$checked_log"
+  out=$( ( xray_test_config() { printf '%s\n' "$1" >> "$checked_log"; return 0; }
+           write_config_atomic "$atomic_dir/rendered.json" "$atomic_dir/src.json" ) 2>&1 ); rc=$?
+  assert_status 0 "$rc" "write_config_atomic 校验通过时返回 0（扩展名回归用例）"
+  checked_cfg="$(tail -n 1 "$checked_log" 2>/dev/null)"
+  case "$checked_cfg" in
+    *.json) assert_eq "0" "0" "交给 xray 校验的暂存文件必须保留 .json 扩展名（xray 按扩展名认格式）" ;;
+    *)      assert_eq "0" "1" "交给 xray 校验的暂存文件必须保留 .json 扩展名（xray 按扩展名认格式）" ;;
+  esac
 
   # ── TG6 + D1：校验失败时必须【原样输出】xray 的真实报错 ──────────────────────────────
   # 旧实现只保留【最后一次】尝试的报错 → 现代 xray 上最后一次用的是旧语法
@@ -1136,16 +1154,102 @@ if [[ -n "$atomic_dir" ]]; then
   assert_contains "$out" "目录" "write_config_atomic 在目标路径是目录时给出明确提示"
 
   # ── D3：cp 失败必须清理半截的临时文件 ──────────────────────────────
-  out=$( ( cp() { printf 'PARTIAL\n' >"$atarget.new"; return 1; }
+  out=$( ( cp() { printf 'PARTIAL\n' >"$atomic_dir/config.new.json"; return 1; }
            write_config_atomic "$atarget" "$atomic_dir/src.json" ) 2>&1 ); rc=$?
   assert_status 1 "$rc" "write_config_atomic 在 cp 失败时返回非零"
-  if [[ -e "$atarget.new" ]]; then leftover=1; else leftover=0; fi
+  if [[ -e "$atomic_dir/config.new.json" ]]; then leftover=1; else leftover=0; fi
   assert_eq "0" "$leftover" "write_config_atomic 在 cp 失败时清理半截的临时文件"
 else
   assert_eq "mktemp -d 能创建唯一临时目录" "失败（mktemp -d 返回空路径）" \
     "write_config_atomic 用例前提：mktemp -d 必须能创建唯一临时目录"
 fi
 rm -rf "$atomic_dir"
+
+test_case "服务运行用户与配置属主（真机事故回归）"
+
+# 真机事故（Debian 13 + Xray 26.10.21）：
+#   unit 是 User=xray，配置却是 root:600 → xray 读不到
+#   → "open /usr/local/etc/xray/config.json: permission denied" → 退出码 23
+#   → 服务起不来，而脚本当时还误报「xray 服务已运行」。
+# 判据：服务以非 root 用户运行时，配置必须是 root:<组> 640（服务用户能读、他人读不到）。
+own_dir=$(mktemp -d 2>/dev/null)
+if [[ -n "$own_dir" ]]; then
+  own_file="$own_dir/config.json"
+  printf '{"ok":1}\n' >"$own_file"
+  own_log="$own_dir/perm.log"
+  : > "$own_log"
+  out=$( ( chmod() { printf '%s\n' "$*" >> "$own_log"; command chmod "$@"; }
+           chown() { printf 'chown %s\n' "$*" >> "$own_log"; command chown "$@" 2>/dev/null || true; }
+           service_run_user() { printf 'xray'; }
+           service_run_group() { printf 'xray'; }
+           apply_config_ownership "$own_file" 2>&1 ) ); rc=$?
+  assert_status 0 "$rc" "apply_config_ownership 在服务以非 root 用户运行时返回 0"
+  assert_eq "1" "$(grep -Fxc "640 $own_file" "$own_log" 2>/dev/null || printf 0)" \
+    "服务以非 root 用户运行时，配置必须是 640（组可读）"
+  assert_eq "1" "$(grep -Fxc "chown root:xray $own_file" "$own_log" 2>/dev/null || printf 0)" \
+    "服务以非 root 用户运行时，配置属组必须是服务用户所在组"
+
+  # 服务以 root 运行时：600 就够（不能无脑放宽成 644）
+  : > "$own_log"
+  out=$( ( chmod() { printf '%s\n' "$*" >> "$own_log"; command chmod "$@"; }
+           service_run_user() { printf 'root'; }
+           apply_config_ownership "$own_file" 2>&1 ) ); rc=$?
+  assert_status 0 "$rc" "apply_config_ownership 在服务以 root 运行时返回 0"
+  assert_eq "1" "$(grep -Fxc "600 $own_file" "$own_log" 2>/dev/null || printf 0)" \
+    "服务以 root 运行时，配置保持 600（不得放宽）"
+
+  # ── xray_service_alive：服务「启动后立刻死掉」必须被判为不存活 ──────────────
+  # 旧实现只看 `systemctl is-active`（Type=simple 的 unit 一 fork 就是 active）
+  # → 真机上进程 76ms 内退出 23，脚本仍判定「服务已运行」。
+  # 这里模拟：is-active 恒为真，但 SubState 变成 failed（= 进程已经死了）。
+  out=$( ( systemctl() { case "$1" in
+                          show) printf 'failed\n'; return 0 ;;
+                          is-active) return 0 ;;
+                        esac; return 0; }
+           xray_service_alive ) 2>&1 ); rc=$?
+  assert_status 1 "$rc" "xray_service_alive 必须把『启动后立刻死掉』的服务判为不存活"
+
+  # 正常服务：SubState=running、is-active 为真 → 判定为存活
+  out=$( ( systemctl() { case "$1" in
+                          show) printf 'running\n'; return 0 ;;
+                          is-active) return 0 ;;
+                        esac; return 0; }
+           xray_service_alive ) 2>&1 ); rc=$?
+  assert_status 0 "$rc" "xray_service_alive 在服务正常运行时判定为存活"
+
+  # ── setup_systemd：服务起来后又死掉 → 必须返回非零（不得误报「已运行」） ──────
+  out=$( ( have_cmd() { return 0; }; tui_run() { return 0; }
+           systemctl() { case "$1" in
+                           show) printf 'failed\n'; return 0 ;;
+                           *) return 0 ;;
+                         esac; }
+           journalctl() { printf 'xray: Failed to start.\n'; }
+           service_run_user() { printf 'root'; }
+           setup_systemd 2>&1 ) ); rc=$?
+  assert_status 1 "$rc" "setup_systemd 在服务启动后立刻退出时必须返回非零"
+  assert_contains "$out" "xray 服务未能启动" "setup_systemd 不得在服务已死时误报已运行"
+
+  # ── 监听地址：IPv6 对外地址不能只听 IPv4 ──────────────────────────────
+  # 真机事故（IPv6-only 的 Vultr 机器）：模板写死 "listen": "0.0.0.0" →
+  # 服务起来了、面板也显示「已运行」，但客户端连 [2001:db8::1]:443 直接被拒。
+  out=$( ( SERVER_IP='2001:db8::1'; choose_listen_addr ) 2>&1 )
+  assert_eq "::" "$out" "对外地址是 IPv6 时必须监听 ::（否则 IPv6 客户端连不上）"
+  out=$( ( SERVER_IP='1.2.3.4'; have_global_ipv6() { return 1; }
+           choose_listen_addr ) 2>&1 )
+  assert_eq "0.0.0.0" "$out" "对外地址是 IPv4 且本机无 IPv6 时监听 0.0.0.0"
+  # 渲染出来的配置必须真的用上这个监听地址
+  out=$( ( SERVER_IP='2001:db8::1'
+           render_server_config "$own_dir/r.json" \
+             "11111111-2222-3333-4444-555555555555" \
+             "PRIVKEY0123456789abcdefghijklmnopqrstuvwxyzABCDE" \
+             "www.microsoft.com" "443" "a1b2c3d4" >/dev/null 2>&1
+           cat "$own_dir/r.json" ) 2>&1 )
+  assert_contains "$out" '"listen": "::"' "服务端配置必须按对外地址族选择监听地址"
+else
+  assert_eq "mktemp -d 能创建唯一临时目录" "失败（mktemp -d 返回空路径）" \
+    "属主用例前提：mktemp -d 必须能创建唯一临时目录"
+fi
+rm -rf "$own_dir"
 
 test_case "deploy 系统操作的可测分支"
 

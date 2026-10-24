@@ -418,23 +418,34 @@ Xray 内核要从 GitHub 下载。而 GitHub 的**主站与 release 资源**
    网络不通或被中间设备拦下时，那一条断言会红 —— 这是**已知的**环境依赖，不是代码缺陷。
 7. **`nft` 的 handle 语义未实测** —— 本机没有 `nft` → 只能验证
    「代码取的是 handle 而不是行号」，无法验证真实 `nft` 的行为。
-8. **真实 systemd 的启停未验证** —— `systemctl disable --now xray`
-   与 `systemctl enable --now xray` 的真实行为没在装了 systemd 的机器上跑过。
-9. **REALITY 握手未验证** —— 部署出来的节点没有与真实客户端握过手。
-10. **完整部署流程未在 Debian 真机上端到端跑过** —— 但**内核安装这一步已经实测**：
-    在一台真实的 Debian 13 (trixie) / x86_64 服务器上跑通了「直连 GitHub 失败 →
-    自动回退镜像 → 下载 → SHA-256 校验 → 解压 → 安装二进制 → 建 xray 用户 →
-    写 systemd unit」的完整链路（详见「已验证清单」）。
-    尚未在真机上跑过的是：配置生成与 `xray run -test` 校验、systemd 单元的启停、
-    防火墙放行、分享链接的客户端导入与 REALITY 握手。
-11. **`ss` 的过滤语法未在真实环境验证** —— `ss -ltn "sport = :$port"` 这条过滤语法
-    本机没有 `ss`、无法实测；退化分支 `netstat -ltn` 同理。
+8. **真实 systemd 的启停未在「卸载」方向验证** —— `systemctl enable --now xray`
+   与服务存活判定已在真机验证（见「已验证清单」）；
+   但 `systemctl disable --now xray`（卸载路径）没有在真机上跑过。
+9. **REALITY 握手已在真机端到端验证，但用的不是第三方客户端 App** ——
+   用**本工具导出的** `client.json` 起了一个本地 xray 客户端，
+   经 SOCKS 出网拿到 HTTP 200，日志显示 `[socks-in >> proxy]`；
+   但 v2rayN / Clash Verge 等**真实客户端 App 的导入与握手仍未实测**。
+10. **完整部署流程已在 Debian 真机上端到端跑通** —— 在一台真实的
+    Debian 13 (trixie) / x86_64 / **IPv6-only（IPv4 仅 CGNAT、无公网 IPv4）** 的服务器上，
+    从「安装内核」到「服务监听 443」「REALITY 握手出网 200」全链路跑通
+    （详见「已验证清单」）。
+    首次真机运行暴露了三个**只在这台机器上才出现**的缺陷，已全部修复：
+    (a) 暂存配置写成 `config.json.new` → 新版 Xray 按扩展名认格式 →
+        `core: Failed to get format of ...`（旧版 Xray 不扩展名，CI 里永远发现不了）；
+    (b) 服务以 `User=xray` 运行，而配置是 `root:600` → xray 读不到配置、退出码 23，
+        而脚本当时还误报「服务已运行」；
+    (c) inbound 写死 `listen: 0.0.0.0` → IPv6-only 的机器上客户端连不上。
+11. **`ss` 的过滤语法已在真机验证** —— `ss -ltn "sport = :$port"` 在 Debian 13 上可用；
+    退化分支 `netstat -ltn` 仍未实测。
+12. **真实终端下的 TUI 交互与按键响应未在真机验证** —— 开发环境是 Windows + Git Bash，
+    只能用 `TUI_TTY=1` + 管道喂按键模拟；真终端（ssh 交互式会话）下的
+    方向键/数字键/超时取消路径仍属模拟验证。
 
 ### 已知风险
 
 > 以下是**已确知、无法在本工具内消除**的风险 —— 同样必须**逐条**点名。
 
-12. **安装包的信任链止于官方 `.dgst`** —— 工具会用官方发布的 `.dgst` 里的 SHA-256
+13. **安装包的信任链止于官方 `.dgst`** —— 工具会用官方发布的 `.dgst` 里的 SHA-256
     校验内核压缩包，且校验文件**优先从直连 GitHub 取**；但当直连 GitHub 不可达时
     （这正是要走镜像/离线的场景），校验文件只能退回**同源**取 ——
     此时「包」与「校验文件」来自同一个镜像，校验只能发现**传输损坏**，
@@ -455,15 +466,25 @@ Xray 内核要从 GitHub 下载。而 GitHub 的**主站与 release 资源**
   - 新下载链**自动回退**到内置镜像并成功取到 `Xray-linux-64.zip`；
   - 官方 `.dgst` 的 **SHA-256 校验通过**；
   - 解压、安装二进制（`/usr/local/bin/xray`，Xray 26.10.21）、创建 `xray` 用户、
-    写入 `/etc/systemd/system/xray.service` —— 全流程 **3 秒**完成。
+    写入 `/etc/systemd/system/xray.service` —— 全流程 **3 秒**完成；
+  - **配置生成 + `xray run -test` 校验通过**（新版 Xray 26.10.21 会按扩展名认格式，
+    暂存文件必须保留 `.json` 扩展名 —— 这条只有真机才会暴露）；
+  - **systemd 单元启停 + 服务存活判定通过**：`systemctl is-active` = `active`、
+    `SubState` = `running`；服务以 `User=xray` 运行，配置为 `root:xray 640`，
+    `xray` 用户可读、其他人不可读；
+  - **监听地址正确**：对外地址是 IPv6 → inbound 监听 `::`（双栈），
+    `ss -lntp` 显示 `*:443`，从公网 IPv6 地址连 443 **TCP 握手成功**；
+  - **防火墙放行通过**：`ufw` 放行 443/tcp（v4 与 v6 均生效）；
+  - **REALITY 握手端到端通过**：用本工具导出的 `client.json` 起本地 xray 客户端，
+    经 SOCKS 出网拿到 **HTTP 200**，日志显示 `[socks-in >> proxy]`。
 
 ### 整体验证边界
 
-**Debian 真机端到端部署尚未在本开发环境验证** —— 开发环境是 Windows + Git Bash，
-没有 Debian、没有 Docker、没有真 TTY。因此以下环节**都没有**在真实目标机上跑过：
-配置生成与 `xray run -test` 校验、systemd 单元的启停、防火墙放行（ufw/iptables/nft）、
-REALITY 握手、真实终端下的 TUI 交互与按键响应、`ss` 的端口过滤。
-**内核安装**这一环已单独在真机上实测通过（见上）。
+**Debian 真机的部署链路已经端到端验证**（安装内核 → 生成配置 → 校验 → 写 unit →
+起服务 → 放行端口 → REALITY 握手出网），但验证是在**一台**具体机器上做的
+（IPv6-only、systemd、ufw、Xray 26.10.21）。以下环节**仍然没有**在真实目标机上跑过：
+真实终端下的 TUI 交互与按键响应、第三方客户端 App（v2rayN / Clash 等）的导入与握手、
+`iptables` / `nft` 分支的防火墙放行、卸载路径的真机行为、`shellcheck`。
 **已验证**的只有上面「已验证清单」里列出的那几项。
 
 ## 卸载说明

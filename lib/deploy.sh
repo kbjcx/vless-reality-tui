@@ -70,10 +70,18 @@ gen_keys() {
 #     校验与落位到正式路径由 write_config_atomic 负责。
 #   · 调用方**必须**传一个【暂存路径】（例如 mktemp 出来的文件），
 #     绝不能把正式配置路径直接传进来 —— 那会绕过 xray run -test 校验。
-#   · 内部暂存名用 ".render" 后缀，与 write_config_atomic 的 ".new" 区分开，
+#   · 内部暂存名用 ".render" 后缀，与 write_config_atomic 的 ".new.<ext>" 区分开，
 #     避免两者在同一条路径上撞名。
 render_server_config() {
   local outfile="$1" uuid="$2" priv="$3" sni="$4" port="$5" sid="$6"
+  # 监听地址：不能写死 "0.0.0.0"（IPv6-only 的机器上只听 IPv4 → 客户端连不上，
+  # 见 core.sh 的 choose_listen_addr）。LISTEN_ADDR 可显式指定，否则自动判断。
+  local listen_addr="${LISTEN_ADDR:-}"
+  if [[ -z "$listen_addr" ]]; then
+    listen_addr=$(choose_listen_addr)
+  fi
+  # 白名单：监听地址会被原样拼进 JSON → 只允许 IP 字面量
+  is_valid_ip "$listen_addr" || { tui_err "监听地址非法：$listen_addr"; return 1; }
   # ── 入参白名单校验（必须【先做】）────────────────────────────
   # 本函数用【未加引号的 heredoc】渲染 JSON → 入参里的 $(...) / 反引号会被
   # 【真实执行】。控制器实证：把 '$(echo PWNED)' 传进 ShortID 或 SNI，
@@ -108,7 +116,7 @@ render_server_config() {
   "inbounds": [
     {
       "tag": "vless-reality-in",
-      "listen": "0.0.0.0",
+      "listen": "${listen_addr}",
       "port": ${port},
       "protocol": "vless",
       "settings": {
@@ -151,7 +159,8 @@ render_server_config() {
     {
       "tag": "direct",
       "protocol": "freedom",
-      "settings": {
+      "settings": {},
+      "sockopt": {
         "domainStrategy": "UseIP"
       }
     },
@@ -247,6 +256,42 @@ xray_test_config() {
   return 1
 }
 
+# 让【服务运行用户】能读到配置文件。
+#
+# ⚠️ 这里是真机踩过的坑：服务端配置含 REALITY 私钥，权限收紧到 root:600，
+# 但 systemd unit 是 User=xray → xray 进程根本读不到配置：
+#     Failed to start: main: failed to load config files: [/usr/local/etc/xray/config.json]
+#     > open /usr/local/etc/xray/config.json: permission denied
+# → 退出码 23 → 服务永远起不来。
+# 而当时的脚本【还误报「xray 服务已运行」】（见 setup_systemd 的存活校验）。
+# 早先的注释写的是「systemd unit 没有 User= → xray 以 root 运行 → 600 不会挡住它读配置」，
+# 与实际写出来的 unit（User=xray）矛盾 —— 注释是错的，实现跟着错。
+#
+# 做法：属主仍留 root（root 永远能改），但把【属组】给服务运行用户 + 组读权限 640：
+#   · 服务用户能读 → 服务能起；
+#   · 其他用户读不到 → 私钥不外泄；
+#   · root 属主 → root 随时可改（管理菜单的轮换密钥走的就是这条路）。
+apply_config_ownership() {
+  local f="$1" run_user grp
+  [[ -f "$f" ]] || return 0
+  run_user=$(service_run_user)
+  if [[ -z "$run_user" || "$run_user" == 'root' ]]; then
+    # 以 root 跑：600 就够了
+    chmod 600 "$f" || return 1
+    return 0
+  fi
+  grp=$(service_run_group)
+  if [[ -n "$grp" ]] && chown "root:$grp" "$f" 2>/dev/null; then
+    chmod 640 "$f" || return 1
+  else
+    # 拿不到组（用户不存在 / chown 失败）→ 退而求其次：属主给服务用户，
+    # 权限同样收紧到 600 —— 服务能读到，其他人读不到。
+    chown "$run_user" "$f" 2>/dev/null || true
+    chmod 600 "$f" || return 1
+  fi
+  return 0
+}
+
 # 写临时文件 → 校验 → 原子替换。校验失败保留旧文件并输出 xray 报错。
 # 用法: write_config_atomic <目标文件> <源文件>
 #   源文件是刚渲染出来的配置（尚未落位）；本函数负责把它校验后原子替换到目标。
@@ -255,7 +300,30 @@ xray_test_config() {
 #   就漏了输出 xray 的原始报错，用户只看到一句「新配置校验未通过」。
 write_config_atomic() {
   local outfile="$1" src="$2"
-  local tmp="$outfile.new"
+  # ⚠️ 暂存名必须【保留原扩展名】—— 这是新版 Xray 的硬性要求。
+  #
+  # Xray 25+ 起改用「按扩展名决定配置格式」的加载器（core.ConfigFormat 注册表）：
+  # .json/.jsonc → JSON，.yaml/.yml → YAML，.toml → TOML，.pb → protobuf。
+  # 扩展名不在注册表里 → 直接拒绝加载：
+  #     core: Failed to get format of /usr/local/etc/xray/config.json.new
+  # 旧写法 "$outfile.new"（config.json.new）的扩展名是 "new" → 未注册 →
+  # 新版 xray 一律拒绝，而配置本身完全正确（真机实证：Xray 26.10.21，
+  # 用户侧表现为「配置校验未通过，已保留原有配置不变」+ 上面那行报错）。
+  # 旧版 xray（只看内容不看扩展名）上这个写法是好的 → 属于典型的
+  # 「本地测试全绿、真机必红」：CI 里没有真 xray 就永远发现不了。
+  #
+  # 改法：把标记放在扩展名【前面】—— config.json → config.new.json。
+  #  · 扩展名仍是 json → 新旧 xray 都能加载；
+  #  · 同目录 → mv 仍是同分区的原子替换；
+  #  · 名字里仍带 "new" → 与 render 的 ".render" 不撞名，排查时一眼看得出是暂存文件。
+  local base ext tmp
+  if [[ "$outfile" == *.* ]]; then
+    base="${outfile%.*}"; ext="${outfile##*.}"
+  else
+    base="$outfile"; ext="json"
+  fi
+  [[ -n "$base" && -n "$ext" ]] || { base="$outfile"; ext="json"; }
+  tmp="$base.new.$ext"
   [[ -f "$src" ]] || { tui_err "源配置不存在：$src"; return 1; }
   # 同 render_server_config：目标路径是【已存在的目录】时，
   # `mv -f "$tmp" "$outfile"` 会把文件移进目录里 → mv 返回 0（看起来成功）
@@ -281,7 +349,10 @@ write_config_atomic() {
     return 1
   fi
   mv -f "$tmp" "$outfile" || { tui_err "无法写入配置文件：$outfile"; rm -f "$tmp"; return 1; }
-  chmod 600 "$outfile" || { tui_err "无法设置配置文件权限：$outfile"; return 1; }
+  # 权限必须按【服务运行用户】来定，而不是一律 600 root：
+  # unit 是 User=xray 时，600 root 的配置它读不到（真机事故：xray 启动即退出 23）。
+  # 失败不阻断：setup_systemd 在真正启动前还会再执行一次，那一次是权威判定。
+  apply_config_ownership "$outfile" || tui_warn "无法调整配置文件权限：$outfile"
   return 0
 }
 xray_installed() { [[ -x "$XRAY_BIN" ]]; }
@@ -613,32 +684,76 @@ install_xray() {
   return 0
 }
 
+# 服务「真的活着」的判定。
+#
+# ⚠️ `systemctl start/restart` 返回 0 ≠ 服务活着：Type=simple 的 unit 在
+# ExecStart 进程一启动就算 "active"，哪怕它 70ms 后就因为配置读不到而退出。
+# 真机上正是这样：xray 进程 76ms 内以退出码 23 结束，
+# 而脚本当时判定 `systemctl is-active --quiet xray` 为真 → 打印「xray 服务已运行」，
+# 用户拿到一台【服务根本没起来】的服务器。
+# 判定方法：启动后等一小会儿（让进程有机会死掉），再查 active 状态。
+xray_service_alive() {
+  local waited=0 sub
+  # ⚠️ 不能「一看到 active 就返回」：Type=simple 的 unit 在 ExecStart 进程
+  # 刚 fork 出来时就是 active，哪怕它 70ms 后就死了（真机：退出码 23）。
+  # 所以先给一个「起不来就会死」的时间窗（2 秒），
+  # 期间一旦 SubState 变成 failed 就立刻判失败；时间窗过后再查 active。
+  # 用 SubState 而不是 `is-failed`：is-failed 在【任何】systemctl 返回 0 的
+  # 情况下都算「failed」（单测里 systemctl 是整体 mock 的），SubState 才是状态本身。
+  while (( waited < 8 )); do
+    sub=$(systemctl show -p SubState --value xray 2>/dev/null || printf '')
+    if [[ "$sub" == "failed" ]]; then
+      return 1
+    fi
+    sleep 0.25
+    waited=$((waited + 1))
+  done
+  systemctl is-active --quiet xray 2>/dev/null
+}
+
 setup_systemd() {
   if ! have_cmd systemctl; then
     tui_err "未找到 systemctl，systemd 不可用"
     return 1
   fi
-  tui_run "启用并启动 xray 服务" systemctl enable --now xray
-  if ! systemctl is-active --quiet xray; then
-    tui_err "xray 服务未能启动，最近日志如下："
-    journalctl -u xray -n 30 --no-pager 2>/dev/null | sed -e 's/^/      /' || true
-    return 1
-  fi
-  # 依据实际运行用户授权日志目录
-  local run_user svc_user
+  # ── 顺序很重要：先把服务启动【需要】的东西准备好，再启动服务 ──────────
+  # ① 日志目录 + 日志文件：xray 以 xray 用户跑时写不了 root 属主的日志文件 →
+  #    （真机事故：日志文件是 root:600，xray 起不来）
+  # ② 配置文件属主：配置是 root:600 时，xray 用户读不到 → 退出码 23
+  # 这两件事都必须【在 enable --now 之前】做完。
+  local run_user svc_user svc_group
   run_user=$(service_run_user)
   if [[ "$run_user" != "root" ]]; then
     svc_user="$run_user"
+    svc_group=$(service_run_group)
     # mkdir 的退出码必须检查：失败时后面仍然会打印「日志目录已授权」→ 谎报。
     # 目录建不出来时 xray 写不了日志，用户却以为一切正常。
     if ! mkdir -p "$LOG_DIR"; then
       tui_warn "无法创建日志目录 $LOG_DIR，xray 可能无法写入日志。"
     else
       if id "$svc_user" >/dev/null 2>&1; then
-        chown -R "$svc_user" "$LOG_DIR" 2>/dev/null || true
+        chown -R "$svc_user${svc_group:+:$svc_group}" "$LOG_DIR" 2>/dev/null || true
       fi
       tui_tip "日志目录已授权给运行用户 $svc_user"
     fi
+  fi
+  # 配置文件的属主/权限：必须与【服务的运行用户】匹配。
+  # unit 是 User=xray 时，root:600 的配置 xray 读不到 → 启动即退出 23。
+  if [[ -f "$XRAY_CONFIG" ]]; then
+    if ! apply_config_ownership "$XRAY_CONFIG"; then
+      tui_err "无法设置配置文件权限，xray 可能读不到配置：$XRAY_CONFIG"
+      return 1
+    fi
+    tui_tip "配置文件权限已按运行用户调整：$XRAY_CONFIG"
+  fi
+
+  tui_run "启用并启动 xray 服务" systemctl enable --now xray
+  # ⚠️ 必须用 xray_service_alive（带等待）而不是立刻 is-active ——
+  # 进程「启动后立刻死掉」是这个场景的真凶。
+  if ! xray_service_alive; then
+    tui_err "xray 服务未能启动，最近日志如下："
+    journalctl -u xray -n 30 --no-pager 2>/dev/null | sed -e 's/^/      /' || true
+    return 1
   fi
   tui_ok "xray 服务已运行"
   return 0
@@ -646,7 +761,7 @@ setup_systemd() {
 
 restart_service() {
   tui_run "重启 xray 服务" systemctl restart xray
-  if systemctl is-active --quiet xray; then
+  if xray_service_alive; then
     tui_ok "xray 服务重启成功"
     return 0
   fi
@@ -1040,7 +1155,7 @@ deploy_wizard() {
   local fw_row="已放行 $PORT/tcp"
   [[ "${FIREWALL_OK:-1}" -eq 1 ]] || fw_row="放行失败，请手工放行 $PORT/tcp"
   tui_panel "部署完成" \
-    "地址|$SERVER_IP:$PORT" \
+    "地址|$(host_for_url "$SERVER_IP"):$PORT" \
     "UUID|$UUID" \
     "SNI|$SNI" \
     "公钥 pbk|$PUBLIC_KEY" \
@@ -1083,7 +1198,7 @@ menu_show_client() {
   # 生成为空说明参数有问题（缺 UUID/公钥/地址）→ 必须报错，不能展示一片空白。
   [[ -n "$link" ]] || { tui_err "分享链接生成为空，状态文件可能不完整。"; return 1; }
   tui_panel "当前节点" \
-    "地址|$SERVER_IP:$PORT" \
+    "地址|$(host_for_url "$SERVER_IP"):$PORT" \
     "UUID|$UUID" \
     "SNI|$SNI" \
     "公钥 pbk|$PUBLIC_KEY" \
