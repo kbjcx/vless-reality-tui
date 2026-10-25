@@ -426,6 +426,14 @@ port_occupant() {
   printf ''
 }
 
+port_owned_by_our_xray() {
+  # $1 = port_occupant 的输出（形如 users:(("xray",pid=123,fd=3))）
+  # 判定「这个被占用的端口，是本工具自己部署的 xray 服务占着的」→
+  # 即「重部署」场景 → 应当沿用同一个端口，而不是改用随机端口。
+  local occ="$1"
+  [[ "$occ" == *xray* ]] && [[ -f "$XRAY_SERVICE_UNIT" ]]
+}
+
 random_free_port() {
   local p
   for _ in $(seq 1 40); do

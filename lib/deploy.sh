@@ -747,7 +747,16 @@ setup_systemd() {
     tui_tip "配置文件权限已按运行用户调整：$XRAY_CONFIG"
   fi
 
-  tui_run "启用并启动 xray 服务" systemctl enable --now xray
+  # ⚠️ 必须用 enable + restart，不能用 `enable --now`：
+  #   `systemctl enable --now xray` 在服务【已经运行】时是【空操作】——
+  #   systemd 只保证「它在跑」，不会让它重新读取刚写好的配置。
+  #   真机事故：用户在已有部署的机器上重跑安装器 → 新配置（端口 30356、
+  #   新密钥）写进了文件、ufw 也放行了新端口，但跑着的还是旧进程
+  #   （journal 里没有任何新的 "Started xray.service"）→ 客户端按新端口连，
+  #   服务却还在监听旧端口 → 「连不上」，且服务端日志一片空白。
+  #   restart 会停掉旧进程、用新配置重新拉起；服务没在跑时 restart 等于 start。
+  tui_run "启用并启动 xray 服务" systemctl enable xray
+  tui_run "重启 xray 服务（加载新配置）" systemctl restart xray
   # ⚠️ 必须用 xray_service_alive（带等待）而不是立刻 is-active ——
   # 进程「启动后立刻死掉」是这个场景的真凶。
   if ! xray_service_alive; then
@@ -1033,54 +1042,65 @@ deploy_wizard() {
   if port_in_use "$PORT"; then
     local occ
     occ=$(port_occupant "$PORT")
-    tui_warn "端口 $PORT 已被占用${occ:+（$occ）}"
-    if [[ ${OPT_YES:-0} -eq 1 ]]; then
-      PORT=$(random_free_port)
-      # ⚠️ random_free_port 的兜底端口 44321 从未校验过是否被占用
-      #    → 这里【必须】再验一次，否则会把一个占用端口写进 config.json，
-      #    直到 systemd 阶段才以「address already in use」失败。
-      [[ -n "$PORT" ]] || { tui_err "找不到空闲端口，部署中止。"; return 1; }
-      if port_in_use "$PORT"; then
-        tui_err "端口 $PORT 仍被占用，部署中止。"
-        return 1
-      fi
-      tui_tip "已自动改用空闲端口：$PORT"
+    # ⚠️ 占用者就是【本工具自己部署的 xray 服务】→ 这不是「冲突」，是「重部署」：
+    #   旧实例占着端口是正常的（它正跑着上一份配置）。
+    #   正确做法：沿用同一个端口，部署末尾重启服务加载新配置。
+    #   误判成冲突 → 自动改用随机端口 → 服务换到别的端口，
+    #   而客户端还指着旧端口 → 「连不上」，服务端日志一条都没有（真机事故：
+    #   重跑安装器后服务仍在 443、配置却写成 30356）。
+    if port_owned_by_our_xray "$occ"; then
+      tui_tip "端口 $PORT 正由本工具已部署的 xray 服务占用（重部署场景）"
+      tui_tip "沿用该端口，部署末尾会重启服务以加载新配置。"
     else
-      # 同上：用返回码取选中项，不要用 $(...) 捕获 stdout
-      local choice=0 crc=0
-      tui_menu "如何处理端口冲突？" \
-        "改用随机空闲端口" \
-        "我手动指定其它端口" \
-        "取消部署" || crc=$?
-      if (( crc == 255 )); then
-        choice=2
+      tui_warn "端口 $PORT 已被占用${occ:+（$occ）}"
+      if [[ ${OPT_YES:-0} -eq 1 ]]; then
+        PORT=$(random_free_port)
+        # ⚠️ random_free_port 的兜底端口 44321 从未校验过是否被占用
+        #    → 这里【必须】再验一次，否则会把一个占用端口写进 config.json，
+        #    直到 systemd 阶段才以「address already in use」失败。
+        [[ -n "$PORT" ]] || { tui_err "找不到空闲端口，部署中止。"; return 1; }
+        if port_in_use "$PORT"; then
+          tui_err "端口 $PORT 仍被占用，部署中止。"
+          return 1
+        fi
+        tui_tip "已自动改用空闲端口：$PORT"
       else
-        choice=$crc
+        # 同上：用返回码取选中项，不要用 $(...) 捕获 stdout
+        local choice=0 crc=0
+        tui_menu "如何处理端口冲突？" \
+          "改用随机空闲端口" \
+          "我手动指定其它端口" \
+          "取消部署" || crc=$?
+        if (( crc == 255 )); then
+          choice=2
+        else
+          choice=$crc
+        fi
+        case $choice in
+          0) PORT=$(random_free_port)
+              [[ -n "$PORT" ]] || { tui_err "找不到空闲端口，部署中止。"; return 1; }
+              if port_in_use "$PORT"; then
+                tui_err "端口 $PORT 仍被占用，部署中止。"
+                return 1
+              fi
+              tui_tip "已改用端口 $PORT" ;;
+          1) PORT=$(tui_input "请输入新端口" "$PORT" "1-65535")
+              # 用 10# 前缀：裸算术会把 "08" 当八进制，直接报「value too great for base」。
+              # ⚠️ 必须是 10#$PORT（带 $）：bash 不会在 10# 后解析【变量名】，
+              #    10#PORT 会被当成「以 10 为基的数字 PORT」→ 直接报
+              #    "value too great for base" → 用户手动指定的端口【必然】被判非法。
+              [[ "$PORT" =~ ^[0-9]+$ ]] && (( 10#$PORT > 0 && 10#$PORT < 65536 )) || { tui_err "端口非法"; return 1; }
+              # 手动指定的端口同样必须复查占用：只校验范围不校验占用 →
+              # 用户会一路走到 systemd 才炸，首句报错是「systemd 配置失败」，
+              # 与真实原因（端口被占）完全无关 —— 正是本轮修掉的 T9-7 抱怨过的那类错。
+              if port_in_use "$PORT"; then
+                tui_err "端口 $PORT 已被占用，请另选一个。"
+                return 1
+              fi ;;
+          *) tui_info "已取消部署"; return 1 ;;
+        esac
       fi
-      case $choice in
-        0) PORT=$(random_free_port)
-            [[ -n "$PORT" ]] || { tui_err "找不到空闲端口，部署中止。"; return 1; }
-            if port_in_use "$PORT"; then
-              tui_err "端口 $PORT 仍被占用，部署中止。"
-              return 1
-            fi
-            tui_tip "已改用端口 $PORT" ;;
-        1) PORT=$(tui_input "请输入新端口" "$PORT" "1-65535")
-            # 用 10# 前缀：裸算术会把 "08" 当八进制，直接报「value too great for base」。
-            # ⚠️ 必须是 10#$PORT（带 $）：bash 不会在 10# 后解析【变量名】，
-            #    10#PORT 会被当成「以 10 为基的数字 PORT」→ 直接报
-            #    "value too great for base" → 用户手动指定的端口【必然】被判非法。
-            [[ "$PORT" =~ ^[0-9]+$ ]] && (( 10#$PORT > 0 && 10#$PORT < 65536 )) || { tui_err "端口非法"; return 1; }
-            # 手动指定的端口同样必须复查占用：只校验范围不校验占用 →
-            # 用户会一路走到 systemd 才炸，首句报错是「systemd 配置失败」，
-            # 与真实原因（端口被占）完全无关 —— 正是本轮修掉的 T9-7 抱怨过的那类错。
-            if port_in_use "$PORT"; then
-              tui_err "端口 $PORT 已被占用，请另选一个。"
-              return 1
-            fi ;;
-        *) tui_info "已取消部署"; return 1 ;;
-      esac
-    fi
+      fi
   fi
 
   # SERVER_IP 由 preflight 负责探测，但 --menu 路径【不经过 preflight】

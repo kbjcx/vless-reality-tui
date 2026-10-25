@@ -1291,6 +1291,25 @@ assert_contains "$out" "--local" "install_xray 下载失败时提示离线包走
 if [[ "$out" == *"Xray 安装完成"* ]]; then lied=1; else lied=0; fi
 assert_eq "0" "$lied" "install_xray 下载失败时不得谎报『Xray 安装完成』"
 
+# ── 端口被【本工具自己的 xray 服务】占用时，必须沿用该端口 ──────────────
+# 真机事故：重跑安装器 → 旧实例占着 443 → 被误判成「端口冲突」→
+# 自动改用随机端口 30356 → 服务（因为没重启）还在 443、配置却写成 30356 →
+# 客户端按 30356 连不上，而服务端日志一条都没有。
+own_unit="$(mktemp 2>/dev/null)"
+if [[ -n "$own_unit" ]]; then
+  : > "$own_unit"
+  out=$( ( XRAY_SERVICE_UNIT="$own_unit"
+           port_owned_by_our_xray 'users:(("xray",pid=123,fd=3))' ) 2>&1 ); rc=$?
+  assert_status 0 "$rc" "端口被自己的 xray 服务占用时必须判定为「重部署」（沿用原端口）"
+  out=$( ( XRAY_SERVICE_UNIT="$own_unit"
+           port_owned_by_our_xray 'users:(("nginx",pid=123,fd=3))' ) 2>&1 ); rc=$?
+  assert_status 1 "$rc" "端口被【别的】进程占用时不得判定为「重部署」"
+  out=$( ( XRAY_SERVICE_UNIT="/nonexistent/xray.service"
+           port_owned_by_our_xray 'users:(("xray",pid=123,fd=3))' ) 2>&1 ); rc=$?
+  assert_status 1 "$rc" "没有本工具的 unit 文件时不得判定为「重部署」"
+  rm -f "$own_unit"
+fi
+
 # ── setup_systemd：服务未运行时必须返回非零并输出 xray 的原始日志 ──────────────
 # systemctl / journalctl / tui_run 全部 mock：绝不能真的动宿主机的 systemd。
 out=$( ( have_cmd() { return 0; }; tui_run() { return 0; }
@@ -1308,6 +1327,31 @@ out=$( ( have_cmd() { return 0; }; tui_run() { return 0; }
          service_run_user() { printf 'root'; }
          setup_systemd 2>&1 ) ); rc=$?
 assert_status 0 "$rc" "setup_systemd 在服务正常运行时返回 0"
+
+# ── setup_systemd：必须【重启】服务，不能只 enable --now ──────────────────
+# 真机事故：在已有部署的机器上重跑安装器 → 新配置写进文件、ufw 也放行了新端口，
+# 但 `systemctl enable --now` 对【已在运行】的服务是空操作 → 跑着的还是旧进程
+# → 客户端按新端口连不上，服务端日志一条没有。
+# 判据：systemctl 的调用里必须出现 restart。
+syslog="$(mktemp 2>/dev/null)"
+if [[ -n "$syslog" ]]; then
+  : > "$syslog"
+  out=$( ( have_cmd() { return 0; }
+           # tui_run 的第一个参数是【描述】，后面才是命令 → 这里必须真的执行，
+           # 否则 systemctl 根本不会被调用，下面两条断言全是恒真。
+           tui_run() { local _d="$1"; shift; "$@"; }
+           systemctl() { printf '%s\n' "$*" >> "$syslog"; return 0; }
+           service_run_user() { printf 'root'; }
+           setup_systemd 2>&1 ) ); rc=$?
+  assert_eq "1" "$(grep -Fxc "restart xray" "$syslog" 2>/dev/null || printf 0)" \
+    "setup_systemd 必须重启 xray 服务（enable --now 不会让已在跑的服务加载新配置）"
+  if grep -Fq "enable --now" "$syslog" 2>/dev/null; then
+    assert_eq "0" "1" "setup_systemd 不得使用 enable --now（对已在运行的服务是空操作）"
+  else
+    assert_eq "0" "0" "setup_systemd 不得使用 enable --now（对已在运行的服务是空操作）"
+  fi
+  rm -f "$syslog"
+fi
 
 # ── restart_service：服务未运行时必须返回非零 ──────────────
 out=$( ( tui_run() { return 0; }; systemctl() { return 3; }
