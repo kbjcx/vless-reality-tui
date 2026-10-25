@@ -1977,6 +1977,33 @@ out=$( ( INSTALL_SH_NO_MAIN=1; source "$ROOT/install.sh"
 assert_status 1 "$rc" "preflight 缺 curl 时返回非零"
 assert_contains "$out" "无法下载安装脚本" "preflight 缺 curl 时给出明确提示"
 
+# ── IPv4 出口检测（IPv6-only 机器上的固有限制）──────────────────────────
+# 真机事故：Vultr IPv6-only 套餐 → github.com/api.github.com 只有 IPv4 →
+# 经代理必然失败，而 raw.githubusercontent.com（有 AAAA）却能通 → 看着像时好时坏。
+# ⚠️ curl 也要 mock：WARP/MASQUE 这类隧道不建 IPv4 默认路由，判定会落到实际探测上
+#    → 不 mock 就会真的联网，测试结果随网络环境漂移。
+out=$( ( ip() { printf 'default via 10.0.0.1 dev eth0\n'; }; curl() { return 0; }
+         ipv4_egress_available ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "有 IPv4 默认路由时必须判定为有 IPv4 出口"
+out=$( ( ip() { printf ''; }; curl() { return 1; }
+         ipv4_egress_available ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "无 IPv4 默认路由且探测失败时必须判定为无 IPv4 出口"
+# 没有默认路由、但实际探测通（WARP/MASQUE 隧道）→ 必须判定为有出口
+out=$( ( ip() { printf ''; }; curl() { return 0; }
+         ipv4_egress_available ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "没有默认路由但实际能出 IPv4（如 WARP 隧道）时必须判定为有出口"
+
+# ── preflight：没有 IPv4 出口时必须提前告知（否则用户会以为代理坏了）──
+out=$( ( INSTALL_SH_NO_MAIN=1; source "$ROOT/install.sh"
+         assert_debian() { return 0; }
+         have_cmd() { return 0; }
+         ensure_packages() { return 0; }
+         detect_public_ip() { printf '203.0.113.9'; }
+         ipv4_egress_available() { return 1; }
+         preflight ) 2>&1 ); rc=$?
+assert_contains "$out" "没有 IPv4 出口" "preflight 在没有 IPv4 出口时必须明确提示"
+assert_contains "$out" "github.com" "preflight 必须点名纯 IPv4 站点（github.com）"
+
 # ── preflight：不是 Debian 时必须失败 ──────────────
 out=$( ( INSTALL_SH_NO_MAIN=1; source "$ROOT/install.sh"
          assert_debian() { return 1; }

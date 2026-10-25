@@ -97,6 +97,35 @@ server_global_ipv6() {
   printf '%s' "$out"
 }
 
+# 本机有没有 IPv4 出口。
+#
+# 判据是「有没有 IPv4 默认路由」而不是「能不能 ping 通某个站点」：
+# 后者依赖具体站点是否可达（Google 在国内被墙、1.1.1.1 在部分网络不通），
+# 拿来当判据会误报；默认路由则是本机自己的网络配置，稳定可查。
+#
+# 为什么它重要（真机事故）：IPv6-only 的服务器（Vultr 的 IPv6-only 套餐等）
+# 只能访问有 AAAA 记录的站点。github.com / api.github.com 只有 IPv4 →
+# 经代理访问它们必然失败；而 raw.githubusercontent.com 有 AAAA → 能通 →
+# 看起来像「时好时坏」，用户很难自己定位。
+ipv4_egress_available() {
+  local routes
+  # 有 IPv4 默认路由 → 基本可以认为有出口，不必联网探测。
+  # ⚠️ 不用 `ip ... | grep -q`：grep 命中即退出 → 上游 ip 收到 SIGPIPE(141)
+  #    → set -o pipefail 下整条管道的退出码变成 141 → 条件恒为假。
+  routes=$(ip -4 route show default 2>/dev/null || printf '')
+  [[ -n "$routes" ]] && return 0
+  # 没有默认路由，但也可能【有】出口：WARP/MASQUE 这类隧道就不建 IPv4 默认路由
+  # （实测：WARP 连上后 `ip -4 route` 里没有 default，IPv4 却完全可用）。
+  # 所以这里实际探测一次（最多 4 秒；真·无 IPv4 时会立刻失败，不会白等）。
+  if curl -4 -s -o /dev/null --max-time 4 https://1.1.1.1/ 2>/dev/null; then
+    return 0
+  fi
+  if curl -4 -s -o /dev/null --max-time 4 https://www.cloudflare.com/ 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
 # 某个域名解析出的 IPv6 是否与本机同 /32（前两组十六进制相同）
 target_same_ipv6_prefix() {
   local domain="$1" srv tgt s1 s2 t1 t2

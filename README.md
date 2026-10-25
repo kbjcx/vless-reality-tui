@@ -366,6 +366,42 @@ Xray 内核要从 GitHub 下载。而 GitHub 的**主站与 release 资源**
 - 换完目标要**重启服务**让新配置生效：`systemctl restart xray`
   （或用管理菜单重新部署）。
 
+**Q：经代理访问 github.com / api.github.com 失败，但 raw.githubusercontent.com 能通？**
+
+这是 **IPv6-only 服务器的固有限制**，不是代理坏了：
+
+- GitHub 主站与 API **只有 IPv4 记录（没有 AAAA）**；
+- 而 IPv6-only 的服务器（Vultr 的 IPv6-only 套餐等）**没有 IPv4 出口** →
+  代理拿到的是 IPv4 地址，却发不出去 → 必然失败；
+- `raw.githubusercontent.com` 有 AAAA（Fastly）→ 所以它能通 →
+  看起来像「时好时坏」，其实是有没有 IPv6 的区别。
+
+部署预检现在会直接提示这一条（`本机没有 IPv4 出口（IPv6-only）`）。
+
+要补上 IPv4 出口，最省事的办法是装 **Cloudflare WARP**（免费）：
+
+```bash
+# 1) 装官方客户端（Cloudflare 的 apt 源有 IPv6 地址，纯 IPv6 机器也能装）
+curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+  | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -sc) main" \
+  > /etc/apt/sources.list.d/cloudflare-client.list
+apt-get update && apt-get install -y cloudflare-warp
+
+# 2) 注册（注意 --accept-tos 是【全局】参数，必须放在子命令前面）
+warp-cli --accept-tos registration new
+# 3) 关键：把 IPv6 排除出隧道 —— 否则本机自己的 IPv6（代理入站、REALITY 握手）也被卷走，会失联
+warp-cli --accept-tos tunnel ip add-range ::/0
+warp-cli --accept-tos mode warp
+warp-cli --accept-tos connect
+```
+
+验证：`curl -4 https://ipinfo.io/ip`（会显示 Cloudflare 的 104.x 地址）、`curl -4 https://github.com`（200）。
+**IPv6 链路保持原样**（`::/0` 被排除），代理的入站与 REALITY 握手不受影响。
+
+> 想彻底不用第三方：Vultr 给 IPv6-only 套餐加购一个正式 IPv4（约 $3/月）即可，
+> 加购后要按新网关更新 `/etc/network/interfaces` 里的 IPv4 配置。
+
 **Q：提示端口被占用 / 部署完客户端连不上？**
 
 - 先确认服务在跑：`systemctl status xray`；

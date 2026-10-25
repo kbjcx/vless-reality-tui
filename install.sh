@@ -232,6 +232,21 @@ preflight() {
     fi
   fi
 
+  # IPv4 出口：没有它，代理【只能】访问有 AAAA 记录的站点。
+  # 真机事故（Vultr IPv6-only 套餐）：github.com / api.github.com 只有 IPv4
+  #   → 服务器无 IPv4 出口 → 经代理访问它们必然失败（而 raw.githubusercontent.com
+  #   因为有 AAAA 所以能通 → 看起来像「时好时坏」，极难自查）。
+  # 这里提前告知，免得用户以为是代理坏了。
+  if ipv4_egress_available; then
+    tui_ok "IPv4 出口可用"
+  else
+    tui_warn "本机没有 IPv4 出口（IPv6-only）"
+    tui_tip "代理仍可正常访问有 IPv6（AAAA）的站点，但 github.com、api.github.com 这类"
+    tui_tip "纯 IPv4 站点【无法】经本代理访问。"
+    tui_tip "如需访问：安装 Cloudflare WARP 补一条 IPv4 出口（warp-cli tunnel ip add-range ::/0"
+    tui_tip "把 IPv6 留在原链路上，不影响本代理的 IPv6 入站）。"
+  fi
+
   return $rc
 }
 
