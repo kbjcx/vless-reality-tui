@@ -931,13 +931,19 @@ choose_target() {
     printf 'www.microsoft.com'; return 0
   fi
   local -a labels=() hosts=()
+  local -a same_prefix=()   # 与本机同 /32 的目标（GFW 关联风险最低）
   while IFS='|' read -r host tls lat; do
     [[ -z "$host" ]] && continue
     hosts+=("$host")
+    local mark=''
+    if target_same_ipv6_prefix "$host"; then
+      same_prefix+=("$host")
+      mark='  同网段✔'
+    fi
     if [[ "$tls" == 'ok' ]]; then
-      labels+=("${host}    TLS1.3 ✔   ${lat}ms")
+      labels+=("${host}    TLS1.3 ✔   ${lat}ms${mark}")
     else
-      labels+=("${host}    TLS1.3 ✘   ${lat}ms")
+      labels+=("${host}    TLS1.3 ✘   ${lat}ms${mark}")
     fi
   done <<<"$probe"
 
@@ -945,11 +951,26 @@ choose_target() {
   # deploy.sh 单独被 source（单元测试 / helper）时它们可能根本没定义，
   # 在 `set -u` 下会直接报 unbound variable。
   if [[ ${OPT_YES:-0} -eq 1 ]]; then
-    # 自动挑选第一个支持 TLS1.3 且延迟已知的目标
-    local pick=''
-    while IFS='|' read -r host tls lat; do
-      if [[ "$tls" == 'ok' && "$lat" != '?' ]]; then pick="$host"; break; fi
-    done <<<"$probe"
+    # 优先挑【与本机同 /32】且支持 TLS1.3 的目标：
+    #   SNI 指向 CDN、连接目标却是小鸡 IP → GFW 的 DPI 会关联并掐断握手
+    #   （真机事故：one.one.one.one + Vultr → TCP 通、REALITY 握手永远不返回；
+    #     换成同网段的 api.vultr.com → 立刻通）。
+    local pick='' host ph pt pl
+    # ⚠️ 必须先判长度再展开：空数组在 set -u + bash 4.2/4.3 下展开会报 unbound variable。
+    if (( ${#same_prefix[@]} > 0 )); then
+      for host in "${same_prefix[@]}"; do
+        while IFS='|' read -r ph pt pl; do
+          if [[ "$ph" == "$host" && "$pt" == 'ok' ]]; then pick="$host"; break; fi
+        done <<<"$probe"
+        [[ -n "$pick" ]] && break
+      done
+    fi
+    if [[ -z "$pick" ]]; then
+      # 没有同网段目标 → 退回「第一个支持 TLS1.3 且延迟已知」的
+      while IFS='|' read -r host tls lat; do
+        if [[ "$tls" == 'ok' && "$lat" != '?' ]]; then pick="$host"; break; fi
+      done <<<"$probe"
+    fi
     [[ -z "$pick" ]] && pick="${hosts[0]}"
     printf '%s' "$pick"; return 0
   fi
@@ -961,12 +982,23 @@ choose_target() {
   #   1..n-1 = 选中第 n 项（成功，但也是非零码，不能用 && || 区分）
   #   255 = 用户取消
   local sel=0 rc=0
+  # 默认选中第一个【同网段】目标（没有则用第一项）：
+  # 同网段目标被 GFW 关联掐断的概率最低，应当是默认而非让用户自己猜。
+  if (( ${#same_prefix[@]} > 0 )); then
+    local first_same=''
+    for i in "${!hosts[@]}"; do
+      if [[ "${hosts[$i]}" == "${same_prefix[0]}" ]]; then first_same=$i; break; fi
+    done
+    [[ -n "$first_same" ]] && TUI_MENU_DEFAULT_INDEX=$first_same
+  fi
   # 必须把 tui_menu 的输出重定向到 stderr：tui_menu 会把【整张菜单】打到 stdout，
   # 而调用方是 `SNI=$(choose_target)` —— 不重定向的话，SNI 会变成
   # 「菜单标题 + 选项列表 + 选中的 host」的多行字符串，随后被原样写进
   # config.json → JSON 非法 → xray run -test 失败 → 部署以一句看不懂的报错中止。
   # 选中项一律用【返回码】取，stdout 只留最后 printf 的那个 host。
   tui_menu "选择 REALITY 伪装目标（SNI）" "${labels[@]}" >&2 || rc=$?
+  # 默认索引是全局变量 → 用完必须复位，否则会污染后面所有的菜单。
+  TUI_MENU_DEFAULT_INDEX=0
   if (( rc == 255 )); then
     # ⚠️ 提示语必须走 stderr：调用方是 `SNI=$(choose_target)` ——
     #    tui_warn 默认写 stdout → 这条提示会被当成【主机名】吞进去。
@@ -1125,13 +1157,25 @@ deploy_wizard() {
   fi
 
   # 伪装目标
-  SNI="${OPT_SNI:-}"
+  # ⚠️ SNI（伪装目标）必须与本机【同网段】才安全：
+  #   SNI 指向 CDN（one.one.one.one / www.microsoft.com …）、连接目标却是
+  #   一台小鸡的 IP → GFW 的 DPI 把两者一关联，REALITY 握手就被掐断
+  #   （客户端表现：TCP 能连上、握手一直不返回、服务器日志一条没有）。
+  #   同网段目标（Vultr → api.vultr.com）＝ 一次普通的 HTTPS 访问，不会被关联。
+  #   --target 可以显式指定；不给就自动挑同网段的。
+  SNI="${OPT_TARGET:-${OPT_SNI:-}}"
   if [[ -z "$SNI" ]]; then
     SNI=$(choose_target)
   fi
   TARGET="$SNI"
   [[ -z "$SNI" ]] && { tui_err "未确定伪装目标"; return 1; }
   tui_kv "伪装目标 (SNI)" "$SNI"
+  # 非同网段 → 必须明确告知风险与解法（真机事故的根因就在这里）
+  if ! target_same_ipv6_prefix "$SNI"; then
+    tui_warn "伪装目标 $SNI 与本机不在同一 IPv6 /32 网段，存在被 GFW 关联掐断的风险。"
+    tui_tip "同网段目标（Vultr → api.vultr.com、Ovh → api.ovh.com 等）可避免该问题。"
+    tui_tip "如已知更合适的目标，可用 --target <域名> 显式指定。"
+  fi
 
   # 备注
   REMARK="${OPT_NAME:-$SNI}"

@@ -65,9 +65,49 @@ REALITY_TARGETS=(
   'www.cloudflare.com'
   'time.akamai.com'
   'addons.mozilla.org'
+  # ↓ 同机房/同供应商的 API 域名：解析结果与本机落在同一个 /32，
+  #   REALITY 握手在 GFW 眼里就是「连向一个真实网站」，
+  #   不会因为「SNI 指向 CDN、目标 IP 却是小鸡」而被关联掐断。
+  'api.vultr.com'
+  'api.hetzner.com'
+  'api.ovh.com'
 )
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# 本机的全球 IPv6 地址（去掉 /prefix）
+#
+# 用途：判断 REALITY 的伪装目标是否与本机【同网段】。
+# 真机事故（Vultr / IPv6-only）：伪装目标选的是 one.one.one.one（解析到
+# Cloudflare），而本机在 Vultr 的 2001:19f0::/32 —— SNI 指向 CDN、连接的却是
+# 一台小鸡的 IP，GFW 的 DPI 据此关联，握手被掐断（客户端表现为
+# 「TCP 能连上、REALITY 握手一直不返回」；换同网段目标后立刻通）。
+# 伪装目标与本机同 /32 → 流量在 GFW 眼里就是一次普通的 HTTPS 访问。
+server_global_ipv6() {
+  # 缓存：一次部署里要对 10 个候选目标各判断一次同网段，
+  # 每次都跑一遍 `ip -6 addr` 是纯浪费（本机地址在一次运行内不会变）。
+  if [[ -n "${SRV_GLOBAL_IPV6:-}" ]]; then
+    printf '%s' "$SRV_GLOBAL_IPV6"
+    return 0
+  fi
+  local out
+  out=$(ip -6 addr show scope global 2>/dev/null | awk '/inet6 /{print $2}' | head -1)
+  out="${out%%/*}"
+  SRV_GLOBAL_IPV6="$out"
+  printf '%s' "$out"
+}
+
+# 某个域名解析出的 IPv6 是否与本机同 /32（前两组十六进制相同）
+target_same_ipv6_prefix() {
+  local domain="$1" srv tgt s1 s2 t1 t2
+  srv=$(server_global_ipv6)
+  [[ -n "$srv" ]] || return 1
+  tgt=$(getent ahostsv6 "$domain" 2>/dev/null | awk 'NR==1{print $1}')
+  [[ -n "$tgt" ]] || return 1
+  s1="${srv%%:*}"; s2="${srv#*:}"; s2="${s2%%:*}"
+  t1="${tgt%%:*}"; t2="${tgt#*:}"; t2="${t2%%:*}"
+  [[ "$s1" == "$t1" && "$s2" == "$t2" ]]
+}
 
 trim() {
   local s="$1"

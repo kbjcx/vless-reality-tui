@@ -187,6 +187,7 @@ sudo bash install.sh [选项]
 | `-y`, `--yes` | 全自动无交互，使用内置默认值 |
 | `-p`, `--port <端口>` | 指定监听端口（默认 443） |
 | `-s`, `--sni <域名>` | 指定 REALITY 伪装目标 |
+| `--target <域名>` | 指定 REALITY 伪装目标（与 `--sni` 等价）。**优先选与本机同网段的目标**（Vultr → `api.vultr.com`），否则可能被 GFW 关联掐断握手（见「常见问题」） |
 | `-n`, `--name <备注>` | 指定分享链接备注 |
 | `--uuid <UUID>` | 指定 UUID（默认自动生成） |
 | `--addr <地址>` | 指定对外地址（NAT 后的服务器用；默认自动探测公网 IP） |
@@ -345,6 +346,25 @@ Xray 内核要从 GitHub 下载。而 GitHub 的**主站与 release 资源**
 > ⚠️ 导入后如果连不上，先看 [常见问题](#常见问题) 里的端口、防火墙与 BBR 三条。
 
 ## 常见问题
+
+**Q：服务在跑、端口在监听，但客户端就是连不上（TCP 通、REALITY 握手一直不返回）？**
+
+这是**伪装目标（SNI）选错**导致的高频问题，也是真机上最难查的一种：
+
+- REALITY 握手的 ClientHello 里带的是**伪装目标的域名**。
+  如果这个域名解析到 **CDN**（`one.one.one.one` → Cloudflare、
+  `www.microsoft.com` → Akamai……），而你连接的是**一台小鸡的 IP**，
+  GFW 的 DPI 把「SNI 指向的 IP」与「实际连的 IP」一对照，
+  就知道这不是一次正常的 HTTPS 访问 → **握手被掐断**。
+- 典型症状：TCP 能连上、`curl`/客户端一直等到超时、
+  **服务器端 `access.log` 里一条记录都没有**（请求根本没进到代理层）。
+- 解法：**伪装目标必须与本机同网段**。工具会自动在候选里挑同 `/32` 的
+  （菜单里标着「同网段✔」，`--yes` 模式也会优先选它），候选表里含
+  `api.vultr.com` / `api.hetzner.com` / `api.ovh.com` 等供应商自己的域名 ——
+  它们解析到与你的机器**相同的 IPv6 /32**，在 GFW 眼里就是一次普通访问。
+- 也可以显式指定：`sudo bash install.sh --target api.vultr.com`
+- 换完目标要**重启服务**让新配置生效：`systemctl restart xray`
+  （或用管理菜单重新部署）。
 
 **Q：提示端口被占用 / 部署完客户端连不上？**
 

@@ -33,6 +33,7 @@ OPT_STATUS=0
 OPT_UNINSTALL=0
 OPT_PORT=''
 OPT_SNI=''
+OPT_TARGET=''
 OPT_NAME=''
 OPT_UUID=''
 OPT_ADDR=''
@@ -51,6 +52,9 @@ ${APP_NAME} v${APP_VERSION}
   -y, --yes          全自动无交互，使用内置默认值
   -p, --port <端口>   指定监听端口（默认 443）
   -s, --sni <域名>    指定 REALITY 伪装目标
+      --target <域名> 指定 REALITY 伪装目标（与 --sni 等价；优先用同网段的目标，
+                     例：Vultr 选 api.vultr.com —— SNI 指向 CDN 而连接目标
+                     是小鸡 IP 时，GFW 的 DPI 会关联并掐断 REALITY 握手）
   -n, --name <备注>   指定分享链接备注
       --uuid <UUID>   指定 UUID（默认自动生成）
       --addr <地址>   指定对外地址（NAT 后的服务器用；默认自动探测公网 IP）
@@ -92,6 +96,14 @@ parse_args() {
                      fi
                      shift 2 ;;
       -s|--sni)      OPT_SNI="${2:-}"; [[ -n "$OPT_SNI" ]] || { tui_err "--sni 缺少参数"; exit 1; }; shift 2 ;;
+      --target)      OPT_TARGET="${2:-}"; [[ -n "$OPT_TARGET" ]] || { tui_err "--target 缺少参数"; exit 1; }
+                     # 伪装目标会原样进入 config.json 的 target/serverNames → 必须是纯主机名。
+                     if ! [[ "$OPT_TARGET" =~ ^[A-Za-z0-9.-]+$ ]]; then
+                       tui_err "--target 只能是域名：$OPT_TARGET"
+                       tui_tip "示例：--target api.vultr.com（与本机同网段的目标最不容易被 GFW 关联）"
+                       exit 1
+                     fi
+                     shift 2 ;;
       -n|--name)     OPT_NAME="${2:-}"; [[ -n "$OPT_NAME" ]] || { tui_err "--name 缺少参数"; exit 1; }; shift 2 ;;
       --uuid)        OPT_UUID="${2:-}"; [[ -n "$OPT_UUID" ]] || { tui_err "--uuid 缺少参数"; exit 1; }; shift 2 ;;
       --addr)        OPT_ADDR="${2:-}"; [[ -n "$OPT_ADDR" ]] || { tui_err "--addr 缺少参数"; exit 1; }

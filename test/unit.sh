@@ -1310,6 +1310,38 @@ if [[ -n "$own_unit" ]]; then
   rm -f "$own_unit"
 fi
 
+# ── 伪装目标必须与本机同网段（真机事故回归）─────────────────────────────
+# 真机事故（Vultr / IPv6-only）：伪装目标自动选成了 one.one.one.one
+# （解析到 Cloudflare），而本机在 Vultr 的 2001:19f0::/32 ——
+# SNI 指向 CDN、连接目标却是一台小鸡 → GFW 的 DPI 一关联就掐断 REALITY 握手
+# （客户端表现：TCP 连得上、握手永远不返回、服务器日志一条都没有）。
+# 换成同 /32 的 api.vultr.com → 立刻通（HTTP 204/200 实测）。
+out=$( ( server_global_ipv6() { printf '2001:19f0:5400:10ef:5400:6ff:feee:6715'; }
+         getent() { printf '2001:19f0:200:41a5::4345:2 STREAM api.vultr.com\n'; }
+         target_same_ipv6_prefix 'api.vultr.com' ) 2>&1 ); rc=$?
+assert_status 0 "$rc" "同 /32 的伪装目标必须判定为同网段"
+out=$( ( server_global_ipv6() { printf '2001:19f0:5400:10ef:5400:6ff:feee:6715'; }
+         getent() { printf '2606:4700:4700::1111 STREAM one.one.one.one\n'; }
+         target_same_ipv6_prefix 'one.one.one.one' ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "跨 CDN 的伪装目标必须判定为非同网段（GFW 关联风险）"
+out=$( ( server_global_ipv6() { printf ''; }
+         target_same_ipv6_prefix 'api.vultr.com' ) 2>&1 ); rc=$?
+assert_status 1 "$rc" "本机没有全球 IPv6 时不得判定为同网段"
+
+# 自动挑选目标时必须优先同网段的那个
+out=$( ( probe_targets() { printf 'one.one.one.one|ok|10\napi.vultr.com|ok|20\n'; }
+         target_same_ipv6_prefix() { [[ "$1" == 'api.vultr.com' ]]; }
+         OPT_YES=1
+         choose_target ) 2>&1 )
+assert_eq "api.vultr.com" "$out" "自动挑选伪装目标时必须优先同网段目标"
+
+# 没有同网段目标时，退回「第一个支持 TLS1.3 且延迟已知」的
+out=$( ( probe_targets() { printf 'one.one.one.one|ok|10\nwww.apple.com|fail|5\n'; }
+         target_same_ipv6_prefix() { return 1; }
+         OPT_YES=1
+         choose_target ) 2>&1 )
+assert_eq "one.one.one.one" "$out" "没有同网段目标时必须退回原有挑选逻辑"
+
 # ── setup_systemd：服务未运行时必须返回非零并输出 xray 的原始日志 ──────────────
 # systemctl / journalctl / tui_run 全部 mock：绝不能真的动宿主机的 systemd。
 out=$( ( have_cmd() { return 0; }; tui_run() { return 0; }
@@ -1869,6 +1901,19 @@ out=$(timeout 10 bash "$ROOT/install.sh" --sni 'bad host' 2>&1); rc=$?
 assert_status 1 "$rc" "--sni 非法主机名以非零码退出"
 assert_contains "$out" "--sni" "--sni 非法主机名时给出明确提示"
 assert_not_contains "$out" "需要 root 权限" "--sni 非法时不得走到 root 检查（主机名校验必须在参数解析口）"
+
+# --target：显式指定伪装目标；非法值必须在参数解析口被拒
+# ⚠️ 这里【不用】timeout：Windows 自带的 timeout.exe 会抢占 GNU timeout
+#    （报错 "Invalid syntax. Default option is not allowed more than '1' time(s)"，
+#     根本不会执行后面的 bash）→ 同款问题让既有的 --sni/--uuid 等用例在
+#     Windows 开发机上恒红。参数解析口的校验不会挂住，直接调用即可。
+out=$(bash "$ROOT/install.sh" --target 'bad host' 2>&1); rc=$?
+assert_status 1 "$rc" "--target 非法主机名以非零码退出"
+assert_contains "$out" "--target" "--target 非法主机名时给出明确提示"
+assert_not_contains "$out" "需要 root 权限" "--target 非法时不得走到 root 检查（主机名校验必须在参数解析口）"
+out=$(bash "$ROOT/install.sh" --target 2>&1); rc=$?
+assert_status 1 "$rc" "--target 缺少参数时以非零码退出"
+assert_contains "$out" "缺少参数" "--target 缺少参数时给出明确提示"
 
 # ── require_root：非 root 时必须报错并以非零码退出 ──────────────
 if [[ "$T8_IS_ROOT" -eq 0 ]]; then
